@@ -10,6 +10,7 @@ pub const T_GOSSIP: u8 = 2;
 pub const T_DATA: u8 = 3;
 pub const T_PING: u8 = 4;
 pub const T_PONG: u8 = 5;
+pub const T_FORGET: u8 = 6;
 
 /// Header of a data frame: dst(32) src(32) ttl(1) nonce(24), followed by the sealed IP packet.
 pub const DATA_HDR: usize = 32 + 32 + 1 + 24;
@@ -73,6 +74,16 @@ impl SignedInfo {
         }
         Ok(info)
     }
+}
+
+/// "Forget node `id` up to version `seq`": removes an offline node everywhere. A node that is
+/// actually alive comes back with its next (newer) record.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct Forget {
+    pub id: NodeId,
+    pub seq: u64,
+    /// When it was issued (ms since epoch), so it can expire.
+    pub at: u64,
 }
 
 #[derive(Serialize, Deserialize)]

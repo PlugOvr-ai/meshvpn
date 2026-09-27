@@ -6,6 +6,7 @@ mod link;
 mod node;
 mod proto;
 mod ssh;
+mod update;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -56,6 +57,24 @@ enum Cmd {
     },
     /// Connect to a node at HOST:PORT (e.g. a firewalled node's reverse tunnel port).
     AddPeer { addr: String },
+    /// Remove offline nodes (e.g. old identities of re-installed machines) from the whole network.
+    Forget {
+        /// Name or id (prefix) of the node.
+        #[arg(required_unless_present = "offline")]
+        who: Option<String>,
+        /// Forget all nodes that are currently offline.
+        #[arg(long, conflicts_with = "who")]
+        offline: bool,
+    },
+    /// Update to the latest release from GitHub (restarts the running VPN).
+    Update {
+        /// Only check whether a new version is available.
+        #[arg(long)]
+        check: bool,
+        /// Update even a development build.
+        #[arg(long)]
+        force: bool,
+    },
     /// Install and start a systemd service so the VPN runs at boot.
     Install,
     /// Stop and remove the systemd service.
@@ -82,7 +101,8 @@ struct NodeOpts {
     /// SSH port of the tunnel server.
     #[arg(long, default_value_t = 22)]
     ssh_port: u16,
-    /// Port opened on the SSH server that forwards to this node.
+    /// Port opened on the SSH server that forwards to this node (0 = none; the node then
+    /// only connects out through the tunnel and is reached through other nodes).
     #[arg(long, default_value_t = DEFAULT_PORT)]
     ssh_remote_port: u16,
     /// Host name others use to reach the SSH server (default: host of --ssh).
@@ -167,6 +187,14 @@ fn real_main(cli: Cli) -> Result<()> {
             println!("Connecting to {addr}. It is remembered, and the whole network will learn about it.");
             println!("Check with: meshvpn status");
         }
+        Cmd::Forget { who, offline: _ } => {
+            let resp =
+                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Forget { who }))?;
+            if let control::Response::Message { text } = resp {
+                println!("{text}");
+            }
+        }
+        Cmd::Update { check, force } => update_cmd(&dir, check, force)?,
         Cmd::Install => install(&dir)?,
         Cmd::Uninstall => uninstall()?,
     }
@@ -230,7 +258,11 @@ fn print_node_summary(cfg: &Config) -> Result<()> {
     println!("  mesh IP:     {}", overlay_ip(&id.id));
     println!("  host name:   {}.mesh", cfg.name);
     if let Some(t) = &cfg.ssh_tunnel {
-        println!("  ssh tunnel:  {} (reachable at {})", t.server, t.public_endpoint());
+        if t.remote_port == 0 {
+            println!("  ssh tunnel:  {} (outgoing only)", t.server);
+        } else {
+            println!("  ssh tunnel:  {} (reachable at {})", t.server, t.public_endpoint());
+        }
     }
     println!();
     Ok(())
@@ -255,12 +287,14 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
             "  - `sudo ssh -p {} {}` must work without a password (as root, or pass --ssh-identity).",
             t.port, t.server
         );
-        println!("  - For other nodes to connect in, the SSH server needs `GatewayPorts clientspecified`");
-        println!(
-            "    in /etc/ssh/sshd_config and port {} open. Without it this node still works by",
-            t.remote_port
-        );
-        println!("    connecting out through the tunnel.");
+        if t.remote_port != 0 {
+            println!("  - For other nodes to connect in, the SSH server needs `GatewayPorts clientspecified`");
+            println!(
+                "    in /etc/ssh/sshd_config and port {} open. Without it this node still works by",
+                t.remote_port
+            );
+            println!("    connecting out through the tunnel.");
+        }
     } else if cfg.no_outbound {
         println!();
         println!("This node does not connect out. On any existing node run:");
@@ -271,7 +305,7 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
     }
 }
 
-fn print_invite(dir: &Path, cfg: &Config) {
+fn make_invite(dir: &Path, cfg: &Config) -> Invite {
     let mut boot: Vec<String> = cfg.static_endpoints();
     let saved = SavedState::load(dir);
     let net = cfg.network_key().map(|k| keys::network_tag(&k)).unwrap_or_default();
@@ -297,11 +331,16 @@ fn print_invite(dir: &Path, cfg: &Config) {
     boot.retain(|e| seen.insert(e.clone()));
     boot.truncate(12);
 
-    let inv = Invite {
+    Invite {
         network: cfg.network.clone(),
         key: cfg.network_key.clone(),
-        bootstrap: boot.clone(),
-    };
+        bootstrap: boot,
+    }
+}
+
+fn print_invite(dir: &Path, cfg: &Config) {
+    let inv = make_invite(dir, cfg);
+    let boot = &inv.bootstrap;
     println!("Invite code (treat it like a password - it grants access to the network):\n");
     println!("  {}\n", inv.encode());
     println!("On the new machine run:\n");
@@ -330,6 +369,9 @@ fn print_status(st: &node::Status) {
         st.interface,
         st.network
     );
+    if let Some(v) = &st.update_available {
+        println!("  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - run: sudo meshvpn update");
+    }
     for w in &st.warnings {
         println!("  \x1b[1;33mwarning:\x1b[0m {w}");
     }
@@ -370,6 +412,37 @@ fn human_secs(s: u64) -> String {
         120..=7199 => format!("{}m ago", s / 60),
         _ => format!("{}h ago", s / 3600),
     }
+}
+
+fn update_cmd(dir: &Path, check: bool, force: bool) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    // A running daemon does it itself: it knows the way out (e.g. the SSH tunnel) and restarts.
+    if control::is_running(dir) {
+        let req = control::Request::Update {
+            check_only: check,
+            force,
+        };
+        if let control::Response::Message { text } = rt.block_on(control::request(dir, &req))? {
+            println!("{text}");
+        }
+        return Ok(());
+    }
+    let socks = Config::load(dir).ok().and_then(|c| c.effective_socks());
+    rt.block_on(async {
+        let client = update::client(socks.as_deref())?;
+        let tag = update::latest_tag(&client).await?;
+        if !update::is_newer(&tag, update::CURRENT) {
+            println!("meshvpn {} is up to date", update::CURRENT);
+        } else if check {
+            println!("meshvpn {tag} is available (running {})", update::CURRENT);
+        } else if update::is_dev_build() && !force {
+            bail!("this is a development build - update it with git pull && cargo build (or use --force)");
+        } else {
+            let exe = update::install(&client, &tag).await?;
+            println!("updated {} -> {tag} ({})", update::CURRENT, exe.display());
+        }
+        Ok(())
+    })
 }
 
 const UNIT_PATH: &str = "/etc/systemd/system/meshvpn.service";

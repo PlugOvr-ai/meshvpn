@@ -7,7 +7,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::keys::{b64, random32, unb64};
-use crate::proto::SignedInfo;
+use crate::proto::{Forget, SignedInfo};
 
 pub const DEFAULT_PORT: u16 = 7870;
 pub const DEFAULT_SOCKS_PORT: u16 = 1081;
@@ -40,7 +40,8 @@ pub struct SshTunnel {
     pub server: String,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
-    /// Port opened on the SSH server that forwards to this node.
+    /// Port opened on the SSH server that forwards to this node (0 = none: this node only
+    /// connects out through the SOCKS proxy, and is reached through other nodes).
     pub remote_port: u16,
     /// Hostname other nodes use to reach `remote_port` (defaults to the host of `server`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +97,9 @@ pub struct Config {
     /// Maintain `<name>.mesh` entries in /etc/hosts.
     #[serde(default = "default_true")]
     pub manage_hosts: bool,
+    /// Install new releases from GitHub automatically (checked every 6 hours).
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
     /// Make all outgoing connections through this SOCKS5 proxy (`host:port`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socks_proxy: Option<String>,
@@ -121,6 +125,7 @@ impl Config {
             interface: default_iface(),
             mtu: default_mtu(),
             manage_hosts: true,
+            auto_update: true,
             socks_proxy: None,
             no_outbound: false,
             ssh_tunnel: None,
@@ -178,7 +183,9 @@ impl Config {
     /// Endpoints known from configuration alone (without asking peers).
     pub fn static_endpoints(&self) -> Vec<String> {
         let mut v = self.endpoints.clone();
-        if let Some(t) = &self.ssh_tunnel {
+        if let Some(t) = &self.ssh_tunnel
+            && t.remote_port != 0
+        {
             v.push(t.public_endpoint());
         }
         v
@@ -223,6 +230,8 @@ fn permission_hint(e: std::io::Error, path: &Path) -> anyhow::Error {
 pub struct SavedState {
     pub me: Option<SignedInfo>,
     pub peers: Vec<SignedInfo>,
+    #[serde(default)]
+    pub forgotten: Vec<Forget>,
 }
 
 impl SavedState {

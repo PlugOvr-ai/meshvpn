@@ -1,6 +1,6 @@
 [package]
 name = "meshvpn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["PlugOvr.ai <cw@plugovr.ai>"]
@@ -18,11 +18,15 @@ blake3 = "1.8.7"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+flate2 = "1.1.10"
 libc = "0.2.189"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "socks"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 snow = "0.10.0"
+tar = "0.4.46"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
 tracing = "0.1.44"

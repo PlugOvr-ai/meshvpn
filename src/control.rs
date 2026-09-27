@@ -15,14 +15,25 @@ use crate::node::{Node, Status};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    AddPeer { addr: String },
+    AddPeer {
+        addr: String,
+    },
+    Update {
+        check_only: bool,
+        force: bool,
+    },
+    /// Forget an offline node by name or id; `None` = all offline nodes.
+    Forget {
+        who: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
-    Status(Status),
+    Status(Box<Status>),
     Ok,
+    Message { text: String },
     Error { message: String },
 }
 
@@ -49,12 +60,24 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                 return;
             }
             let resp = match serde_json::from_str::<Request>(&line) {
-                Ok(Request::Status) => Response::Status(node.status()),
+                Ok(Request::Status) => Response::Status(Box::new(node.status())),
                 Ok(Request::AddPeer { addr }) => match node.add_peer(addr) {
                     Ok(()) => {
                         node.dial_now();
                         Response::Ok
                     }
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::Forget { who }) => match node.forget(who.as_deref()) {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::Update { check_only, force }) => match node.update_now(check_only, force).await {
+                    Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },
@@ -66,6 +89,10 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
             let _ = w.write_all(&out).await;
         });
     }
+}
+
+pub fn is_running(dir: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path(dir)).is_ok()
 }
 
 pub async fn request(dir: &Path, req: &Request) -> Result<Response> {

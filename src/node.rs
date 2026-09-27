@@ -33,6 +33,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Forget nodes we have not heard of for a week.
 const FORGET_AFTER_MS: u64 = 7 * 24 * 3600 * 1000;
 const GOSSIP_BATCH: usize = 32;
+/// An offline node whose name is now used by a newer, online node (typically the same machine
+/// set up again) is forgotten automatically after this long.
+const AUTO_FORGET_AFTER: Duration = Duration::from_secs(600);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -125,6 +128,8 @@ struct State {
     my_signed: Option<SignedInfo>,
     my_endpoints: Vec<String>,
     hosts_written: String,
+    update_available: Option<String>,
+    forgotten: HashMap<NodeId, Forget>,
 }
 
 pub struct Node {
@@ -166,6 +171,10 @@ pub struct Status {
     pub outbound_via: Option<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub update_available: Option<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -224,6 +233,10 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         if let Some(me) = saved.me.and_then(|m| m.verify(&node.net).ok()) {
             st.my_seq = me.seq;
         }
+        let cutoff = now_ms().saturating_sub(FORGET_AFTER_MS);
+        for f in saved.forgotten.into_iter().filter(|f| f.at > cutoff) {
+            node.apply_forget(&mut st, f);
+        }
         for s in saved.peers {
             node.ingest(&mut st, s, false);
         }
@@ -248,13 +261,19 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     }
     if let Some(t) = node.cfg.ssh_tunnel.clone() {
         let port = node.cfg.listen_port().context("ssh_tunnel needs `listen` to be set")?;
-        tokio::spawn(crate::ssh::supervise(t, port));
+        let label = if t.remote_port == 0 {
+            format!("ssh tunnel to {}", t.server)
+        } else {
+            format!("ssh tunnel to {} (public endpoint {})", t.server, t.public_endpoint())
+        };
+        tokio::spawn(crate::ssh::supervise(label, crate::ssh::tunnel_args(&t, port)));
     }
     if let Some(s) = &node.socks {
         info!("outgoing connections go through SOCKS proxy {s}");
     }
     tokio::spawn(node.clone().tun_loop());
     tokio::spawn(node.clone().tick_loop());
+    tokio::spawn(node.clone().update_loop());
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -358,6 +377,9 @@ impl Node {
         {
             return false;
         }
+        if st.forgotten.get(&info.id).is_some_and(|f| f.seq >= info.seq) {
+            return false;
+        }
         if live && info.seq > now_ms() + 3_600_000 {
             debug!("dropping record from the future for {}", info.id);
             return false;
@@ -372,12 +394,16 @@ impl Node {
         }
         st.ciphers.remove(&info.id);
         let id = info.id;
+        // A record we see for the first time may be stale (relayed from someone's memory), so
+        // it only proves the node is alive once a newer version follows (every REANNOUNCE).
+        // Directly linked nodes count as online anyway. This does not depend on clocks.
+        let seen_before = st.records.contains_key(&id);
         st.records.insert(
             id,
             Record {
                 info,
                 signed,
-                last_heard: live.then(Instant::now),
+                last_heard: (live && seen_before).then(Instant::now),
             },
         );
         true
@@ -407,9 +433,144 @@ impl Node {
     fn full_table(&self, st: &State) -> Vec<Vec<u8>> {
         let mut all: Vec<SignedInfo> = st.records.values().map(|r| r.signed.clone()).collect();
         all.extend(st.my_signed.clone());
-        all.chunks(GOSSIP_BATCH)
+        let mut frames: Vec<Vec<u8>> = all
+            .chunks(GOSSIP_BATCH)
             .map(|c| frame(T_GOSSIP, &serde_json::to_vec(c).unwrap()))
-            .collect()
+            .collect();
+        let forgotten: Vec<Forget> = st.forgotten.values().copied().collect();
+        for c in forgotten.chunks(256) {
+            frames.push(frame(T_FORGET, &serde_json::to_vec(c).unwrap()));
+        }
+        frames
+    }
+
+    // ----------------------------------------------------------------------------- forgetting
+
+    /// Records a tombstone and drops the node if we only know that version or older.
+    fn apply_forget(&self, st: &mut State, f: Forget) -> bool {
+        if f.id == self.ident.id || st.forgotten.get(&f.id).is_some_and(|old| old.seq >= f.seq) {
+            return false;
+        }
+        st.forgotten.insert(f.id, f);
+        if st.records.get(&f.id).is_some_and(|r| r.info.seq <= f.seq) && !st.links.contains_key(&f.id) {
+            let r = st.records.remove(&f.id).unwrap();
+            st.ciphers.remove(&f.id);
+            info!("forgot node {} ({})", r.info.name, f.id);
+        }
+        true
+    }
+
+    fn handle_forget(&self, from: NodeId, payload: &[u8]) {
+        let Ok(list) = serde_json::from_slice::<Vec<Forget>>(payload) else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        let changed: Vec<Forget> = list.into_iter().filter(|f| self.apply_forget(&mut st, *f)).collect();
+        if !changed.is_empty() {
+            self.rebuild(&mut st);
+            self.broadcast(
+                &st,
+                &frame(T_FORGET, &serde_json::to_vec(&changed).unwrap()),
+                Some(from),
+            );
+            drop(st);
+            self.update_hosts();
+        }
+    }
+
+    /// Forgets offline nodes everywhere in the network. Returns their names.
+    fn forget_ids(&self, st: &mut State, ids: &[NodeId]) -> Vec<String> {
+        let mut names = vec![];
+        let mut sent = vec![];
+        for id in ids {
+            let Some(r) = st.records.get(id) else { continue };
+            let f = Forget {
+                id: *id,
+                seq: r.info.seq,
+                at: now_ms(),
+            };
+            names.push(r.info.name.clone());
+            if self.apply_forget(st, f) {
+                sent.push(f);
+            }
+        }
+        if !sent.is_empty() {
+            self.rebuild(st);
+            self.broadcast(st, &frame(T_FORGET, &serde_json::to_vec(&sent).unwrap()), None);
+        }
+        names
+    }
+
+    /// How long a node has been offline (None = online).
+    fn offline_for(&self, st: &State, id: &NodeId) -> Option<Duration> {
+        if self.is_online(st, id) {
+            return None;
+        }
+        let heard = st.records.get(id)?.last_heard.map(|t| t.elapsed());
+        Some(heard.unwrap_or(self.started.elapsed()).saturating_sub(ONLINE_WINDOW))
+    }
+
+    /// `meshvpn forget NAME|ID` or `meshvpn forget --offline`.
+    pub fn forget(&self, who: Option<&str>) -> Result<String> {
+        let mut st = self.state.lock().unwrap();
+        let ids: Vec<NodeId> = match who {
+            None => st
+                .records
+                .keys()
+                .copied()
+                .filter(|id| !self.is_online(&st, id))
+                .collect(),
+            Some(w) => {
+                let w = w.trim().to_lowercase();
+                let matches: Vec<NodeId> = st
+                    .records
+                    .values()
+                    .filter(|r| r.info.name == w || (w.len() >= 4 && r.info.id.hex().starts_with(&w)))
+                    .map(|r| r.info.id)
+                    .collect();
+                if matches.is_empty() && w == self.cfg.name {
+                    bail!("{w} is this node");
+                }
+                if matches.is_empty() {
+                    bail!("no node named {w:?} (see meshvpn status)");
+                }
+                let offline: Vec<NodeId> = matches.iter().copied().filter(|id| !self.is_online(&st, id)).collect();
+                if offline.is_empty() {
+                    bail!("{w} is online - it would come right back (stop meshvpn on it first)");
+                }
+                offline
+            }
+        };
+        let names = self.forget_ids(&mut st, &ids);
+        drop(st);
+        self.update_hosts();
+        Ok(match names.len() {
+            0 => "no offline nodes to forget".into(),
+            _ => format!("forgot {} (on every node of the network)", names.join(", ")),
+        })
+    }
+
+    /// A machine that was set up again leaves its old identity behind under the same name.
+    fn auto_forget(&self, st: &mut State) {
+        let mut newest: HashMap<&str, u64> = HashMap::new();
+        newest.insert(&self.cfg.name, u64::MAX);
+        for r in st.records.values() {
+            if self.is_online(st, &r.info.id) {
+                let e = newest.entry(&r.info.name).or_default();
+                *e = (*e).max(r.info.seq);
+            }
+        }
+        let stale: Vec<NodeId> = st
+            .records
+            .values()
+            .filter(|r| newest.get(r.info.name.as_str()).is_some_and(|&s| s > r.info.seq))
+            .filter(|r| self.offline_for(st, &r.info.id).is_some_and(|d| d > AUTO_FORGET_AFTER))
+            .map(|r| r.info.id)
+            .collect();
+        if !stale.is_empty() {
+            let names = self.forget_ids(st, &stale);
+            info!("forgot replaced node(s): {}", names.join(", "));
+        }
     }
 
     fn is_online(&self, st: &State, id: &NodeId) -> bool {
@@ -710,6 +871,7 @@ impl Node {
                     }
                 }
                 T_GOSSIP => self.handle_gossip(peer, payload),
+                T_FORGET => self.handle_forget(peer, payload),
                 T_PING => {
                     let st = self.state.lock().unwrap();
                     if let Some(l) = st.links.get(&peer) {
@@ -871,6 +1033,8 @@ impl Node {
                 if st.records.len() != before {
                     info!("forgot {} long-gone node(s)", before - st.records.len());
                 }
+                st.forgotten.retain(|_, f| f.at > cutoff);
+                self.auto_forget(&mut st);
                 self.rebuild(&mut st);
                 self.dial_candidates(&mut st)
             };
@@ -891,6 +1055,7 @@ impl Node {
         let saved = SavedState {
             me: st.my_signed.clone(),
             peers: st.records.values().map(|r| r.signed.clone()).collect(),
+            forgotten: st.forgotten.values().copied().collect(),
         };
         drop(st);
         if let Err(e) = saved.save(&self.dir) {
@@ -966,19 +1131,88 @@ impl Node {
             ip: self.my_ip,
             interface: self.cfg.interface.clone(),
             endpoints: st.my_endpoints.clone(),
-            ssh_tunnel: self
-                .cfg
-                .ssh_tunnel
-                .as_ref()
-                .map(|t| format!("{} -> {}", t.server, t.public_endpoint())),
+            ssh_tunnel: self.cfg.ssh_tunnel.as_ref().map(|t| match t.remote_port {
+                0 => format!("{} (outgoing only)", t.server),
+                _ => format!("{} -> {}", t.server, t.public_endpoint()),
+            }),
             outbound_via: if self.cfg.no_outbound {
                 Some("disabled".into())
             } else {
                 self.socks.clone()
             },
             warnings: range_conflicts(&self.cfg.interface),
+            version: crate::update::CURRENT.into(),
+            update_available: st.update_available.clone(),
             peers,
         }
+    }
+
+    // ----------------------------------------------------------------------------- updates
+
+    fn update_client(&self) -> Result<reqwest::Client> {
+        if self.cfg.no_outbound && self.socks.is_none() {
+            bail!("this node does not connect out (no_outbound), so it cannot reach GitHub");
+        }
+        crate::update::client(self.socks.as_deref())
+    }
+
+    /// Checks GitHub for a newer release and (unless `check_only`) installs it and restarts.
+    pub async fn update_now(self: &Arc<Self>, check_only: bool, force: bool) -> Result<String> {
+        use crate::update;
+        let client = self.update_client()?;
+        let tag = update::latest_tag(&client).await?;
+        if !update::is_newer(&tag, update::CURRENT) {
+            self.state.lock().unwrap().update_available = None;
+            return Ok(format!("meshvpn {} is up to date", update::CURRENT));
+        }
+        self.state.lock().unwrap().update_available = Some(tag.clone());
+        if check_only {
+            return Ok(format!("meshvpn {tag} is available (running {})", update::CURRENT));
+        }
+        if update::is_dev_build() && !force {
+            bail!("this is a development build - update it with git pull && cargo build (or use --force)");
+        }
+        info!("updating to meshvpn {tag}");
+        let exe = update::install(&client, &tag).await?;
+        info!("installed meshvpn {tag}; restarting");
+        let node = self.clone();
+        tokio::spawn(async move {
+            // Give the control socket a moment to deliver the answer.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            node.restart(exe);
+        });
+        Ok(format!("updated {} -> {tag}, restarting", update::CURRENT))
+    }
+
+    async fn update_loop(self: Arc<Self>) {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            let auto = self.cfg.auto_update && !crate::update::is_dev_build();
+            match self.update_now(!auto, false).await {
+                Ok(msg) if msg.contains("available") => {
+                    info!("{msg} - install it with: sudo meshvpn update")
+                }
+                Ok(msg) => debug!("{msg}"),
+                Err(e) => debug!("update check failed: {e:#}"),
+            }
+            // Spread checks out so a whole network does not hit GitHub at once.
+            let jitter = rand::rngs::OsRng.next_u64() % 3600;
+            tokio::time::sleep(Duration::from_secs(6 * 3600 + jitter)).await;
+        }
+    }
+
+    /// Replaces this process with the (new) binary, keeping pid and arguments.
+    fn restart(&self, exe: PathBuf) {
+        use std::os::unix::process::CommandExt;
+        self.save_state();
+        crate::ssh::kill_all();
+        std::fs::remove_file(crate::control::socket_path(&self.dir)).ok();
+        let err = std::process::Command::new(&exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        // exec only returns on failure; let the service manager restart us.
+        warn!("restarting {}: {err}", exe.display());
+        std::process::exit(1);
     }
 
     /// Adds a node address to dial (and remembers it in the config).
