@@ -109,7 +109,7 @@ else
     if command -v sha256sum >/dev/null 2>&1; then
         (cd "$TMP" && sha256sum -c "meshvpn-$TARGET.tar.gz.sha256" >/dev/null) || die "checksum mismatch"
     fi
-    tar -xzf "$TMP/meshvpn-$TARGET.tar.gz" -C "$TMP" meshvpn
+    tar -xzf "$TMP/meshvpn-$TARGET.tar.gz" -C "$TMP"
 fi
 
 say "Uploading meshvpn to $HOSTNAME_DEV..."
