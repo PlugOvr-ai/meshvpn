@@ -27,6 +27,9 @@ pub struct NodeInfo {
     pub neighbors: Vec<NodeId>,
     /// Monotonic version, newer wins.
     pub seq: u64,
+    /// Network this record belongs to (see `keys::network_tag`).
+    #[serde(default)]
+    pub net: String,
     #[serde(default)]
     pub version: String,
 }
@@ -44,9 +47,16 @@ impl SignedInfo {
         SignedInfo { data, sig }
     }
 
-    pub fn verify(&self) -> Result<NodeInfo> {
+    /// Checks the signature and that the record belongs to network `net`.
+    pub fn verify(&self, net: &str) -> Result<NodeInfo> {
         let info: NodeInfo = serde_json::from_str(&self.data)?;
         verify(&info.id, self.data.as_bytes(), &unb64(&self.sig)?)?;
+        if info.net != net {
+            bail!(
+                "node {} belongs to a different network or runs an older meshvpn version (update it)",
+                info.name
+            );
+        }
         if info.endpoints.len() > 32 || info.neighbors.len() > 4096 {
             bail!("oversized node info");
         }
@@ -99,6 +109,7 @@ mod tests {
             endpoints: vec!["1.2.3.4:7870".into()],
             neighbors: vec![],
             seq: 1,
+            net: "n1".into(),
             version: String::new(),
         }
     }
@@ -107,18 +118,19 @@ mod tests {
     fn signed_info_roundtrip_and_tamper() {
         let id = ident();
         let s = SignedInfo::sign(&info(&id, "alpha"), &id);
-        assert_eq!(s.verify().unwrap().name, "alpha");
+        assert_eq!(s.verify("n1").unwrap().name, "alpha");
+        assert!(s.verify("other-network").is_err());
         let tampered = SignedInfo {
             data: s.data.replace("1.2.3.4", "6.6.6.6"),
             sig: s.sig.clone(),
         };
-        assert!(tampered.verify().is_err());
+        assert!(tampered.verify("n1").is_err());
     }
 
     #[test]
     fn rejects_hostile_names() {
         let id = ident();
         let s = SignedInfo::sign(&info(&id, "evil\n1.2.3.4 bank.com"), &id);
-        assert!(s.verify().is_err());
+        assert!(s.verify("n1").is_err());
     }
 }

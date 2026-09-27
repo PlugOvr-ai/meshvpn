@@ -140,6 +140,12 @@ pub fn overlay_ip(id: &NodeId) -> Ipv4Addr {
     Ipv4Addr::from(0x6440_0000 | n)
 }
 
+/// Short public tag identifying a network (derived from its key). Records carry it so
+/// leftovers from another network (e.g. after `init --force`) are rejected everywhere.
+pub fn network_tag(network_key: &[u8; 32]) -> String {
+    Key32(blake3::derive_key("meshvpn network tag v1", network_key)).hex()[..16].to_string()
+}
+
 pub const OVERLAY_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 192, 0, 0);
 
 #[cfg(test)]

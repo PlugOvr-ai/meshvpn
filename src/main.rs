@@ -125,7 +125,7 @@ fn real_main(cli: Cli) -> Result<()> {
             println!("Created network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
             print_invite(&dir, &cfg);
-            print_next_steps(&cfg);
+            print_next_steps(&dir, &cfg);
         }
         Cmd::Join { invite, node } => {
             let inv = Invite::decode(&invite)?;
@@ -134,7 +134,7 @@ fn real_main(cli: Cli) -> Result<()> {
             println!("Joined network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
             println!("It will connect to: {}", cfg.bootstrap.join(", "));
-            print_next_steps(&cfg);
+            print_next_steps(&dir, &cfg);
         }
         Cmd::Invite => {
             let cfg = Config::load(&dir)?;
@@ -189,6 +189,8 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
             Config::path(dir).display()
         );
     }
+    // Starting over: forget the nodes of the previous setup.
+    let _ = std::fs::remove_file(SavedState::path(dir));
     let name = o
         .name
         .as_deref()
@@ -234,8 +236,14 @@ fn print_node_summary(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn print_next_steps(cfg: &Config) {
+fn print_next_steps(dir: &Path, cfg: &Config) {
     println!();
+    if std::os::unix::net::UnixStream::connect(control::socket_path(dir)).is_ok() {
+        println!("meshvpn is still running with the previous configuration. Restart it:");
+        println!("  sudo systemctl restart meshvpn   # if installed as a service");
+        println!("  (or stop `meshvpn up` with Ctrl+C and start it again)");
+        println!();
+    }
     println!("Next steps:");
     println!("  sudo meshvpn up          # run now, in the foreground");
     println!("  sudo meshvpn install     # or: run in the background, also after reboot");
@@ -266,7 +274,8 @@ fn print_next_steps(cfg: &Config) {
 fn print_invite(dir: &Path, cfg: &Config) {
     let mut boot: Vec<String> = cfg.static_endpoints();
     let saved = SavedState::load(dir);
-    match saved.me.as_ref().and_then(|m| m.verify().ok()) {
+    let net = cfg.network_key().map(|k| keys::network_tag(&k)).unwrap_or_default();
+    match saved.me.as_ref().and_then(|m| m.verify(&net).ok()) {
         Some(me) => boot.extend(me.endpoints),
         None => {
             if cfg.auto_endpoints
@@ -278,7 +287,7 @@ fn print_invite(dir: &Path, cfg: &Config) {
             }
         }
     }
-    let mut peers: Vec<_> = saved.peers.iter().filter_map(|p| p.verify().ok()).collect();
+    let mut peers: Vec<_> = saved.peers.iter().filter_map(|p| p.verify(&net).ok()).collect();
     peers.sort_by_key(|p| std::cmp::Reverse(p.seq));
     for p in peers {
         boot.extend(p.endpoints);

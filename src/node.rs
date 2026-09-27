@@ -132,6 +132,7 @@ pub struct Node {
     dir: PathBuf,
     ident: Identity,
     psk: [u8; 32],
+    net: String,
     my_ip: Ipv4Addr,
     tun: Arc<tun::AsyncDevice>,
     state: Mutex<State>,
@@ -206,6 +207,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     let node = Arc::new(Node {
         dir: dir.clone(),
         ident,
+        net: crate::keys::network_tag(&psk),
         psk,
         my_ip,
         tun: Arc::new(tun),
@@ -219,7 +221,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     {
         let saved = SavedState::load(&dir);
         let mut st = node.state.lock().unwrap();
-        if let Some(me) = saved.me.and_then(|m| m.verify().ok()) {
+        if let Some(me) = saved.me.and_then(|m| m.verify(&node.net).ok()) {
             st.my_seq = me.seq;
         }
         for s in saved.peers {
@@ -311,6 +313,7 @@ impl Node {
             endpoints: st.my_endpoints.clone(),
             neighbors,
             seq: st.my_seq,
+            net: self.net.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
         };
         st.my_signed = Some(SignedInfo::sign(&info, &self.ident));
@@ -336,7 +339,7 @@ impl Node {
 
     /// Accepts a record if it is valid and newer than what we have. Returns true if it changed.
     fn ingest(&self, st: &mut State, signed: SignedInfo, live: bool) -> bool {
-        let info = match signed.verify() {
+        let info = match signed.verify(&self.net) {
             Ok(i) => i,
             Err(e) => {
                 debug!("dropping invalid record: {e}");
@@ -612,7 +615,7 @@ impl Node {
             bail!("expected hello");
         }
         let hello: Hello = serde_json::from_slice(&msg[1..])?;
-        let info = hello.info.verify()?;
+        let info = hello.info.verify(&self.net)?;
         if info.noise_pub != remote_static {
             bail!("record does not match link key");
         }
@@ -901,12 +904,20 @@ impl Node {
         }
         let mut st = self.state.lock().unwrap();
         let mut entries = vec![(self.cfg.name.clone(), self.my_ip, self.ident.id)];
-        let mut others: Vec<_> = st
-            .records
-            .values()
+        // If two nodes share a name, the plain name goes to the one that is online and newest
+        // (e.g. a machine that was set up again gets its name back from its old identity).
+        let mut others: Vec<_> = st.records.values().collect();
+        others.sort_by_key(|r| {
+            (
+                !self.is_online(&st, &r.info.id),
+                std::cmp::Reverse(r.info.seq),
+                r.info.id,
+            )
+        });
+        let others: Vec<_> = others
+            .into_iter()
             .map(|r| (r.info.name.clone(), overlay_ip(&r.info.id), r.info.id))
             .collect();
-        others.sort_by_key(|a| a.2);
         entries.extend(others);
         let block = crate::hosts::render(&entries);
         if block == st.hosts_written {
