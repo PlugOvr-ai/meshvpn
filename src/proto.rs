@@ -34,6 +34,44 @@ pub struct NodeInfo {
     pub net: String,
     #[serde(default)]
     pub version: String,
+    /// SSH public keys of this node's users, for password-less logins that other nodes
+    /// may allow (`meshvpn ssh allow`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_keys: Vec<SshKey>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SshKey {
+    /// Account on the publishing node.
+    pub user: String,
+    /// `<type> <base64>`, without comment.
+    pub key: String,
+}
+
+pub fn valid_user(u: &str) -> bool {
+    (1..=32).contains(&u.len())
+        && !u.starts_with('-')
+        && u.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c))
+}
+
+pub fn valid_ssh_key(k: &str) -> bool {
+    const TYPES: &[&str] = &[
+        "ssh-ed25519",
+        "ssh-rsa",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+    ];
+    let mut parts = k.split(' ');
+    let (Some(t), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    TYPES.contains(&t)
+        && (16..=4096).contains(&b.len())
+        && b.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -72,6 +110,15 @@ impl SignedInfo {
             .any(|e| e.len() > 262 || e.chars().any(|c| c.is_control() || c.is_whitespace()))
         {
             bail!("invalid endpoint");
+        }
+        // These end up in sshd's authorized keys: accept nothing but plain keys.
+        if info.ssh_keys.len() > 64
+            || info
+                .ssh_keys
+                .iter()
+                .any(|k| !valid_user(&k.user) || !valid_ssh_key(&k.key))
+        {
+            bail!("invalid ssh key");
         }
         Ok(info)
     }
@@ -168,6 +215,7 @@ mod tests {
             neighbors: vec![],
             seq: 1,
             net: "n1".into(),
+            ssh_keys: vec![],
             version: String::new(),
         }
     }
@@ -183,6 +231,27 @@ mod tests {
             sig: s.sig.clone(),
         };
         assert!(tampered.verify("n1").is_err());
+    }
+
+    #[test]
+    fn ssh_keys_are_validated() {
+        assert!(valid_ssh_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+        ));
+        assert!(!valid_ssh_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl comment"
+        ));
+        assert!(!valid_ssh_key("command=\"sh\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA"));
+        assert!(!valid_ssh_key("ssh-ed25519 AAAAC3Nza\nssh-rsa AAAAB3NzaC1yc2E"));
+        assert!(valid_user("cornelius") && valid_user("svc_backup-1"));
+        assert!(!valid_user("-oProxyCommand") && !valid_user("Root") && !valid_user("a b"));
+        let id = ident();
+        let mut i = info(&id, "alpha");
+        i.ssh_keys = vec![SshKey {
+            user: "bob".into(),
+            key: "ssh-rsa AAAA\nevil".into(),
+        }];
+        assert!(SignedInfo::sign(&i, &id).verify("n1").is_err());
     }
 
     #[test]

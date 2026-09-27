@@ -6,6 +6,8 @@ mod link;
 mod node;
 mod proto;
 mod ssh;
+mod sshd;
+mod tui;
 mod update;
 
 use anyhow::{Context, Result, bail};
@@ -72,6 +74,15 @@ enum Cmd {
         /// Name or id (prefix) of the node.
         who: String,
     },
+    /// Password-less SSH logins between nodes: each machine decides who may log in to it.
+    /// Without a subcommand, opens an editor for this machine's permissions.
+    Ssh {
+        #[command(subcommand)]
+        cmd: Option<SshCmd>,
+    },
+    /// Used by sshd (AuthorizedKeysCommand): prints the keys that may log in as USER.
+    #[command(hide = true)]
+    SshAuthorizedKeys { user: String },
     /// Update to the latest release from GitHub (restarts the running VPN).
     Update {
         /// Only check whether a new version is available.
@@ -85,6 +96,28 @@ enum Cmd {
     Install,
     /// Stop and remove the systemd service.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum SshCmd {
+    /// Let a node - or one user on it (`user@node`) - log in here without a password.
+    ///
+    /// Example: `sudo meshvpn ssh allow cornelius@desktop --as cornelius`
+    Allow {
+        /// `node` (any of its users) or `user@node`.
+        who: String,
+        /// Local account(s) they may log in as.
+        #[arg(long = "as", required = true, num_args = 1..)]
+        users: Vec<String>,
+    },
+    /// Take a permission back (without --as: all accounts).
+    Deny {
+        who: String,
+        #[arg(long = "as", num_args = 1..)]
+        users: Vec<String>,
+    },
+    /// Show who may log in here, and which keys this machine offers to others.
+    List,
 }
 
 #[derive(Args)]
@@ -195,6 +228,43 @@ fn real_main(cli: Cli) -> Result<()> {
             ))?;
             println!("Connecting to {addr}. It is remembered, and the whole network will learn about it.");
             println!("Check with: meshvpn status");
+        }
+        Cmd::Ssh { cmd: None } if unsafe { libc::isatty(1) } == 1 => {
+            require_root()?;
+            tui::run(&dir)?;
+        }
+        Cmd::Ssh { cmd } => {
+            let req = match cmd.unwrap_or(SshCmd::List) {
+                SshCmd::Allow { who, users } => {
+                    require_root()?;
+                    if sshd::enable()? {
+                        println!(
+                            "Enabled password-less logins from mesh nodes in sshd ({}).",
+                            sshd::DROPIN
+                        );
+                    }
+                    control::Request::SshAllow { who, users }
+                }
+                SshCmd::Deny { who, users } => {
+                    require_root()?;
+                    control::Request::SshDeny { who, users }
+                }
+                SshCmd::List => control::Request::SshList,
+            };
+            if let control::Response::Message { text } =
+                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
+            {
+                println!("{}", text.trim_end());
+            }
+        }
+        Cmd::SshAuthorizedKeys { user } => {
+            // Called by sshd for every login attempt: never fail loudly, just offer nothing.
+            let req = control::Request::AuthorizedKeys { user };
+            if let Ok(rt) = tokio::runtime::Runtime::new()
+                && let Ok(control::Response::Message { text }) = rt.block_on(control::request(&dir, &req))
+            {
+                print!("{text}");
+            }
         }
         Cmd::Ban { who } => {
             let resp =
@@ -582,6 +652,7 @@ fn stop_other_daemons() -> Vec<(i32, String)> {
 fn uninstall() -> Result<()> {
     require_root()?;
     let _ = systemctl(&["disable", "--now", "meshvpn"]);
+    sshd::disable();
     std::fs::remove_file(UNIT_PATH).ok();
     let _ = systemctl(&["daemon-reload"]);
     println!("meshvpn service removed (configuration kept).");

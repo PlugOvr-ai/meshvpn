@@ -68,6 +68,18 @@ impl SshTunnel {
     }
 }
 
+/// Password-less SSH login rule: `node` (optionally only its user `from_user`) may log in
+/// here as any of `users`. Bound to the node's id, so a name can't be hijacked.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SshAllow {
+    pub node: crate::keys::NodeId,
+    /// Node name when the rule was made (for display).
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_user: Option<String>,
+    pub users: Vec<String>,
+}
+
 /// A network key used before the current one (see `meshvpn ban`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OldKey {
@@ -120,6 +132,10 @@ pub struct Config {
     /// Install new releases from GitHub automatically (checked every 6 hours).
     #[serde(default = "default_true")]
     pub auto_update: bool,
+    /// Publish the SSH public keys of this machine's users, so other nodes can allow them to
+    /// log in without a password.
+    #[serde(default = "default_true")]
+    pub publish_ssh_keys: bool,
     /// Make all outgoing connections through this SOCKS5 proxy (`host:port`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socks_proxy: Option<String>,
@@ -134,6 +150,9 @@ pub struct Config {
     pub old_keys: Vec<OldKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banned: Vec<BannedNode>,
+    /// Who may log in here over SSH without a password (see `meshvpn ssh`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_allow: Vec<SshAllow>,
 }
 
 impl Config {
@@ -152,6 +171,8 @@ impl Config {
             mtu: default_mtu(),
             manage_hosts: true,
             auto_update: true,
+            publish_ssh_keys: true,
+            ssh_allow: vec![],
             socks_proxy: None,
             no_outbound: false,
             ssh_tunnel: None,

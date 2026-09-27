@@ -135,6 +135,7 @@ struct State {
     key_version: u32,
     rotation: Option<(SignedRotation, Rotation)>,
     banned: HashMap<NodeId, String>,
+    ssh_allow: Vec<crate::config::SshAllow>,
 }
 
 pub struct Node {
@@ -182,6 +183,22 @@ pub struct Status {
     #[serde(default)]
     pub banned: Vec<String>,
     pub peers: Vec<PeerStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SshSource {
+    pub id: NodeId,
+    pub name: String,
+    pub online: bool,
+    /// Users that publish an SSH key.
+    pub users: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SshOverview {
+    pub hostname: String,
+    pub nodes: Vec<SshSource>,
+    pub rules: Vec<crate::config::SshAllow>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -248,6 +265,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.keys = keys;
         st.key_version = node.cfg.key_version;
         st.banned = node.cfg.banned.iter().map(|b| (b.id, b.name.clone())).collect();
+        st.ssh_allow = node.cfg.ssh_allow.clone();
         if let Some(r) = saved.rotation
             && let Ok(body) = r.verify(&node.net)
             && body.version == st.key_version
@@ -355,6 +373,11 @@ impl Node {
             seq: st.my_seq,
             net: self.net.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
+            ssh_keys: if self.cfg.publish_ssh_keys {
+                local_ssh_keys()
+            } else {
+                vec![]
+            },
         };
         st.my_signed = Some(SignedInfo::sign(&info, &self.ident));
     }
@@ -469,6 +492,215 @@ impl Node {
             frames.push(frame(T_FORGET, &serde_json::to_vec(c).unwrap()));
         }
         frames
+    }
+
+    // ----------------------------------------------------------------------------- ssh logins
+
+    /// What sshd asks (AuthorizedKeysCommand): keys that may log in as local `user`, each
+    /// pinned to its node's mesh IP (which meshvpn guarantees can't be spoofed).
+    pub fn authorized_keys(&self, user: &str) -> String {
+        let st = self.state.lock().unwrap();
+        let mut out = String::new();
+        for rule in st.ssh_allow.iter().filter(|r| r.users.iter().any(|u| u == user)) {
+            let Some(rec) = st.records.get(&rule.node) else {
+                continue;
+            };
+            let ip = overlay_ip(&rule.node);
+            for k in &rec.info.ssh_keys {
+                if rule.from_user.as_ref().is_none_or(|u| *u == k.user) {
+                    out.push_str(&format!(
+                        "from=\"{ip}\" {} meshvpn:{}@{}\n",
+                        k.key, k.user, rec.info.name
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolves `[user@]node` to a rule key.
+    fn resolve_ssh_source(&self, st: &State, who: &str) -> Result<(NodeId, String, Option<String>)> {
+        let (user, node) = match who.split_once('@') {
+            Some((u, n)) => (Some(u.to_string()), n),
+            None => (None, who),
+        };
+        if let Some(u) = &user
+            && !crate::proto::valid_user(u)
+        {
+            bail!("invalid user name {u:?}");
+        }
+        let node = node.trim().to_lowercase();
+        let mut matches: Vec<&Record> = st
+            .records
+            .values()
+            .filter(|r| r.info.name == node || (node.len() >= 4 && r.info.id.hex().starts_with(&node)))
+            .collect();
+        // Same name twice (e.g. a re-installed machine): the online, newest one is meant.
+        matches.sort_by_key(|r| (!self.is_online(st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+        let Some(rec) = matches.first() else {
+            bail!("no node named {node:?} (see meshvpn status)");
+        };
+        Ok((rec.info.id, rec.info.name.clone(), user))
+    }
+
+    fn save_ssh_rules(&self, st: &State) -> Result<()> {
+        let mut cfg = Config::load(&self.dir)?;
+        cfg.ssh_allow = st.ssh_allow.clone();
+        cfg.save(&self.dir)
+    }
+
+    /// `meshvpn ssh allow [user@]node --as local-user...`
+    pub fn ssh_allow(&self, who: &str, users: Vec<String>) -> Result<String> {
+        if let Some(u) = users.iter().find(|u| !crate::proto::valid_user(u)) {
+            bail!("invalid user name {u:?}");
+        }
+        let mut st = self.state.lock().unwrap();
+        let (node, name, from_user) = self.resolve_ssh_source(&st, who)?;
+        let keys = st.records[&node]
+            .info
+            .ssh_keys
+            .iter()
+            .filter(|k| from_user.as_ref().is_none_or(|u| *u == k.user))
+            .count();
+        match st
+            .ssh_allow
+            .iter_mut()
+            .find(|r| r.node == node && r.from_user == from_user)
+        {
+            Some(rule) => {
+                for u in &users {
+                    if !rule.users.contains(u) {
+                        rule.users.push(u.clone());
+                    }
+                }
+                rule.name = name.clone();
+            }
+            None => st.ssh_allow.push(crate::config::SshAllow {
+                node,
+                name: name.clone(),
+                from_user: from_user.clone(),
+                users: users.clone(),
+            }),
+        }
+        self.save_ssh_rules(&st)?;
+        let src = from_user
+            .map(|u| format!("{u}@{name}"))
+            .unwrap_or_else(|| format!("any user on {name}"));
+        let mut msg = format!("{src} may now log in here as {} without a password", users.join(", "));
+        if keys == 0 {
+            msg.push_str(&format!(
+                "\nnote: {name} publishes no SSH key for that user yet - create one there with `ssh-keygen` \
+                 (it is picked up within a minute)"
+            ));
+        }
+        Ok(msg)
+    }
+
+    /// `meshvpn ssh deny [user@]node [--as local-user...]` (no users = remove the rule).
+    pub fn ssh_deny(&self, who: &str, users: Vec<String>) -> Result<String> {
+        let mut st = self.state.lock().unwrap();
+        let (node, name, from_user) = match self.resolve_ssh_source(&st, who) {
+            Ok(r) => r,
+            // The node may be gone already: match the rules by name.
+            Err(_) => {
+                let (u, n) = match who.split_once('@') {
+                    Some((u, n)) => (Some(u.to_string()), n.to_string()),
+                    None => (None, who.to_string()),
+                };
+                let rule = st.ssh_allow.iter().find(|r| r.name == n && r.from_user == u);
+                let rule = rule.ok_or_else(|| anyhow!("no rule for {who} (see meshvpn ssh list)"))?;
+                (rule.node, n, u)
+            }
+        };
+        let before = st.ssh_allow.clone();
+        for rule in st
+            .ssh_allow
+            .iter_mut()
+            .filter(|r| r.node == node && r.from_user == from_user)
+        {
+            if users.is_empty() {
+                rule.users.clear();
+            } else {
+                rule.users.retain(|u| !users.contains(u));
+            }
+        }
+        st.ssh_allow.retain(|r| !r.users.is_empty());
+        if st.ssh_allow == before {
+            bail!("no rule for {who} (see meshvpn ssh list)");
+        }
+        self.save_ssh_rules(&st)?;
+        Ok(format!("updated password-less logins from {name}"))
+    }
+
+    pub fn ssh_list(&self) -> String {
+        let st = self.state.lock().unwrap();
+        let mut out = String::from("Password-less SSH logins into this machine:\n");
+        if st.ssh_allow.is_empty() {
+            out.push_str("  (none) - allow some with: sudo meshvpn ssh allow [user@]node --as <local user>\n");
+        }
+        for r in &st.ssh_allow {
+            let src = r
+                .from_user
+                .as_ref()
+                .map(|u| format!("{u}@{}", r.name))
+                .unwrap_or(format!("{} (any user)", r.name));
+            let gone = if st.records.contains_key(&r.node) {
+                ""
+            } else {
+                "  [node unknown/offline]"
+            };
+            out.push_str(&format!("  {src:<32} -> {}{gone}\n", r.users.join(", ")));
+        }
+        out.push_str("\nSSH keys this machine offers to other nodes:\n");
+        let keys = if self.cfg.publish_ssh_keys {
+            local_ssh_keys()
+        } else {
+            vec![]
+        };
+        if keys.is_empty() {
+            out.push_str("  (none)\n");
+        }
+        for k in keys {
+            out.push_str(&format!("  {:<16} {}\n", k.user, k.key.split(' ').next().unwrap_or("")));
+        }
+        out
+    }
+
+    /// Everything the SSH permission editor needs.
+    pub fn ssh_overview(&self) -> SshOverview {
+        let st = self.state.lock().unwrap();
+        let mut nodes: Vec<SshSource> = st
+            .records
+            .values()
+            .map(|r| {
+                let mut users: Vec<String> = r.info.ssh_keys.iter().map(|k| k.user.clone()).collect();
+                users.dedup();
+                SshSource {
+                    id: r.info.id,
+                    name: r.info.name.clone(),
+                    online: self.is_online(&st, &r.info.id),
+                    users,
+                }
+            })
+            .collect();
+        nodes.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
+        SshOverview {
+            hostname: self.cfg.name.clone(),
+            nodes,
+            rules: st.ssh_allow.clone(),
+        }
+    }
+
+    /// Replaces all rules (the permission editor saves everything at once).
+    pub fn ssh_set_rules(&self, rules: Vec<crate::config::SshAllow>) -> Result<()> {
+        for r in &rules {
+            if r.users.iter().chain(&r.from_user).any(|u| !crate::proto::valid_user(u)) {
+                bail!("invalid user name in rule for {}", r.name);
+            }
+        }
+        let mut st = self.state.lock().unwrap();
+        st.ssh_allow = rules.into_iter().filter(|r| !r.users.is_empty()).collect();
+        self.save_ssh_rules(&st)
     }
 
     // ----------------------------------------------------------------------------- banning
@@ -1490,6 +1722,36 @@ impl Node {
             tokio::spawn(self.clone().dial(key, addrs, boot));
         }
     }
+}
+
+/// Public keys (`~/.ssh/id_*.pub`) of this machine's login accounts.
+fn local_ssh_keys() -> Vec<crate::proto::SshKey> {
+    let mut out = vec![];
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        let (Some(user), Some(uid), Some(home)) = (f.first(), f.get(2), f.get(5)) else {
+            continue;
+        };
+        let Ok(uid) = uid.parse::<u32>() else { continue };
+        if (uid != 0 && uid < 1000) || uid >= 65534 || !crate::proto::valid_user(user) {
+            continue;
+        }
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa", "id_ed25519_sk", "id_ecdsa_sk"] {
+            let Ok(text) = std::fs::read_to_string(format!("{home}/.ssh/{name}.pub")) else {
+                continue;
+            };
+            let key: Vec<&str> = text.split_whitespace().take(2).collect();
+            let key = key.join(" ");
+            if crate::proto::valid_ssh_key(&key) && out.len() < 64 {
+                out.push(crate::proto::SshKey {
+                    user: user.to_string(),
+                    key,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The address of the interface used for the default route (no packets are sent).

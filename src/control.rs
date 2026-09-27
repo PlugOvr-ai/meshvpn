@@ -15,6 +15,23 @@ use crate::node::{Node, Status};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    /// For sshd's AuthorizedKeysCommand (runs as nobody).
+    AuthorizedKeys {
+        user: String,
+    },
+    SshList,
+    SshOverview,
+    SshSetRules {
+        rules: Vec<crate::config::SshAllow>,
+    },
+    SshAllow {
+        who: String,
+        users: Vec<String>,
+    },
+    SshDeny {
+        who: String,
+        users: Vec<String>,
+    },
     AddPeer {
         addr: String,
     },
@@ -35,6 +52,7 @@ pub enum Request {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Status(Box<Status>),
+    SshOverview(Box<crate::node::SshOverview>),
     Ok,
     Message { text: String },
     Error { message: String },
@@ -73,6 +91,11 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
             }
             let resp = match serde_json::from_str::<Request>(&line) {
                 Ok(Request::Status) => Response::Status(Box::new(node.status())),
+                Ok(Request::AuthorizedKeys { user }) => Response::Message {
+                    text: node.authorized_keys(&user),
+                },
+                Ok(Request::SshList) => Response::Message { text: node.ssh_list() },
+                Ok(Request::SshOverview) => Response::SshOverview(Box::new(node.ssh_overview())),
                 Ok(_) if !privileged => Response::Error {
                     message: "permission denied - try again with sudo".into(),
                 },
@@ -87,6 +110,24 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                 },
                 Ok(Request::Forget { who }) => match node.forget(who.as_deref()) {
                     Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::SshAllow { who, users }) => match node.ssh_allow(&who, users) {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::SshDeny { who, users }) => match node.ssh_deny(&who, users) {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::SshSetRules { rules }) => match node.ssh_set_rules(rules) {
+                    Ok(()) => Response::Ok,
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },

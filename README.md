@@ -109,6 +109,42 @@ jump host with `restrict,port-forwarding,command="echo meshvpn-ok"`: port forwar
 connection the device reaches the other nodes and GitHub (for updates). The script detects how the device reaches the
 jump host; if it can't, pass `--jump user@host[:port]`. Run the script again to update the device.
 
+## Password-less SSH between nodes
+
+Each machine decides for itself who may log in to it without a password. Open the editor on the machine you want to log
+in *to*:
+
+```sh
+sudo meshvpn ssh
+```
+
+```
+Who may log in to server over SSH without a password
+┌──────────────────────────────────────────────┐
+│from \ as            bob    carol  root       │
+│● laptop (any user)   [ ]    [ ]    [ ]        │
+│●   alice@laptop      [ ]    [x]    [ ]        │
+│●   eve@laptop        [ ]    [ ]    [ ]        │
+└──────────────────────────────────────────────┘
+↑↓←→ move   space allow/deny   s save   q quit
+```
+
+Then, on the laptop, alice just runs `ssh carol@server.mesh`. The same works from scripts:
+
+```sh
+sudo meshvpn ssh allow alice@laptop --as carol   # one user of a node
+sudo meshvpn ssh allow laptop --as bob           # any user of a node
+sudo meshvpn ssh deny alice@laptop               # take it back
+meshvpn ssh list                                 # show rules and the keys this machine offers
+```
+
+How it works: every node publishes the SSH public keys of its users (`~/.ssh/id_*.pub`) in its signed record; disable
+with `publish_ssh_keys = false`. The first `allow` adds `/etc/ssh/sshd_config.d/meshvpn.conf`, which makes your normal
+OpenSSH server ask meshvpn for additional keys at each login. meshvpn answers only with keys you allowed, each limited
+to `from="<that node's mesh IP>"`, which meshvpn guarantees can't be spoofed. Rules are bound to the node's identity,
+not its name. Your other SSH settings and existing logins stay as they are. Needs OpenSSH with `sshd_config.d` support
+(Debian/Ubuntu/Fedora); a user without a key creates one with `ssh-keygen`.
+
 ## Everyday use
 
 | Command | What it does |
@@ -118,6 +154,7 @@ jump host; if it can't, pass `--jump user@host[:port]`. Run the script again to 
 | `sudo meshvpn update` | Install the latest release now. Nodes also update themselves automatically: they check every ~6 hours; disable with `auto_update = false` |
 | `sudo meshvpn forget <name>` | Remove an offline node (e.g. an old identity of a re-installed machine) from all nodes. `--offline` forgets all offline nodes. If an offline node's name is taken by a newer online node, it's forgotten automatically after 10 minutes |
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
+| `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
 | `sudo meshvpn add-peer host:port` | Connect to a node at an address, e.g. an inbound-only node |
 
 ### Banning a node
