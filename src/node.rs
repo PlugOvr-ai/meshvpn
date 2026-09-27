@@ -130,13 +130,17 @@ struct State {
     hosts_written: String,
     update_available: Option<String>,
     forgotten: HashMap<NodeId, Forget>,
+    /// Network keys by version; `key_version` is the current one.
+    keys: HashMap<u32, [u8; 32]>,
+    key_version: u32,
+    rotation: Option<(SignedRotation, Rotation)>,
+    banned: HashMap<NodeId, String>,
 }
 
 pub struct Node {
     cfg: Config,
     dir: PathBuf,
     ident: Identity,
-    psk: [u8; 32],
     net: String,
     my_ip: Ipv4Addr,
     tun: Arc<tun::AsyncDevice>,
@@ -175,6 +179,8 @@ pub struct Status {
     pub version: String,
     #[serde(default)]
     pub update_available: Option<String>,
+    #[serde(default)]
+    pub banned: Vec<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -194,7 +200,7 @@ pub struct PeerStatus {
 
 pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     let ident = Identity::from_config(&cfg)?;
-    let psk = cfg.network_key()?;
+    let keys = cfg.all_keys()?;
     let my_ip = overlay_ip(&ident.id);
 
     let mut tcfg = tun::Configuration::default();
@@ -216,8 +222,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     let node = Arc::new(Node {
         dir: dir.clone(),
         ident,
-        net: crate::keys::network_tag(&psk),
-        psk,
+        net: cfg.network_id(),
         my_ip,
         tun: Arc::new(tun),
         state: Mutex::new(State::default()),
@@ -232,6 +237,15 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         let mut st = node.state.lock().unwrap();
         if let Some(me) = saved.me.and_then(|m| m.verify(&node.net).ok()) {
             st.my_seq = me.seq;
+        }
+        st.keys = keys;
+        st.key_version = node.cfg.key_version;
+        st.banned = node.cfg.banned.iter().map(|b| (b.id, b.name.clone())).collect();
+        if let Some(r) = saved.rotation
+            && let Ok(body) = r.verify(&node.net)
+            && body.version == st.key_version
+        {
+            st.rotation = Some((r, body));
         }
         let cutoff = now_ms().saturating_sub(FORGET_AFTER_MS);
         for f in saved.forgotten.into_iter().filter(|f| f.at > cutoff) {
@@ -380,6 +394,9 @@ impl Node {
         if st.forgotten.get(&info.id).is_some_and(|f| f.seq >= info.seq) {
             return false;
         }
+        if st.banned.contains_key(&info.id) {
+            return false;
+        }
         if live && info.seq > now_ms() + 3_600_000 {
             debug!("dropping record from the future for {}", info.id);
             return false;
@@ -437,11 +454,202 @@ impl Node {
             .chunks(GOSSIP_BATCH)
             .map(|c| frame(T_GOSSIP, &serde_json::to_vec(c).unwrap()))
             .collect();
+        if let Some((r, _)) = &st.rotation {
+            frames.insert(0, frame(T_ROTATE, &serde_json::to_vec(r).unwrap()));
+        }
         let forgotten: Vec<Forget> = st.forgotten.values().copied().collect();
         for c in forgotten.chunks(256) {
             frames.push(frame(T_FORGET, &serde_json::to_vec(c).unwrap()));
         }
         frames
+    }
+
+    // ----------------------------------------------------------------------------- banning
+
+    /// Drops a banned node: its record, its link and its address.
+    fn ban_local(&self, st: &mut State, id: NodeId, name: &str) {
+        if id == self.ident.id || st.banned.contains_key(&id) {
+            return;
+        }
+        st.banned.insert(id, name.to_string());
+        st.records.remove(&id);
+        st.ciphers.remove(&id);
+        if let Some(l) = st.links.remove(&id) {
+            l.kill.notify_one();
+        }
+        warn!("banned node {name} ({id})");
+    }
+
+    /// Accepts a (newer) rotation: applies its bans and unseals our copy of the new key.
+    fn apply_rotation(&self, st: &mut State, signed: SignedRotation) -> bool {
+        let r = match signed.verify(&self.net) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("dropping key rotation: {e}");
+                return false;
+            }
+        };
+        if st.banned.contains_key(&r.issuer) {
+            return false;
+        }
+        let current = st.rotation.as_ref().map(|(_, c)| (c.version, c.issuer));
+        let newer =
+            r.version > st.key_version || (r.version == st.key_version && current < Some((r.version, r.issuer)));
+        if !newer {
+            return false;
+        }
+        for (id, name) in &r.banned {
+            if *id == self.ident.id {
+                warn!("this node was banned from the network");
+            }
+            self.ban_local(st, *id, name);
+        }
+        if r.issuer != self.ident.id {
+            let Some(env) = r.envelopes.iter().find(|e| e.to == self.ident.id) else {
+                warn!("the network key was changed and this node did not get the new one (banned?)");
+                return true;
+            };
+            match self.unseal(&r, env) {
+                Some(key) => {
+                    st.keys.insert(r.version, key);
+                    st.key_version = r.version;
+                    info!("network key changed to version {} (after a ban)", r.version);
+                }
+                None => {
+                    warn!("could not open the new network key");
+                    return true;
+                }
+            }
+        }
+        st.rotation = Some((signed, r));
+        self.save_keys(st);
+        self.rebuild(st);
+        true
+    }
+
+    fn unseal(&self, r: &Rotation, env: &Envelope) -> Option<[u8; 32]> {
+        let key = self.ident.envelope_key(&r.issuer_noise, r.version);
+        let nonce: [u8; 24] = crate::keys::unb64(&env.nonce).ok()?.try_into().ok()?;
+        let sealed = crate::keys::unb64(&env.sealed).ok()?;
+        let plain = XChaCha20Poly1305::new(&key.into())
+            .decrypt(&XNonce::from(nonce), sealed.as_slice())
+            .ok()?;
+        plain.try_into().ok()
+    }
+
+    /// Persists keys and bans, so they survive restarts and new invites carry the new key.
+    fn save_keys(&self, st: &State) {
+        let res = (|| -> Result<()> {
+            let mut cfg = Config::load(&self.dir)?;
+            if cfg.network_id.is_empty() {
+                cfg.network_id = self.net.clone();
+            }
+            let current = st.keys.get(&st.key_version).context("current key missing")?;
+            cfg.network_key = crate::keys::b64(current);
+            cfg.key_version = st.key_version;
+            let mut old: Vec<_> = st.keys.iter().filter(|(v, _)| **v != st.key_version).collect();
+            old.sort_by_key(|(v, _)| **v);
+            cfg.old_keys = old
+                .into_iter()
+                .map(|(v, k)| crate::config::OldKey {
+                    version: *v,
+                    key: crate::keys::b64(k),
+                })
+                .collect();
+            cfg.banned = st
+                .banned
+                .iter()
+                .map(|(id, name)| crate::config::BannedNode {
+                    id: *id,
+                    name: name.clone(),
+                })
+                .collect();
+            cfg.save(&self.dir)
+        })();
+        if let Err(e) = res {
+            warn!("saving the new network key: {e:#}");
+        }
+    }
+
+    fn handle_rotation(&self, from: NodeId, payload: &[u8]) {
+        let Ok(signed) = serde_json::from_slice::<SignedRotation>(payload) else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        if self.apply_rotation(&mut st, signed.clone()) {
+            self.broadcast(&st, &frame(T_ROTATE, &serde_json::to_vec(&signed).unwrap()), Some(from));
+            drop(st);
+            self.save_state();
+            self.update_hosts();
+        }
+    }
+
+    /// `meshvpn ban NAME|ID`: bans the node everywhere and gives everyone else a new key.
+    pub fn ban(&self, who: &str) -> Result<String> {
+        let mut st = self.state.lock().unwrap();
+        let w = who.trim().to_lowercase();
+        if w == self.cfg.name || (w.len() >= 4 && self.ident.id.hex().starts_with(&w)) {
+            bail!("{w} is this node");
+        }
+        let targets: Vec<(NodeId, String)> = st
+            .records
+            .values()
+            .filter(|r| r.info.name == w || (w.len() >= 4 && r.info.id.hex().starts_with(&w)))
+            .map(|r| (r.info.id, r.info.name.clone()))
+            .collect();
+        if targets.is_empty() {
+            bail!("no node named {w:?} (see meshvpn status)");
+        }
+        for (id, name) in &targets {
+            self.ban_local(&mut st, *id, name);
+        }
+
+        let version = st.key_version + 1;
+        let new_key = crate::keys::random32();
+        let envelopes: Vec<Envelope> = st
+            .records
+            .values()
+            .map(|r| {
+                let key = self.ident.envelope_key(&r.info.noise_pub, version);
+                let mut nonce = [0u8; 24];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                let sealed = XChaCha20Poly1305::new(&key.into())
+                    .encrypt(&XNonce::from(nonce), new_key.as_slice())
+                    .expect("sealing");
+                Envelope {
+                    to: r.info.id,
+                    nonce: crate::keys::b64(&nonce),
+                    sealed: crate::keys::b64(&sealed),
+                }
+            })
+            .collect();
+        let members = envelopes.len();
+        let rotation = Rotation {
+            net: self.net.clone(),
+            version,
+            issuer: self.ident.id,
+            issuer_noise: self.ident.noise_pub,
+            banned: st.banned.iter().map(|(id, n)| (*id, n.clone())).collect(),
+            envelopes,
+            at: now_ms(),
+        };
+        let signed = SignedRotation::sign(&rotation, &self.ident);
+        st.keys.insert(version, new_key);
+        st.key_version = version;
+        st.rotation = Some((signed.clone(), rotation));
+        self.save_keys(&st);
+        self.rebuild(&mut st);
+        self.broadcast(&st, &frame(T_ROTATE, &serde_json::to_vec(&signed).unwrap()), None);
+        drop(st);
+        self.save_state();
+        self.update_hosts();
+        let names: Vec<_> = targets.into_iter().map(|(_, n)| n).collect();
+        Ok(format!(
+            "banned {}. The network key was changed and sent to the other {members} member(s); \
+             members that are offline now get it when they reconnect. Old invites no longer work - \
+             create new ones with `meshvpn invite`.",
+            names.join(", ")
+        ))
     }
 
     // ----------------------------------------------------------------------------- forgetting
@@ -625,7 +833,7 @@ impl Node {
             return Some(c.clone());
         }
         let rec = st.records.get(peer)?;
-        let key = self.ident.e2e_key(&rec.info.noise_pub, &self.psk);
+        let key = self.ident.e2e_key(&rec.info.noise_pub, &self.net);
         let c = XChaCha20Poly1305::new(&key.into());
         st.ciphers.insert(*peer, c.clone());
         Some(c)
@@ -724,6 +932,12 @@ impl Node {
                     tokio::spawn(async move {
                         match node.establish(stream, false, addr.to_string()).await {
                             Ok(est) => node.serve(est).await,
+                            Err(e)
+                                if e.to_string().contains("banned")
+                                    || e.to_string().contains("outdated network key") =>
+                            {
+                                warn!("rejected connection from {addr}: {e:#}")
+                            }
                             Err(e) => debug!("incoming connection from {addr}: {e:#}"),
                         }
                     });
@@ -750,9 +964,13 @@ impl Node {
     async fn establish(self: &Arc<Self>, mut stream: TcpStream, initiator: bool, addr: String) -> Result<Established> {
         stream.set_nodelay(true).ok();
         let observed = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-        let (transport, remote_static) = timeout(
+        let (my_version, keys) = {
+            let st = self.state.lock().unwrap();
+            (st.key_version, st.keys.clone())
+        };
+        let (transport, remote_static, version) = timeout(
             HANDSHAKE_TIMEOUT,
-            link::handshake(&mut stream, initiator, &self.ident.noise_secret, &self.psk),
+            link::handshake(&mut stream, initiator, &self.ident.noise_secret, my_version, &keys),
         )
         .await
         .map_err(|_| anyhow!("handshake timed out"))??;
@@ -783,6 +1001,26 @@ impl Node {
         let peer = info.id;
         if peer == self.ident.id {
             bail!("connected to myself");
+        }
+        {
+            let st = self.state.lock().unwrap();
+            if st.banned.contains_key(&peer) {
+                bail!("{} ({peer}) is banned", info.name);
+            }
+            // An old network key is only good for members that got the new one sealed for
+            // them; they receive it right after connecting.
+            if version < st.key_version
+                && !st
+                    .rotation
+                    .as_ref()
+                    .is_some_and(|(_, r)| r.envelopes.iter().any(|e| e.to == peer))
+            {
+                bail!(
+                    "{} ({peer}) uses an outdated network key and was not a member when it changed \
+                     (banned, or it joined with an old invite - give it a new one)",
+                    info.name
+                );
+            }
         }
 
         let (tx, rx) = mpsc::channel(1024);
@@ -872,6 +1110,7 @@ impl Node {
                 }
                 T_GOSSIP => self.handle_gossip(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
+                T_ROTATE => self.handle_rotation(peer, payload),
                 T_PING => {
                     let st = self.state.lock().unwrap();
                     if let Some(l) = st.links.get(&peer) {
@@ -1056,6 +1295,7 @@ impl Node {
             me: st.my_signed.clone(),
             peers: st.records.values().map(|r| r.signed.clone()).collect(),
             forgotten: st.forgotten.values().copied().collect(),
+            rotation: st.rotation.as_ref().map(|(r, _)| r.clone()),
         };
         drop(st);
         if let Err(e) = saved.save(&self.dir) {
@@ -1143,6 +1383,7 @@ impl Node {
             warnings: range_conflicts(&self.cfg.interface),
             version: crate::update::CURRENT.into(),
             update_available: st.update_available.clone(),
+            banned: st.banned.values().cloned().collect(),
             peers,
         }
     }

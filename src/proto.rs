@@ -11,6 +11,7 @@ pub const T_DATA: u8 = 3;
 pub const T_PING: u8 = 4;
 pub const T_PONG: u8 = 5;
 pub const T_FORGET: u8 = 6;
+pub const T_ROTATE: u8 = 7;
 
 /// Header of a data frame: dst(32) src(32) ttl(1) nonce(24), followed by the sealed IP packet.
 pub const DATA_HDR: usize = 32 + 32 + 1 + 24;
@@ -84,6 +85,52 @@ pub struct Forget {
     pub seq: u64,
     /// When it was issued (ms since epoch), so it can expire.
     pub at: u64,
+}
+
+/// The new network key, sealed for one member.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Envelope {
+    pub to: NodeId,
+    pub nonce: String,
+    pub sealed: String,
+}
+
+/// A ban: the listed nodes are out, and every other member gets a new network key so the
+/// banned ones cannot come back under a new identity.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Rotation {
+    pub net: String,
+    pub version: u32,
+    pub issuer: NodeId,
+    pub issuer_noise: Key32,
+    /// All nodes banned so far (so members that were away learn about every ban).
+    pub banned: Vec<(NodeId, String)>,
+    pub envelopes: Vec<Envelope>,
+    pub at: u64,
+}
+
+/// A rotation signed by the member that issued it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SignedRotation {
+    pub data: String,
+    pub sig: String,
+}
+
+impl SignedRotation {
+    pub fn sign(r: &Rotation, ident: &Identity) -> Self {
+        let data = serde_json::to_string(r).unwrap();
+        let sig = b64(&ident.sign(data.as_bytes()));
+        SignedRotation { data, sig }
+    }
+
+    pub fn verify(&self, net: &str) -> Result<Rotation> {
+        let r: Rotation = serde_json::from_str(&self.data)?;
+        verify(&r.issuer, self.data.as_bytes(), &unb64(&self.sig)?)?;
+        if r.net != net {
+            bail!("key rotation of another network");
+        }
+        Ok(r)
+    }
 }
 
 #[derive(Serialize, Deserialize)]

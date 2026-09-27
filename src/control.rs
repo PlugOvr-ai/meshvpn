@@ -22,6 +22,9 @@ pub enum Request {
         check_only: bool,
         force: bool,
     },
+    Ban {
+        who: String,
+    },
     /// Forget an offline node by name or id; `None` = all offline nodes.
     Forget {
         who: Option<String>,
@@ -83,6 +86,12 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                     },
                 },
                 Ok(Request::Forget { who }) => match node.forget(who.as_deref()) {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::Ban { who }) => match node.ban(&who) {
                     Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),

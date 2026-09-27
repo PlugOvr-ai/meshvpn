@@ -92,28 +92,67 @@ Requirements: `ssh` must log in without a password as root, or pass `--ssh-ident
 on any node in the network run `sudo meshvpn add-peer jump.example.com:7871`. The address is remembered, and gossip tells
 every other node about it.
 
+## Devices without internet access
+
+If a device can't reach the internet at all, but you can SSH into it from a jump host (e.g. through its existing reverse
+tunnel on `localhost:2222`), install it **from the jump host**. Nothing is installed on the jump host:
+
+```sh
+# on the jump host; get the invite from `meshvpn invite` on any member
+curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/deploy.sh \
+  | sh -s -- --invite mesh1-... user@localhost -p 2222
+```
+
+The script downloads the right binary on the jump host and uploads it. It then installs it on the device with `sudo`
+and joins the network. The device gets its own SSH key, which the script adds to your `~/.ssh/authorized_keys` on the
+jump host with `restrict,port-forwarding,command="echo meshvpn-ok"`: port forwarding only, no shell. Through that SSH
+connection the device reaches the other nodes and GitHub (for updates). The script detects how the device reaches the
+jump host; if it can't, pass `--jump user@host[:port]`. Run the script again to update the device.
+
+## Everyday use
+
+| Command | What it does |
+|---|---|
+| `meshvpn status` | This node and its peers (no sudo needed) |
+| `sudo meshvpn invite` | Print an invite code for a new machine |
+| `sudo meshvpn update` | Install the latest release now. Nodes also update themselves automatically: they check every ~6 hours; disable with `auto_update = false` |
+| `sudo meshvpn forget <name>` | Remove an offline node (e.g. an old identity of a re-installed machine) from all nodes. `--offline` forgets all offline nodes. If an offline node's name is taken by a newer online node, it's forgotten automatically after 10 minutes |
+| `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
+| `sudo meshvpn add-peer host:port` | Connect to a node at an address, e.g. an inbound-only node |
+
+### Banning a node
+
+`sudo meshvpn ban <name>` works without setting the network up again. Every node drops the banned node and refuses it
+from then on. The network key is also changed, and the new key is sent to every *other* member, sealed individually for
+each one. That way the banned device can't rejoin under a new identity with the key it already has. Members that are
+offline during the ban may connect once with the old key when they come back, and then receive the new one. Invites
+created before the ban stop working, so create new ones with `meshvpn invite`. IP addresses and names stay the same.
+
 ## How it works
 
 | Piece | Design |
 |---|---|
 | Identity | Each node has an ed25519 key (its node id) and an X25519 key. |
-| Membership | A shared 32-byte network key from the invite. Links use Noise `XXpsk3` with it as the PSK: without the key, the handshake fails. |
+| Membership | A shared 32-byte network key from the invite. Links use Noise `XXpsk3` with it as the PSK: without the key, the handshake fails. Banning a node changes the key (the key is versioned). |
 | Addresses | `100.64.0.0/10` + 22 bits of `blake3(node id)`. Deterministic, so no allocation server is needed. |
 | Transport | TCP (the only thing an SSH tunnel can carry), with one link per pair of nodes. |
 | Discovery | Nodes sign a record (name, endpoints, neighbors, sequence number) and gossip all records they know. A new link gets the full table; changes are flooded. The state is saved to disk, so the mesh survives losing the bootstrap node. |
 | Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers) or the SSH tunnel's public port. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
-| Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key mixed with the network key). Relays can't read or forge traffic, and the inner source IP must match the sender. |
+| Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key bound to the network id). Relays can't read or forge traffic, and the inner source IP must match the sender. |
 | Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable). |
 
-Files: `/etc/meshvpn/config.toml` (settings and secret keys, mode 0600), `state.json` (known nodes) and `meshvpn.sock`
-(control socket). Use `--dir` or `MESHVPN_DIR` to put them elsewhere, e.g. to run several nodes on one machine.
+Files: `/etc/meshvpn/config.toml` (settings and secret keys, mode 0600), `state.json` (known nodes) and `/run/meshvpn.sock`
+(control socket: anyone may ask for the status, but changes need root). Use `--dir` or `MESHVPN_DIR` to put them elsewhere, e.g. to run several nodes on one machine.
 Set `RUST_LOG=meshvpn=debug` for verbose logs.
 
 ## Security model and limitations
 
-* Everyone with the network key is a fully trusted member. You can't revoke a single node; to remove one, create a new
-  network and re-invite the others. Treat invite codes like passwords.
+* Everyone with the network key is a trusted member, and all members are equal: any member can ban any other. Treat
+  invite codes like passwords. Banning is covered above; if two members ban nodes at the same moment, run the ban again.
+* Updates are downloaded from this repository's GitHub releases and checked against the published SHA-256 checksums.
+  That protects against corrupted downloads, but not against a compromised GitHub account. Set `auto_update = false`
+  if you want to update manually.
 * The end-to-end layer has no replay protection or forward secrecy (the hop-by-hop Noise links have both).
 * IPv4 only, Linux only (the TUN setup and systemd integration).
 * The TCP transport means TCP-over-TCP, which works well on good links but degrades on lossy ones. There's no UDP hole

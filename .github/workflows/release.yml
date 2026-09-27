@@ -83,9 +83,9 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          cp ../install.sh .
+          cp ../install.sh ../deploy.sh .
           for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
-          sha256sum -- meshvpn-* *.deb *.rpm install.sh | grep -v '\.sha256$' > SHA256SUMS
+          sha256sum -- meshvpn-* *.deb *.rpm install.sh deploy.sh | grep -v '\.sha256$' > SHA256SUMS
           ls -l
 
       - name: Release notes
@@ -103,6 +103,12 @@ jobs:
 
           \`\`\`sh
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
+          \`\`\`
+
+          **A device without internet access** that you can SSH into from a jump host. Run this on the jump host; nothing is installed there:
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/deploy.sh | sh -s -- --invite mesh1-... user@localhost -p 2222
           \`\`\`
 
           **Debian / Ubuntu / Raspberry Pi OS:** download the \`.deb\` for your architecture, then \`sudo apt install ./meshvpn_*.deb\`

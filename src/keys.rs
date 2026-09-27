@@ -106,15 +106,25 @@ impl Identity {
         self.signing.sign(msg).to_bytes()
     }
 
-    /// Symmetric end-to-end key shared with `peer` (static-static X25519 + network key).
-    pub fn e2e_key(&self, peer_noise_pub: &Key32, network_key: &[u8; 32]) -> [u8; 32] {
+    /// Symmetric key shared with `peer` (static-static X25519), bound to `context`.
+    fn shared_key(&self, peer_noise_pub: &Key32, purpose: &str, context: &[u8]) -> [u8; 32] {
         let dh = StaticSecret::from(self.noise_secret)
             .diffie_hellman(&PublicKey::from(peer_noise_pub.0))
             .to_bytes();
-        let mut material = Vec::with_capacity(64);
-        material.extend_from_slice(&dh);
-        material.extend_from_slice(network_key);
-        blake3::derive_key("meshvpn e2e packet key v1", &material)
+        let mut material = dh.to_vec();
+        material.extend_from_slice(context);
+        blake3::derive_key(purpose, &material)
+    }
+
+    /// End-to-end packet key with `peer`. Does not depend on the network key, so rotating
+    /// it (on a ban) does not interrupt traffic.
+    pub fn e2e_key(&self, peer_noise_pub: &Key32, network_id: &str) -> [u8; 32] {
+        self.shared_key(peer_noise_pub, "meshvpn e2e packet key v2", network_id.as_bytes())
+    }
+
+    /// Key that seals a new network key (version `version`) for one member.
+    pub fn envelope_key(&self, peer_noise_pub: &Key32, version: u32) -> [u8; 32] {
+        self.shared_key(peer_noise_pub, "meshvpn key envelope v1", &version.to_be_bytes())
     }
 }
 
@@ -169,6 +179,9 @@ mod tests {
         let cfg = |_: u8| Identity::from_config(&crate::config::Config::new("a".into(), "n".into(), [0; 32])).unwrap();
         let (a, b) = (cfg(0), cfg(1));
         let psk = random32();
-        assert_eq!(a.e2e_key(&b.noise_pub, &psk), b.e2e_key(&a.noise_pub, &psk));
+        assert_eq!(a.e2e_key(&b.noise_pub, "net"), b.e2e_key(&a.noise_pub, "net"));
+        assert_eq!(a.envelope_key(&b.noise_pub, 3), b.envelope_key(&a.noise_pub, 3));
+        assert_ne!(a.envelope_key(&b.noise_pub, 3), a.envelope_key(&b.noise_pub, 4));
+        let _ = psk;
     }
 }

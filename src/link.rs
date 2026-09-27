@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use snow::{Builder, TransportState};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -35,12 +36,24 @@ async fn read_raw(r: &mut (impl AsyncReadExt + Unpin), buf: &mut [u8]) -> Result
 
 /// Runs the Noise handshake. Both sides must know the network key (psk), which is
 /// what makes the network private. Returns the remote's static (noise) key.
+///
+/// Both sides first announce the newest network key version they have and then use the
+/// older of the two (the newer side keeps its old keys), so a member that missed a key
+/// rotation can still connect and catch up. Returns the version used.
 pub async fn handshake(
     stream: &mut TcpStream,
     initiator: bool,
     local_key: &[u8; 32],
-    psk: &[u8; 32],
-) -> Result<(TransportState, Key32)> {
+    my_version: u32,
+    keys: &HashMap<u32, [u8; 32]>,
+) -> Result<(TransportState, Key32, u32)> {
+    stream.write_all(&my_version.to_be_bytes()).await?;
+    let mut theirs = [0u8; 4];
+    stream.read_exact(&mut theirs).await?;
+    let version = my_version.min(u32::from_be_bytes(theirs));
+    let psk = keys
+        .get(&version)
+        .ok_or_else(|| anyhow!("the other side uses network key version {version}, which this node never had"))?;
     let builder = Builder::new(NOISE_PARAMS.parse()?)
         .local_private_key(local_key)?
         .psk(3, psk)?
@@ -69,7 +82,7 @@ pub async fn handshake(
         hs.read_message(&msg[..n], &mut payload).map_err(|_| bad_key())?;
     }
     let remote = Key32::from_slice(hs.get_remote_static().context("no remote static key")?)?;
-    Ok((hs.into_transport_mode()?, remote))
+    Ok((hs.into_transport_mode()?, remote, version))
 }
 
 /// The two directions of an established link share the Noise state.
@@ -171,19 +184,18 @@ mod tests {
     use crate::keys::random32;
     use tokio::net::TcpListener;
 
-    async fn pair(
-        psk_a: [u8; 32],
-        psk_b: [u8; 32],
-    ) -> (Result<(TransportState, Key32)>, Result<(TransportState, Key32)>) {
+    type Hs = Result<(TransportState, Key32, u32)>;
+
+    async fn pair(psk_a: [u8; 32], psk_b: [u8; 32]) -> (Hs, Hs) {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let (ka, kb) = (random32(), random32());
         let server = tokio::spawn(async move {
             let (mut s, _) = l.accept().await.unwrap();
-            handshake(&mut s, false, &kb, &psk_b).await
+            handshake(&mut s, false, &kb, 0, &HashMap::from([(0, psk_b)])).await
         });
         let mut c = TcpStream::connect(addr).await.unwrap();
-        let a = handshake(&mut c, true, &ka, &psk_a).await;
+        let a = handshake(&mut c, true, &ka, 0, &HashMap::from([(0, psk_a)])).await;
         drop(c);
         (a, server.await.unwrap())
     }
@@ -192,8 +204,8 @@ mod tests {
     async fn same_network_key_connects() {
         let psk = random32();
         let (a, b) = pair(psk, psk).await;
-        let (mut ta, _) = a.unwrap();
-        let (mut tb, _) = b.unwrap();
+        let (mut ta, _, _) = a.unwrap();
+        let (mut tb, _, _) = b.unwrap();
         let mut buf = [0u8; 64];
         let mut out = [0u8; 64];
         let n = ta.write_message(b"hi", &mut buf).unwrap();

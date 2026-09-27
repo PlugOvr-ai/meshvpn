@@ -68,6 +68,19 @@ impl SshTunnel {
     }
 }
 
+/// A network key used before the current one (see `meshvpn ban`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OldKey {
+    pub version: u32,
+    pub key: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BannedNode {
+    pub id: crate::keys::NodeId,
+    pub name: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     /// Human readable node name (becomes `<name>.mesh` in /etc/hosts).
@@ -76,6 +89,13 @@ pub struct Config {
     pub network: String,
     /// Shared secret of the network. Everybody holding it is a member.
     pub network_key: String,
+    /// Stable id of the network; stays the same when the key is rotated. Empty = derived
+    /// from `network_key` (networks created before key rotation existed).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub network_id: String,
+    /// Incremented each time the network key is rotated (on a ban).
+    #[serde(default)]
+    pub key_version: u32,
     pub signing_key: String,
     pub noise_key: String,
     /// TCP address to accept peer connections on. None = never accept.
@@ -108,6 +128,12 @@ pub struct Config {
     pub no_outbound: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_tunnel: Option<SshTunnel>,
+    /// Earlier network keys, so members that were offline during a ban can still connect
+    /// once and receive the new key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub old_keys: Vec<OldKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub banned: Vec<BannedNode>,
 }
 
 impl Config {
@@ -129,6 +155,10 @@ impl Config {
             socks_proxy: None,
             no_outbound: false,
             ssh_tunnel: None,
+            network_id: String::new(),
+            key_version: 0,
+            old_keys: vec![],
+            banned: vec![],
         }
     }
 
@@ -162,6 +192,26 @@ impl Config {
 
     pub fn network_key(&self) -> Result<[u8; 32]> {
         crate::keys::unb64_32(&self.network_key).context("network_key")
+    }
+
+    pub fn network_id(&self) -> String {
+        if self.network_id.is_empty() {
+            self.network_key()
+                .map(|k| crate::keys::network_tag(&k))
+                .unwrap_or_default()
+        } else {
+            self.network_id.clone()
+        }
+    }
+
+    /// All network keys this node knows, by version.
+    pub fn all_keys(&self) -> Result<std::collections::HashMap<u32, [u8; 32]>> {
+        let mut m = std::collections::HashMap::new();
+        for k in &self.old_keys {
+            m.insert(k.version, crate::keys::unb64_32(&k.key).context("old_keys")?);
+        }
+        m.insert(self.key_version, self.network_key()?);
+        Ok(m)
     }
 
     pub fn listen_port(&self) -> Option<u16> {
@@ -232,6 +282,9 @@ pub struct SavedState {
     pub peers: Vec<SignedInfo>,
     #[serde(default)]
     pub forgotten: Vec<Forget>,
+    /// The latest ban / key rotation, relayed to members that were offline.
+    #[serde(default)]
+    pub rotation: Option<crate::proto::SignedRotation>,
 }
 
 impl SavedState {
@@ -255,6 +308,10 @@ pub struct Invite {
     pub network: String,
     pub key: String,
     pub bootstrap: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default)]
+    pub v: u32,
 }
 
 impl Invite {
@@ -303,9 +360,12 @@ mod tests {
             network: "home".into(),
             key: b64(&random32()),
             bootstrap: vec!["a.example:7870".into()],
+            id: "abc".into(),
+            v: 3,
         };
         let back = Invite::decode(&format!("  {}\n", inv.encode())).unwrap();
         assert_eq!(back.key, inv.key);
+        assert_eq!((back.id.as_str(), back.v), ("abc", 3));
         assert_eq!(back.bootstrap, inv.bootstrap);
         assert!(Invite::decode("hello").is_err());
     }

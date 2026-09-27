@@ -66,6 +66,12 @@ enum Cmd {
         #[arg(long, conflicts_with = "who")]
         offline: bool,
     },
+    /// Ban a node from the network for good: every node drops it, and all other members get a
+    /// new network key (so it cannot come back under a new identity). Old invites stop working.
+    Ban {
+        /// Name or id (prefix) of the node.
+        who: String,
+    },
     /// Update to the latest release from GitHub (restarts the running VPN).
     Update {
         /// Only check whether a new version is available.
@@ -150,7 +156,10 @@ fn real_main(cli: Cli) -> Result<()> {
         Cmd::Join { invite, node } => {
             let inv = Invite::decode(&invite)?;
             let key = keys::unb64_32(&inv.key)?;
-            let cfg = create(&dir, node, inv.network, key, inv.bootstrap)?;
+            let mut cfg = create(&dir, node, inv.network, key, inv.bootstrap)?;
+            cfg.network_id = inv.id;
+            cfg.key_version = inv.v;
+            cfg.save(&dir)?;
             println!("Joined network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
             println!("It will connect to: {}", cfg.bootstrap.join(", "));
@@ -186,6 +195,13 @@ fn real_main(cli: Cli) -> Result<()> {
             ))?;
             println!("Connecting to {addr}. It is remembered, and the whole network will learn about it.");
             println!("Check with: meshvpn status");
+        }
+        Cmd::Ban { who } => {
+            let resp =
+                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Ban { who }))?;
+            if let control::Response::Message { text } = resp {
+                println!("{text}");
+            }
         }
         Cmd::Forget { who, offline: _ } => {
             let resp =
@@ -308,7 +324,7 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
 fn make_invite(dir: &Path, cfg: &Config) -> Invite {
     let mut boot: Vec<String> = cfg.static_endpoints();
     let saved = SavedState::load(dir);
-    let net = cfg.network_key().map(|k| keys::network_tag(&k)).unwrap_or_default();
+    let net = cfg.network_id();
     match saved.me.as_ref().and_then(|m| m.verify(&net).ok()) {
         Some(me) => boot.extend(me.endpoints),
         None => {
@@ -335,6 +351,8 @@ fn make_invite(dir: &Path, cfg: &Config) -> Invite {
         network: cfg.network.clone(),
         key: cfg.network_key.clone(),
         bootstrap: boot,
+        id: cfg.network_id(),
+        v: cfg.key_version,
     }
 }
 
@@ -371,6 +389,9 @@ fn print_status(st: &node::Status) {
     );
     if let Some(v) = &st.update_available {
         println!("  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - run: sudo meshvpn update");
+    }
+    if !st.banned.is_empty() {
+        println!("  banned:       {}", st.banned.join(", "));
     }
     for w in &st.warnings {
         println!("  \x1b[1;33mwarning:\x1b[0m {w}");
