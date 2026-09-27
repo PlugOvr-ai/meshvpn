@@ -509,10 +509,74 @@ fn install(dir: &Path) -> Result<()> {
     );
     std::fs::write(UNIT_PATH, unit)?;
     systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", "meshvpn"])?;
+    // The service takes over: a meshvpn started by hand (or an old version) would hold the
+    // network interface and make the service fail with "Resource busy".
+    let _ = systemctl(&["stop", "meshvpn"]);
+    for (pid, cmd) in stop_other_daemons() {
+        println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
+    }
+    systemctl(&["enable", "meshvpn"])?;
+    systemctl(&["restart", "meshvpn"])?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let active = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "meshvpn"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !active {
+        bail!("the meshvpn service did not start - see: journalctl -u meshvpn -n 20");
+    }
     println!("meshvpn is running and will start at boot.");
     println!("  status: meshvpn status   logs: journalctl -u meshvpn -f");
     Ok(())
+}
+
+/// `meshvpn [options] up`, started from any path.
+fn is_daemon_cmdline(args: &[String]) -> bool {
+    let is_meshvpn = args
+        .first()
+        .is_some_and(|a| Path::new(a).file_name().is_some_and(|n| n == "meshvpn"));
+    is_meshvpn && args.iter().skip(1).any(|a| a == "up")
+}
+
+/// Stops meshvpn daemons (`meshvpn ... up`) other than this process. Returns what it stopped.
+fn stop_other_daemons() -> Vec<(i32, String)> {
+    let me = std::process::id() as i32;
+    let mut stopped = vec![];
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return stopped;
+    };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|p| p.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        if !is_daemon_cmdline(&args) {
+            continue;
+        }
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..50 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        stopped.push((pid, args.join(" ")));
+    }
+    stopped
 }
 
 fn uninstall() -> Result<()> {
@@ -522,4 +586,22 @@ fn uninstall() -> Result<()> {
     let _ = systemctl(&["daemon-reload"]);
     println!("meshvpn service removed (configuration kept).");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn finds_meshvpn_daemons_only() {
+        assert!(is_daemon_cmdline(&args("./target/release/meshvpn up")));
+        assert!(is_daemon_cmdline(&args("/usr/local/bin/meshvpn --dir /etc/meshvpn up")));
+        assert!(!is_daemon_cmdline(&args("meshvpn status")));
+        assert!(!is_daemon_cmdline(&args("/usr/bin/vim meshvpn up")));
+        assert!(!is_daemon_cmdline(&args("sudo meshvpn up")));
+    }
 }

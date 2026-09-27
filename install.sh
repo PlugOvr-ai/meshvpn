@@ -85,6 +85,10 @@ if [ $# -gt 0 ]; then
             fi
             ;;
     esac
+elif [ -f /etc/systemd/system/meshvpn.service ] && $SUDO test -f /etc/meshvpn/config.toml; then
+    # Already set up: restart the service on the new version (this also stops a meshvpn
+    # that was started by hand and would block the network interface).
+    $SUDO "$BIN_DIR/meshvpn" install
 else
     echo
     echo "Next: create a network with   sudo meshvpn init"
