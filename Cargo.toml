@@ -1,0 +1,60 @@
+[package]
+name = "meshvpn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["PlugOvr.ai <cw@plugovr.ai>"]
+description = "Decentralized mesh VPN: no coordination server, relaying, and support for nodes behind a reverse SSH tunnel"
+license = "Apache-2.0"
+repository = "https://github.com/PlugOvr-ai/meshvpn"
+readme = "README.md"
+keywords = ["vpn", "mesh", "wireguard", "tailscale", "networking"]
+categories = ["network-programming", "command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+blake3 = "1.8.7"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+libc = "0.2.189"
+rand = "0.8"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+snow = "0.10.0"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tun = { version = "0.8.14", features = ["async"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.deb]
+maintainer = "PlugOvr.ai <cw@plugovr.ai>"
+copyright = "2026, PlugOvr.ai"
+section = "net"
+priority = "optional"
+recommends = "openssh-client"
+extended-description = """\
+meshvpn connects your machines into one private network without a coordination \
+server. Nodes find each other by gossip, relay traffic for nodes that cannot \
+talk directly, and machines behind a firewall can join through a reverse SSH tunnel. \
+Get started with `sudo meshvpn init` or `sudo meshvpn join <invite>`."""
+assets = [
+    ["target/release/meshvpn", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/meshvpn/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/meshvpn", dest = "/usr/bin/meshvpn", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/meshvpn/README.md", mode = "644", doc = true },
+]
+[package.metadata.generate-rpm.recommends]
+openssh-clients = "*"

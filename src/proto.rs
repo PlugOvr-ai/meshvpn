@@ -1,0 +1,124 @@
+//! Messages exchanged between nodes (inside the encrypted link).
+
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::keys::{Identity, Key32, NodeId, b64, unb64, verify};
+
+pub const T_HELLO: u8 = 1;
+pub const T_GOSSIP: u8 = 2;
+pub const T_DATA: u8 = 3;
+pub const T_PING: u8 = 4;
+pub const T_PONG: u8 = 5;
+
+/// Header of a data frame: dst(32) src(32) ttl(1) nonce(24), followed by the sealed IP packet.
+pub const DATA_HDR: usize = 32 + 32 + 1 + 24;
+pub const DEFAULT_TTL: u8 = 8;
+
+/// What a node tells the world about itself. Signed by the node, gossiped by everyone.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NodeInfo {
+    pub id: NodeId,
+    pub noise_pub: Key32,
+    pub name: String,
+    /// `host:port` addresses where the node accepts connections.
+    pub endpoints: Vec<String>,
+    /// Nodes this node currently has a direct link to (used for relay routing).
+    pub neighbors: Vec<NodeId>,
+    /// Monotonic version, newer wins.
+    pub seq: u64,
+    #[serde(default)]
+    pub version: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SignedInfo {
+    pub data: String,
+    pub sig: String,
+}
+
+impl SignedInfo {
+    pub fn sign(info: &NodeInfo, ident: &Identity) -> Self {
+        let data = serde_json::to_string(info).unwrap();
+        let sig = b64(&ident.sign(data.as_bytes()));
+        SignedInfo { data, sig }
+    }
+
+    pub fn verify(&self) -> Result<NodeInfo> {
+        let info: NodeInfo = serde_json::from_str(&self.data)?;
+        verify(&info.id, self.data.as_bytes(), &unb64(&self.sig)?)?;
+        if info.endpoints.len() > 32 || info.neighbors.len() > 4096 {
+            bail!("oversized node info");
+        }
+        // Names end up in /etc/hosts and on terminals: only accept what we would generate.
+        if info.name != crate::config::sanitize_name(&info.name) {
+            bail!("invalid node name");
+        }
+        if info
+            .endpoints
+            .iter()
+            .any(|e| e.len() > 262 || e.chars().any(|c| c.is_control() || c.is_whitespace()))
+        {
+            bail!("invalid endpoint");
+        }
+        Ok(info)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Hello {
+    pub info: SignedInfo,
+    /// The address we see the other side connecting from (helps it learn its public IP).
+    pub observed: String,
+    /// Random per-connection value; used to pick the same link on both sides when two race.
+    #[serde(default)]
+    pub nonce: u64,
+}
+
+pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(payload.len() + 1);
+    v.push(kind);
+    v.extend_from_slice(payload);
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn ident() -> Identity {
+        Identity::from_config(&Config::new("n".into(), "net".into(), crate::keys::random32())).unwrap()
+    }
+
+    fn info(id: &Identity, name: &str) -> NodeInfo {
+        NodeInfo {
+            id: id.id,
+            noise_pub: id.noise_pub,
+            name: name.into(),
+            endpoints: vec!["1.2.3.4:7870".into()],
+            neighbors: vec![],
+            seq: 1,
+            version: String::new(),
+        }
+    }
+
+    #[test]
+    fn signed_info_roundtrip_and_tamper() {
+        let id = ident();
+        let s = SignedInfo::sign(&info(&id, "alpha"), &id);
+        assert_eq!(s.verify().unwrap().name, "alpha");
+        let tampered = SignedInfo {
+            data: s.data.replace("1.2.3.4", "6.6.6.6"),
+            sig: s.sig.clone(),
+        };
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn rejects_hostile_names() {
+        let id = ident();
+        let s = SignedInfo::sign(&info(&id, "evil\n1.2.3.4 bank.com"), &id);
+        assert!(s.verify().is_err());
+    }
+}

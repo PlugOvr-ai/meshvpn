@@ -1,0 +1,131 @@
+name: Release
+
+# Push a tag like `v0.2.0` to publish a release with binaries, .deb/.rpm packages
+# and the one-line installer.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.0); created from the selected branch if missing"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PCs, servers, VMs
+          - { target: x86_64-unknown-linux-musl, packages: true }
+          # Raspberry Pi 3/4/5 (64 bit OS), ARM servers, Jetson, ...
+          - { target: aarch64-unknown-linux-musl, packages: true }
+          # Raspberry Pi 2/3/4 (32 bit OS), most ARM routers and SBCs
+          - { target: armv7-unknown-linux-musleabihf, packages: true }
+          # Raspberry Pi Zero / 1
+          - { target: arm-unknown-linux-musleabihf, packages: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross,cargo-deb,cargo-generate-rpm
+
+      - name: Set version from tag
+        run: |
+          version="${TAG#v}"
+          sed -i "0,/^version = .*/s//version = \"$version\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - name: Build (fully static, runs on any Linux distribution)
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package archive
+        run: |
+          mkdir -p dist staging
+          cp target/${{ matrix.target }}/release/meshvpn README.md LICENSE staging/
+          tar -czf dist/meshvpn-${{ matrix.target }}.tar.gz -C staging .
+
+      - name: Package .deb and .rpm
+        if: matrix.packages
+        run: |
+          cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
+          cargo generate-rpm --target ${{ matrix.target }} --output dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          cp ../install.sh .
+          for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+          sha256sum -- meshvpn-* *.deb *.rpm install.sh | grep -v '\.sha256$' > SHA256SUMS
+          ls -l
+
+      - name: Release notes
+        run: |
+          cat > notes.md <<NOTES
+          ## Install
+
+          **Any Linux machine** (x86_64, ARM64, ARMv7, ARMv6 / Raspberry Pi; static binary, no dependencies):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo sh
+          \`\`\`
+
+          Install and join a network in one step (the service starts automatically):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
+          \`\`\`
+
+          **Debian / Ubuntu / Raspberry Pi OS:** download the \`.deb\` for your architecture, then \`sudo apt install ./meshvpn_*.deb\`
+          **Fedora / RHEL / openSUSE:** download the \`.rpm\`, then \`sudo dnf install ./meshvpn-*.rpm\`
+          **Manual:** unpack \`meshvpn-<target>.tar.gz\` and put \`meshvpn\` in your \`PATH\`.
+
+          | File | Devices |
+          |---|---|
+          | \`x86_64-unknown-linux-musl\` / \`amd64\` | PCs, servers, VMs |
+          | \`aarch64-unknown-linux-musl\` / \`arm64\` | Raspberry Pi 3/4/5 (64 bit), ARM servers |
+          | \`armv7-unknown-linux-musleabihf\` / \`armhf\` | Raspberry Pi 2/3/4 (32 bit), routers, SBCs |
+          | \`arm-unknown-linux-musleabihf\` | Raspberry Pi Zero / 1 |
+
+          Then: \`sudo meshvpn init\` to create a network, or \`sudo meshvpn join <invite>\` to join one.
+          NOTES
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "meshvpn $TAG" --notes-file notes.md \
+              --generate-notes --target "${{ github.sha }}"
+          fi
