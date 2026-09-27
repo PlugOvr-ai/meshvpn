@@ -41,6 +41,44 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Other interfaces holding addresses in our overlay range. Their routes and firewall rules
+/// win over ours: e.g. Tailscale drops every packet from 100.64.0.0/10 not arriving on
+/// tailscale0, which silently breaks all incoming mesh traffic.
+pub fn range_conflicts(own_iface: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        return out;
+    }
+    let mut cur = addrs;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET {
+            continue;
+        }
+        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if name == own_iface || !is_overlay(IpAddr::V4(ip)) {
+            continue;
+        }
+        let hint = if name.starts_with("tailscale") {
+            " - Tailscale's firewall drops all mesh traffic arriving on other interfaces; \
+             uninstall Tailscale (or run `sudo tailscale down`) on this machine"
+        } else {
+            " - traffic to or from mesh IPs may be dropped or misrouted"
+        };
+        out.push(format!(
+            "interface {name} ({ip}) uses the same address range as meshvpn (100.64.0.0/10){hint}"
+        ));
+    }
+    unsafe { libc::freeifaddrs(addrs) };
+    out
+}
+
 fn is_overlay(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => u32::from(v4) & u32::from(OVERLAY_NETMASK) == 0x6440_0000,
@@ -125,6 +163,8 @@ pub struct Status {
     pub endpoints: Vec<String>,
     pub ssh_tunnel: Option<String>,
     pub outbound_via: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -194,6 +234,9 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         node.cfg.name, my_ip, node.cfg.interface, node.cfg.network, node.ident.id
     );
 
+    for w in range_conflicts(&node.cfg.interface) {
+        warn!("{w}");
+    }
     if let Some(listen) = node.cfg.listen.clone() {
         let listener = TcpListener::bind(&listen)
             .await
@@ -922,6 +965,7 @@ impl Node {
             } else {
                 self.socks.clone()
             },
+            warnings: range_conflicts(&self.cfg.interface),
             peers,
         }
     }

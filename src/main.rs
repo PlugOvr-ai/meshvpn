@@ -321,6 +321,9 @@ fn print_status(st: &node::Status) {
         st.interface,
         st.network
     );
+    for w in &st.warnings {
+        println!("  \x1b[1;33mwarning:\x1b[0m {w}");
+    }
     if !st.endpoints.is_empty() {
         println!("  reachable at: {}", st.endpoints.join(", "));
     }
