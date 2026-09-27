@@ -37,8 +37,15 @@ pub enum Response {
     Error { message: String },
 }
 
+/// The config directory is root-only (it holds the keys), so the default instance puts its
+/// socket in /run where everyone can ask for the status. Everything else needs root; that is
+/// checked per request with the caller's credentials.
 pub fn socket_path(dir: &Path) -> PathBuf {
-    dir.join("meshvpn.sock")
+    if dir == Path::new("/etc/meshvpn") {
+        PathBuf::from("/run/meshvpn.sock")
+    } else {
+        dir.join("meshvpn.sock")
+    }
 }
 
 pub async fn serve(node: Arc<Node>, path: PathBuf) {
@@ -50,9 +57,11 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
             return;
         }
     };
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).ok();
+    let me = unsafe { libc::geteuid() };
     while let Ok((stream, _)) = listener.accept().await {
         let node = node.clone();
+        let privileged = stream.peer_cred().is_ok_and(|c| c.uid() == 0 || c.uid() == me);
         tokio::spawn(async move {
             let (r, mut w) = stream.into_split();
             let mut line = String::new();
@@ -61,6 +70,9 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
             }
             let resp = match serde_json::from_str::<Request>(&line) {
                 Ok(Request::Status) => Response::Status(Box::new(node.status())),
+                Ok(_) if !privileged => Response::Error {
+                    message: "permission denied - try again with sudo".into(),
+                },
                 Ok(Request::AddPeer { addr }) => match node.add_peer(addr) {
                     Ok(()) => {
                         node.dial_now();
