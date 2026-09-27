@@ -213,6 +213,13 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         let msg = e.to_string();
         if msg.contains("ermission") || msg.contains("EPERM") || msg.contains("Operation not permitted") {
             anyhow!("cannot create the network interface: {msg}\n  -> meshvpn needs root: run `sudo meshvpn up`")
+        } else if msg.contains("busy") || msg.contains("os error 16") {
+            anyhow!(
+                "cannot create network interface {}: it is already in use, most likely by another meshvpn \
+                 that is still running (see `pgrep -a meshvpn`; if you installed the service, a copy started \
+                 by hand with `meshvpn up` has to be stopped first)",
+                cfg.interface
+            )
         } else {
             anyhow!("cannot create network interface {}: {msg}", cfg.interface)
         }
