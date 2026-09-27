@@ -35,7 +35,7 @@ jobs:
           # Raspberry Pi Zero / 1
           - { target: arm-unknown-linux-musleabihf, packages: false }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -64,7 +64,7 @@ jobs:
           cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
           cargo generate-rpm --target ${{ matrix.target }} --output dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
@@ -73,8 +73,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
