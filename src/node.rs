@@ -514,34 +514,25 @@ impl Node {
     /// pinned to its node's mesh IP (which meshvpn guarantees can't be spoofed).
     pub fn authorized_keys(&self, user: &str) -> String {
         let st = self.state.lock().unwrap();
-        let mut out = String::new();
-        if st.ssh_allow_all.iter().any(|u| u == user) {
-            for rec in st.records.values() {
-                let ip = overlay_ip(&rec.info.id);
-                for k in &rec.info.ssh_keys {
-                    out.push_str(&format!(
-                        "from=\"{ip}\" {} meshvpn:{}@{}\n",
-                        k.key, k.user, rec.info.name
-                    ));
-                }
-            }
-            return out;
-        }
-        for rule in st.ssh_allow.iter().filter(|r| r.users.iter().any(|u| u == user)) {
-            let Some(rec) = st.records.get(&rule.node) else {
-                continue;
-            };
-            let ip = overlay_ip(&rule.node);
+        let everyone = st.ssh_allow_all.iter().any(|u| u == user);
+        let mut lines: Vec<String> = vec![];
+        for rec in st.records.values() {
+            let rules: Vec<_> = st
+                .ssh_allow
+                .iter()
+                .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
+                .collect();
+            let ip = overlay_ip(&rec.info.id);
             for k in &rec.info.ssh_keys {
-                if rule.from_user.as_ref().is_none_or(|u| *u == k.user) {
-                    out.push_str(&format!(
-                        "from=\"{ip}\" {} meshvpn:{}@{}\n",
-                        k.key, k.user, rec.info.name
-                    ));
+                if everyone || rules.iter().any(|r| r.from_user.as_ref().is_none_or(|u| *u == k.user)) {
+                    let line = format!("from=\"{ip}\" {} meshvpn:{}@{}\n", k.key, k.user, rec.info.name);
+                    if !lines.contains(&line) {
+                        lines.push(line);
+                    }
                 }
             }
         }
-        out
+        lines.concat()
     }
 
     /// Resolves `[user@]node` to a rule key.
@@ -1808,7 +1799,11 @@ fn local_ssh_keys() -> Vec<crate::proto::SshKey> {
             continue;
         }
         for name in ["id_ed25519", "id_ecdsa", "id_rsa", "id_ed25519_sk", "id_ecdsa_sk"] {
-            let Ok(text) = std::fs::read_to_string(format!("{home}/.ssh/{name}.pub")) else {
+            let private = format!("{home}/.ssh/{name}");
+            let Some(text) = std::fs::read_to_string(format!("{private}.pub"))
+                .ok()
+                .or_else(|| derive_public_key(&private))
+            else {
                 continue;
             };
             let key: Vec<&str> = text.split_whitespace().take(2).collect();
@@ -1824,10 +1819,66 @@ fn local_ssh_keys() -> Vec<crate::proto::SshKey> {
     out
 }
 
+/// Public key of a private key file that has no `.pub` next to it (common on servers).
+/// Keys with a passphrase are skipped: nothing may prompt here. Cached per file version.
+fn derive_public_key(private: &str) -> Option<String> {
+    type Cache = HashMap<String, (SystemTime, Option<String>)>;
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    let modified = std::fs::metadata(private).ok()?.modified().ok()?;
+    let mut cache = CACHE.lock().unwrap();
+    let cache = cache.get_or_insert_default();
+    if let Some((m, key)) = cache.get(private)
+        && *m == modified
+    {
+        return key.clone();
+    }
+    let key = std::process::Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f", private])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    cache.insert(private.to_string(), (modified, key.clone()));
+    key
+}
+
 /// The address of the interface used for the default route (no packets are sent).
 fn primary_ip() -> Option<IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("1.1.1.1:80").ok()?;
     let ip = s.local_addr().ok()?.ip();
     (!ip.is_loopback() && !ip.is_unspecified() && !is_overlay(ip)).then_some(ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_public_keys_but_never_prompts() {
+        let dir = std::env::temp_dir().join(format!("meshvpn-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let keygen = |name: &str, pass: &str| {
+            let path = dir.join(name);
+            let ok = std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", pass, "-f"])
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            std::fs::remove_file(path.with_extension("pub")).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let plain = keygen("plain", "");
+        let key = derive_public_key(&plain).expect("public key");
+        assert!(crate::proto::valid_ssh_key(
+            &key.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+        ));
+        let locked = keygen("locked", "secret");
+        assert_eq!(derive_public_key(&locked), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
