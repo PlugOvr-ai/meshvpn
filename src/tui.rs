@@ -341,7 +341,10 @@ impl App {
                     }
                 }
                 KeyCode::Char('s') => match self.save(rt, dir) {
-                    Ok(()) => self.message = "saved - the changes apply to the next login".into(),
+                    Ok(()) => {
+                        self.message =
+                            "saved - applies right away to new SSH logins (sessions already open stay open)".into()
+                    }
                     Err(e) => self.message = format!("error: {e:#}"),
                 },
                 KeyCode::Char('q') | KeyCode::Esc => {
