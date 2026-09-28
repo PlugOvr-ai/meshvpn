@@ -12,7 +12,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::config::Config;
 
 /// A 32 byte public key, serialized as hex.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Key32(pub [u8; 32]);
 
 /// A node is identified by its ed25519 public key.

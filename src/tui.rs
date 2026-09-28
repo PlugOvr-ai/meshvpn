@@ -24,10 +24,15 @@ struct Source {
     from_user: Option<String>,
     online: bool,
     known: bool,
+    /// The "every node of the network" row.
+    everyone: bool,
 }
 
 impl Source {
     fn label(&self) -> String {
+        if self.everyone {
+            return "everyone (all nodes)".into();
+        }
         match &self.from_user {
             None => format!("{} (any user)", self.name),
             Some(u) => format!("  {u}@{}", self.name),
@@ -75,7 +80,14 @@ fn local_accounts() -> Vec<String> {
 
 impl App {
     fn new(ov: SshOverview) -> Self {
-        let mut rows = vec![];
+        let mut rows = vec![Source {
+            node: NodeId::default(),
+            name: String::new(),
+            from_user: None,
+            online: true,
+            known: true,
+            everyone: true,
+        }];
         for n in &ov.nodes {
             rows.push(Source {
                 node: n.id,
@@ -83,6 +95,7 @@ impl App {
                 from_user: None,
                 online: n.online,
                 known: true,
+                everyone: false,
             });
             for u in &n.users {
                 rows.push(Source {
@@ -91,6 +104,7 @@ impl App {
                     from_user: Some(u.clone()),
                     online: n.online,
                     known: true,
+                    everyone: false,
                 });
             }
         }
@@ -103,6 +117,7 @@ impl App {
                     from_user: r.from_user.clone(),
                     online: false,
                     known: false,
+                    everyone: false,
                 });
             }
             for u in &r.users {
@@ -111,7 +126,17 @@ impl App {
                 }
             }
         }
+        for u in &ov.allow_all {
+            if !cols.contains(u) {
+                cols.push(u.clone());
+            }
+        }
         let mut checked = HashSet::new();
+        for u in &ov.allow_all {
+            if let Some(col) = cols.iter().position(|c| c == u) {
+                checked.insert((0, col));
+            }
+        }
         for r in &ov.rules {
             let Some(row) = rows.iter().position(|s| s.node == r.node && s.from_user == r.from_user) else {
                 continue;
@@ -151,6 +176,7 @@ impl App {
         self.rows
             .iter()
             .enumerate()
+            .filter(|(_, s)| !s.everyone)
             .filter_map(|(i, s)| {
                 let users: Vec<String> = (0..self.cols.len())
                     .filter(|c| self.checked.contains(&(i, *c)))
@@ -166,12 +192,21 @@ impl App {
             .collect()
     }
 
+    /// Accounts checked in the "everyone" row.
+    fn allow_all(&self) -> Vec<String> {
+        (0..self.cols.len())
+            .filter(|c| self.checked.contains(&(0, *c)))
+            .map(|c| self.cols[c].clone())
+            .collect()
+    }
+
     fn save(&mut self, rt: &tokio::runtime::Runtime, dir: &Path) -> Result<()> {
         let rules = self.rules();
-        if !rules.is_empty() {
+        let allow_all = self.allow_all();
+        if !rules.is_empty() || !allow_all.is_empty() {
             crate::sshd::enable()?;
         }
-        rt.block_on(control::request(dir, &Request::SshSetRules { rules }))?;
+        rt.block_on(control::request(dir, &Request::SshSetRules { rules, allow_all }))?;
         self.saved = self.checked.clone();
         Ok(())
     }
@@ -224,12 +259,13 @@ impl App {
                 .enumerate()
                 .map(|(i, s)| {
                     let dot = match (s.known, s.online) {
+                        _ if s.everyone => Span::styled("★ ", Style::new().fg(Color::Cyan)),
                         (false, _) => Span::styled("? ", Style::new().fg(Color::Yellow)),
                         (true, true) => Span::styled("● ", Style::new().fg(Color::Green)),
                         (true, false) => Span::styled("○ ", Style::new().fg(Color::DarkGray)),
                     };
                     let mut label = Line::from(vec![dot, Span::raw(s.label())]);
-                    if s.from_user.is_none() {
+                    if s.from_user.is_none() || s.everyone {
                         label = label.bold();
                     }
                     let mut cells = vec![Cell::from(label)];

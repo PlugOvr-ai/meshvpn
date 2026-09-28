@@ -134,8 +134,19 @@ Then, on the laptop, alice just runs `ssh carol@server.mesh`. The same works fro
 ```sh
 sudo meshvpn ssh allow alice@laptop --as carol   # one user of a node
 sudo meshvpn ssh allow laptop --as bob           # any user of a node
+sudo meshvpn ssh allow everyone --as ubuntu      # every node, also ones that join later
 sudo meshvpn ssh deny alice@laptop               # take it back
 meshvpn ssh list                                 # show rules and the keys this machine offers
+```
+
+**Machines everybody should reach**, such as the nodes of a Docker cluster, can be opened up at install time. Every node
+of the network, including ones that join later, may then log in as the named account(s):
+
+```sh
+curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh \
+  | sudo sh -s -- join mesh1-... --ssh-allow-all ubuntu
+# devices without internet, from the jump host:
+curl -fsSL .../deploy.sh | sh -s -- --invite mesh1-... --ssh-allow-all ubuntu user@localhost -p 2222
 ```
 
 How it works: every node publishes the SSH public keys of its users (`~/.ssh/id_*.pub`) in its signed record; disable

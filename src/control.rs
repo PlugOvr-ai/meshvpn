@@ -23,6 +23,8 @@ pub enum Request {
     SshOverview,
     SshSetRules {
         rules: Vec<crate::config::SshAllow>,
+        #[serde(default)]
+        allow_all: Vec<String>,
     },
     SshAllow {
         who: String,
@@ -126,7 +128,7 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                         message: format!("{e:#}"),
                     },
                 },
-                Ok(Request::SshSetRules { rules }) => match node.ssh_set_rules(rules) {
+                Ok(Request::SshSetRules { rules, allow_all }) => match node.ssh_set_rules(rules, allow_all) {
                     Ok(()) => Response::Ok,
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),

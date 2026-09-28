@@ -153,6 +153,10 @@ pub struct Config {
     /// Who may log in here over SSH without a password (see `meshvpn ssh`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_allow: Vec<SshAllow>,
+    /// Local accounts that every node of the network (any of its users) may log in as
+    /// without a password - e.g. for cluster machines everybody works on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_allow_all: Vec<String>,
 }
 
 impl Config {
@@ -173,6 +177,7 @@ impl Config {
             auto_update: true,
             publish_ssh_keys: true,
             ssh_allow: vec![],
+            ssh_allow_all: vec![],
             socks_proxy: None,
             no_outbound: false,
             ssh_tunnel: None,

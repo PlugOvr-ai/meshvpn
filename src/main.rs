@@ -159,6 +159,10 @@ struct NodeOpts {
     /// Never connect out; wait for other nodes to connect in.
     #[arg(long)]
     no_outbound: bool,
+    /// Let every node of the network log in here over SSH as USER without a password (e.g. on
+    /// cluster machines everybody works on). Repeatable, or comma separated.
+    #[arg(long, value_name = "USER", value_delimiter = ',')]
+    ssh_allow_all: Vec<String>,
     /// Name of the network interface.
     #[arg(long, default_value = "mesh0")]
     interface: String,
@@ -184,6 +188,7 @@ fn real_main(cli: Cli) -> Result<()> {
             println!("Created network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
             print_invite(&dir, &cfg);
+            enable_ssh_logins(&cfg);
             print_next_steps(&dir, &cfg);
         }
         Cmd::Join { invite, node } => {
@@ -196,6 +201,7 @@ fn real_main(cli: Cli) -> Result<()> {
             println!("Joined network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
             println!("It will connect to: {}", cfg.bootstrap.join(", "));
+            enable_ssh_logins(&cfg);
             print_next_steps(&dir, &cfg);
         }
         Cmd::Invite => {
@@ -317,6 +323,10 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
     cfg.interface = o.interface;
     cfg.socks_proxy = o.socks_proxy;
     cfg.no_outbound = o.no_outbound;
+    if let Some(u) = o.ssh_allow_all.iter().find(|u| !proto::valid_user(u)) {
+        bail!("--ssh-allow-all: invalid user name {u:?}");
+    }
+    cfg.ssh_allow_all = o.ssh_allow_all;
     if let Some(server) = o.ssh {
         if cfg.listen.is_none() {
             bail!("--ssh needs this node to listen (drop --no-listen)");
@@ -338,6 +348,21 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
     Ok(cfg)
 }
 
+/// Sets up sshd right away if the config asks for password-less logins. If that isn't possible
+/// yet (e.g. meshvpn not installed to /usr/local/bin), the daemon retries at startup.
+fn enable_ssh_logins(cfg: &Config) {
+    if cfg.ssh_allow_all.is_empty() && cfg.ssh_allow.is_empty() {
+        return;
+    }
+    match sshd::enable() {
+        Ok(_) => println!(
+            "Password-less SSH logins from mesh nodes are enabled ({}).\n",
+            sshd::DROPIN
+        ),
+        Err(e) => println!("note: password-less SSH logins are not active yet: {e:#}\n"),
+    }
+}
+
 fn print_node_summary(cfg: &Config) -> Result<()> {
     let id = Identity::from_config(cfg)?;
     println!("  this node:   {}", cfg.name);
@@ -349,6 +374,12 @@ fn print_node_summary(cfg: &Config) -> Result<()> {
         } else {
             println!("  ssh tunnel:  {} (reachable at {})", t.server, t.public_endpoint());
         }
+    }
+    if !cfg.ssh_allow_all.is_empty() {
+        println!(
+            "  ssh logins:  every node may log in as {} without a password",
+            cfg.ssh_allow_all.join(", ")
+        );
     }
     println!();
     Ok(())

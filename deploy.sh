@@ -22,6 +22,8 @@
 #   --jump USER@HOST[:PORT]
 #                        how the device reaches this machine over SSH (default: detected
 #                        from the device's existing SSH connection, user = you)
+#   --ssh-allow-all USER let every node of the network log in to the device as USER over SSH
+#                        without a password (comma separated for several accounts)
 #   --binary FILE        upload this meshvpn binary instead of downloading a release
 #   --version vX.Y.Z     release to install (default: latest)
 set -eu
@@ -32,7 +34,7 @@ say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,31s/^# \{0,1\}//p' "$0" 2>/dev/null || true; exit 1; }
 
-INVITE="" DEVICE="" PORT=22 KEY="" NAME="" JUMP="" BINARY="" VERSION="latest"
+INVITE="" DEVICE="" PORT=22 KEY="" NAME="" JUMP="" BINARY="" VERSION="latest" ALLOW_ALL=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --invite) INVITE="$2"; shift 2 ;;
@@ -41,6 +43,7 @@ while [ $# -gt 0 ]; do
         --name) NAME="$2"; shift 2 ;;
         --jump) JUMP="$2"; shift 2 ;;
         --binary) BINARY="$2"; shift 2 ;;
+        --ssh-allow-all) ALLOW_ALL="$2"; shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
         -h | --help) usage ;;
         -*) die "unknown option $1" ;;
@@ -59,7 +62,7 @@ trap cleanup EXIT INT TERM
 
 # One SSH login for all steps. stdin never comes from the terminal pipe (`curl | sh` feeds
 # this script through it), so every ssh call redirects it explicitly.
-set -- -o ControlMaster=auto -o ControlPath="$TMP/cm" -o ControlPersist=600 -p "$PORT"
+set -- -o ControlMaster=auto -o ControlPath="$TMP/cm" -o ControlPersist=600 -o StrictHostKeyChecking=accept-new -p "$PORT"
 [ -z "$KEY" ] || set -- "$@" -i "$KEY"
 dev() { c="$1"; shift; ssh "$@" -T "$DEVICE" "$c"; }   # usage: dev 'command' "$@" </dev/null
 if [ -r /dev/tty ] && (: </dev/tty) 2>/dev/null; then
@@ -119,6 +122,12 @@ VERSION_DEV="$(dev 'umask 077; cat > ~/.meshvpn-upload && chmod 755 ~/.meshvpn-u
 q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 NAME_ARG=""
 [ -z "$NAME" ] || NAME_ARG="--name $(q "$NAME")"
+ALLOW_ARG="" ALLOW_LATER=""
+if [ -n "$ALLOW_ALL" ]; then
+    ALLOW_ARG="--ssh-allow-all $(q "$ALLOW_ALL")"
+    # Already set up (no join): add the rule once the service is up.
+    ALLOW_LATER="for i in 1 2 3 4 5 6 7 8 9 10; do \$SUDO /usr/local/bin/meshvpn ssh allow everyone --as $(echo "$ALLOW_ALL" | tr ',' ' ') >/dev/null 2>&1 && break; sleep 1; done"
+fi
 
 say "Installing $VERSION_DEV on $HOSTNAME_DEV (you may be asked for its sudo password)..."
 SCRIPT="set -e
@@ -152,15 +161,17 @@ fi
 if \$SUDO test -f /etc/meshvpn/config.toml; then
   echo 'Already part of a network - keeping its configuration, updating meshvpn.'
 else
-  \$SUDO /usr/local/bin/meshvpn join $(q "$INVITE") $NAME_ARG --ssh $JUMP --ssh-port $JUMP_PORT --ssh-remote-port 0 --ssh-identity /etc/meshvpn/ssh_key | sed -n 's/^ *mesh IP: */  mesh IP: /p; s/^ *this node: */  name:    /p'
+  \$SUDO /usr/local/bin/meshvpn join $(q "$INVITE") $NAME_ARG --ssh $JUMP --ssh-port $JUMP_PORT --ssh-remote-port 0 --ssh-identity /etc/meshvpn/ssh_key $ALLOW_ARG | sed -n 's/^ *mesh IP: */  mesh IP: /p; s/^ *this node: */  name:    /p'
 fi
 if [ -d /run/systemd/system ]; then
   \$SUDO /usr/local/bin/meshvpn install >/dev/null
   \$SUDO systemctl restart meshvpn
 else
   \$SUDO pkill -x meshvpn || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x meshvpn >/dev/null || break; sleep 0.5; done
   \$SUDO sh -c 'nohup /usr/local/bin/meshvpn up >>/var/log/meshvpn.log 2>&1 &'
-fi"
+fi
+$ALLOW_LATER"
 dev_sudo "$@" || die "setting up meshvpn on $HOSTNAME_DEV failed"
 
 say "Done. $HOSTNAME_DEV joins the network within a few seconds - check with \`meshvpn status\` on any node."
