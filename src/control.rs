@@ -44,6 +44,9 @@ pub enum Request {
     Ban {
         who: String,
     },
+    Rename {
+        name: String,
+    },
     /// Forget an offline node by name or id; `None` = all offline nodes.
     Forget {
         who: Option<String>,
@@ -130,6 +133,12 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                 },
                 Ok(Request::SshSetRules { rules, allow_all }) => match node.ssh_set_rules(rules, allow_all) {
                     Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::Rename { name }) => match node.rename(&name) {
+                    Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },

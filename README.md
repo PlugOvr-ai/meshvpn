@@ -166,6 +166,7 @@ not its name. Your other SSH settings and existing logins stay as they are. Need
 | `sudo meshvpn forget <name>` | Remove an offline node (e.g. an old identity of a re-installed machine) from all nodes. `--offline` forgets all offline nodes. If an offline node's name is taken by a newer online node, it's forgotten automatically after 10 minutes |
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
+| `sudo meshvpn rename <name>` | Give this node a new name. It becomes `<name>.mesh` on every node within seconds; its IP, SSH permissions and links stay. Names already taken are refused |
 | `sudo meshvpn add-peer host:port` | Connect to a node at an address, e.g. an inbound-only node |
 
 ### Banning a node

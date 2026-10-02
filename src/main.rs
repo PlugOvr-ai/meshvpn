@@ -83,6 +83,11 @@ enum Cmd {
     /// Used by sshd (AuthorizedKeysCommand): prints the keys that may log in as USER.
     #[command(hide = true)]
     SshAuthorizedKeys { user: String },
+    /// Give this node a new name (it becomes NAME.mesh everywhere; its IP and permissions stay).
+    Rename {
+        /// The new name (a-z, 0-9 and -).
+        name: String,
+    },
     /// Update to the latest release from GitHub (restarts the running VPN).
     Update {
         /// Only check whether a new version is available.
@@ -270,6 +275,35 @@ fn real_main(cli: Cli) -> Result<()> {
                 && let Ok(control::Response::Message { text }) = rt.block_on(control::request(&dir, &req))
             {
                 print!("{text}");
+            }
+        }
+        Cmd::Rename { name } => {
+            require_root()?;
+            if control::is_running(&dir) {
+                let req = control::Request::Rename { name };
+                if let control::Response::Message { text } =
+                    tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
+                {
+                    println!("{text}");
+                }
+            } else {
+                // Not running: just change the config; the name goes out at the next start.
+                let mut cfg = Config::load(&dir)?;
+                let new = config::sanitize_name(&name);
+                if new == cfg.name {
+                    bail!("this node is already called {new}");
+                }
+                let net = cfg.network_id();
+                let peers: Vec<String> = SavedState::load(&dir)
+                    .peers
+                    .iter()
+                    .filter_map(|p| p.verify(&net).ok())
+                    .map(|i| i.name)
+                    .collect();
+                node::check_name_free(&new, peers.iter())?;
+                let old = std::mem::replace(&mut cfg.name, new.clone());
+                cfg.save(&dir)?;
+                println!("renamed {old} -> {new} (meshvpn is not running; the new name is announced when it starts)");
             }
         }
         Cmd::Ban { who } => {

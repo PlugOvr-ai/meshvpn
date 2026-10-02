@@ -137,6 +137,8 @@ struct State {
     banned: HashMap<NodeId, String>,
     ssh_allow: Vec<crate::config::SshAllow>,
     ssh_allow_all: Vec<String>,
+    /// This node's name (can change at runtime: `meshvpn rename`).
+    my_name: String,
 }
 
 pub struct Node {
@@ -268,6 +270,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.keys = keys;
         st.key_version = node.cfg.key_version;
         st.banned = node.cfg.banned.iter().map(|b| (b.id, b.name.clone())).collect();
+        st.my_name = node.cfg.name.clone();
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
         if let Some(r) = saved.rotation
@@ -381,7 +384,7 @@ impl Node {
         let info = NodeInfo {
             id: self.ident.id,
             noise_pub: self.ident.noise_pub,
-            name: self.cfg.name.clone(),
+            name: st.my_name.clone(),
             endpoints: st.my_endpoints.clone(),
             neighbors,
             seq: st.my_seq,
@@ -690,11 +693,13 @@ impl Node {
             out.push_str("  (none) - allow some with: sudo meshvpn ssh allow [user@]node --as <local user>\n");
         }
         for r in &st.ssh_allow {
+            // Rules follow the node, also when it was renamed.
+            let name = st.records.get(&r.node).map(|x| &x.info.name).unwrap_or(&r.name);
             let src = r
                 .from_user
                 .as_ref()
-                .map(|u| format!("{u}@{}", r.name))
-                .unwrap_or(format!("{} (any user)", r.name));
+                .map(|u| format!("{u}@{name}"))
+                .unwrap_or(format!("{name} (any user)"));
             let gone = if st.records.contains_key(&r.node) {
                 ""
             } else {
@@ -736,7 +741,7 @@ impl Node {
             .collect();
         nodes.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
         SshOverview {
-            hostname: self.cfg.name.clone(),
+            hostname: st.my_name.clone(),
             nodes,
             rules: st.ssh_allow.clone(),
             allow_all: st.ssh_allow_all.clone(),
@@ -883,7 +888,7 @@ impl Node {
     pub fn ban(&self, who: &str) -> Result<String> {
         let mut st = self.state.lock().unwrap();
         let w = who.trim().to_lowercase();
-        if w == self.cfg.name || (w.len() >= 4 && self.ident.id.hex().starts_with(&w)) {
+        if w == st.my_name || (w.len() >= 4 && self.ident.id.hex().starts_with(&w)) {
             bail!("{w} is this node");
         }
         let targets: Vec<(NodeId, String)> = st
@@ -1031,7 +1036,7 @@ impl Node {
                     .filter(|r| r.info.name == w || (w.len() >= 4 && r.info.id.hex().starts_with(&w)))
                     .map(|r| r.info.id)
                     .collect();
-                if matches.is_empty() && w == self.cfg.name {
+                if matches.is_empty() && w == st.my_name {
                     bail!("{w} is this node");
                 }
                 if matches.is_empty() {
@@ -1055,8 +1060,9 @@ impl Node {
 
     /// A machine that was set up again leaves its old identity behind under the same name.
     fn auto_forget(&self, st: &mut State) {
+        let me = st.my_name.clone();
         let mut newest: HashMap<&str, u64> = HashMap::new();
-        newest.insert(&self.cfg.name, u64::MAX);
+        newest.insert(&me, u64::MAX);
         for r in st.records.values() {
             if self.is_online(st, &r.info.id) {
                 let e = newest.entry(&r.info.name).or_default();
@@ -1603,7 +1609,7 @@ impl Node {
             return;
         }
         let mut st = self.state.lock().unwrap();
-        let mut entries = vec![(self.cfg.name.clone(), self.my_ip, self.ident.id)];
+        let mut entries = vec![(st.my_name.clone(), self.my_ip, self.ident.id)];
         // If two nodes share a name, the plain name goes to the one that is online and newest
         // (e.g. a machine that was set up again gets its name back from its old identity).
         let mut others: Vec<_> = st.records.values().collect();
@@ -1660,7 +1666,7 @@ impl Node {
             .collect();
         peers.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
         Status {
-            name: self.cfg.name.clone(),
+            name: st.my_name.clone(),
             network: self.cfg.network.clone(),
             id: self.ident.id.hex(),
             ip: self.my_ip,
@@ -1751,6 +1757,31 @@ impl Node {
         std::process::exit(1);
     }
 
+    /// `meshvpn rename NEW`: new name for this node; identity, IP and permissions stay.
+    pub fn rename(&self, new: &str) -> Result<String> {
+        let name = crate::config::sanitize_name(new);
+        let mut st = self.state.lock().unwrap();
+        if name == st.my_name {
+            bail!("this node is already called {name}");
+        }
+        check_name_free(&name, st.records.values().map(|r| &r.info.name))?;
+        let mut cfg = Config::load(&self.dir)?;
+        cfg.name = name.clone();
+        cfg.save(&self.dir)?;
+        let old = std::mem::replace(&mut st.my_name, name.clone());
+        self.announce(&mut st);
+        drop(st);
+        self.update_hosts();
+        info!("renamed this node: {old} -> {name}");
+        let mut msg = format!("renamed {old} -> {name}; the other nodes see it as {name}.mesh within seconds");
+        if name != new.trim() {
+            msg.push_str(&format!(
+                " (names may only contain a-z, 0-9 and -, so {new:?} became {name:?})"
+            ));
+        }
+        Ok(msg)
+    }
+
     /// Adds a node address to dial (and remembers it in the config).
     pub fn add_peer(&self, addr: String) -> Result<()> {
         {
@@ -1778,6 +1809,18 @@ impl Node {
             tokio::spawn(self.clone().dial(key, addrs, boot));
         }
     }
+}
+
+/// Refuses a name another node already has: two nodes with one name confuse `<name>.mesh`, and
+/// the older one would be cleaned up as "replaced machine".
+pub fn check_name_free<'a>(name: &str, mut others: impl Iterator<Item = &'a String>) -> Result<()> {
+    if others.any(|other| other == name) {
+        bail!(
+            "another node is already called {name} - pick another name, or remove that node first \
+             (`meshvpn forget {name}` if it is gone for good)"
+        );
+    }
+    Ok(())
 }
 
 /// `meshvpn ssh allow everyone ...`
