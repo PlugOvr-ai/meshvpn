@@ -4,6 +4,7 @@ mod control;
 mod hosts;
 mod inventory;
 mod keys;
+mod launch;
 mod link;
 mod mcp;
 mod net;
@@ -98,6 +99,42 @@ enum Cmd {
     Unshare { id: String },
     /// Shared objects in the network and which nodes have them.
     Objects,
+    /// Start a distributed job on a group of nodes, e.g.
+    /// `meshvpn launch tag:gpu -- torchrun --nproc_per_node=8 train.py`. Every node gets
+    /// MASTER_ADDR, NODE_RANK, NCCL_SOCKET_IFNAME...; torchrun gets --nnodes/--node_rank/
+    /// --master_addr/--master_port added. If one node fails, the others are stopped.
+    Launch {
+        /// The nodes of the job: all, tag:<tag>, names.
+        #[arg(required = true)]
+        selectors: Vec<String>,
+        /// The command (one argument = a shell command line).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+        /// Rank 0 (default: the first node by name).
+        #[arg(long)]
+        master: Option<String>,
+        #[arg(long, default_value_t = 29500)]
+        port: u16,
+        /// Account on the nodes (default: you).
+        #[arg(long, short)]
+        user: Option<String>,
+        /// Directory to run in on the nodes (default: home).
+        #[arg(long)]
+        workdir: Option<String>,
+        /// Don't stop the other nodes when one fails.
+        #[arg(long)]
+        keep_going: bool,
+        /// Run in the background and print the job id (see `meshvpn jobs`).
+        #[arg(long)]
+        detach: bool,
+        #[arg(long, hide = true)]
+        job_dir: Option<PathBuf>,
+    },
+    /// Jobs started with `meshvpn launch` (yours): list, logs, stop.
+    Jobs {
+        #[command(subcommand)]
+        cmd: Option<JobsCmd>,
+    },
     /// Model Context Protocol server on stdio for AI agents (`claude mcp add meshvpn -- meshvpn mcp`).
     Mcp,
     /// Label this node (e.g. gpu, trainer) so it can be selected as tag:<name>.
@@ -213,6 +250,29 @@ enum NetCmd {
         #[arg(long, default_value_t = 29500)]
         port: u16,
     },
+}
+
+#[derive(Subcommand)]
+enum JobsCmd {
+    /// All jobs, newest first.
+    List,
+    /// A job's state, environment and the end of each node's log.
+    Show {
+        id: String,
+        /// Lines per node.
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
+    /// The log of a job (all nodes, or one).
+    Logs {
+        id: String,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+    },
+    /// Stop a running job on all its nodes.
+    Stop { id: String },
 }
 
 #[derive(Subcommand)]
@@ -345,7 +405,7 @@ fn say(json: bool, text: &str) {
     if json {
         println!("{}", serde_json::json!({ "ok": true, "message": text }));
     } else {
-        say(json, text);
+        println!("{text}");
     }
 }
 
@@ -580,6 +640,146 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Mcp => mcp::serve(dir.clone())?,
+        Cmd::Launch {
+            selectors,
+            command,
+            master,
+            port,
+            user,
+            workdir,
+            keep_going,
+            detach,
+            job_dir,
+        } => {
+            let opts = launch::Opts {
+                selectors: selectors.clone(),
+                master: master.clone(),
+                port,
+                user: user.clone(),
+                workdir: workdir.clone(),
+                keep_going,
+                command: command.clone(),
+            };
+            if detach {
+                let mut args: Vec<String> = selectors;
+                for (flag, v) in [("--master", master), ("--user", user), ("--workdir", workdir)] {
+                    if let Some(v) = v {
+                        args.extend([flag.to_string(), v]);
+                    }
+                }
+                args.extend(["--port".to_string(), port.to_string()]);
+                if keep_going {
+                    args.push("--keep-going".into());
+                }
+                args.push("--".into());
+                args.extend(command);
+                let job = launch::detach(&dir, &args)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&job)?);
+                } else {
+                    println!(
+                        "job {} started on {} (master {})",
+                        job.id,
+                        job.nodes.join(", "),
+                        job.master
+                    );
+                    println!(
+                        "  meshvpn jobs show {id}   meshvpn jobs logs {id}   meshvpn jobs stop {id}",
+                        id = job.id
+                    );
+                }
+                return Ok(0);
+            }
+            let quiet = job_dir.is_some();
+            let job = launch::run(&dir, &opts, job_dir, quiet)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&job)?);
+            } else if !quiet {
+                for r in &job.results {
+                    eprintln!(
+                        "  {:<12} {} after {:.1}s",
+                        r.node,
+                        match r.exit_code {
+                            Some(0) => "ok".to_string(),
+                            Some(c) => format!("exit {c}"),
+                            None => "killed".to_string(),
+                        },
+                        r.duration_s
+                    );
+                }
+                eprintln!("job {}: {} - logs in {}", job.id, job.state, job.dir);
+            }
+            return Ok(match job.state.as_str() {
+                "succeeded" => 0,
+                "stopped" => 130,
+                _ => 1,
+            });
+        }
+        Cmd::Jobs { cmd } => match cmd.unwrap_or(JobsCmd::List) {
+            JobsCmd::List => {
+                let jobs = launch::Job::list();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&jobs)?);
+                } else if jobs.is_empty() {
+                    println!("No jobs yet - start one with: meshvpn launch <nodes> -- <command>");
+                } else {
+                    println!("{:<8}  {:<9}  {:<24}  COMMAND", "JOB", "STATE", "NODES");
+                    for j in jobs {
+                        println!(
+                            "{:<8}  {:<9}  {:<24}  {}",
+                            j.id,
+                            j.state,
+                            j.nodes.join(","),
+                            j.command.join(" ")
+                        );
+                    }
+                }
+            }
+            JobsCmd::Show { id, tail } => {
+                let job = launch::Job::load(&id)?;
+                let tails: serde_json::Map<String, serde_json::Value> = job
+                    .nodes
+                    .iter()
+                    .map(|n| {
+                        let log = Path::new(&job.dir).join(format!("{n}.log"));
+                        (n.clone(), serde_json::Value::String(launch::tail(&log, tail)))
+                    })
+                    .collect();
+                if json {
+                    let mut v = serde_json::to_value(&job)?;
+                    v["log_tail"] = serde_json::Value::Object(tails);
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    println!(
+                        "job {}: {} on {} (master {})",
+                        job.id,
+                        job.state,
+                        job.nodes.join(", "),
+                        job.master
+                    );
+                    println!("command: {}", job.command.join(" "));
+                    for r in &job.results {
+                        println!("  {:<12} exit {:?} after {:.1}s", r.node, r.exit_code, r.duration_s);
+                    }
+                    for (n, t) in tails {
+                        println!("── {n}\n{}", t.as_str().unwrap_or(""));
+                    }
+                }
+            }
+            JobsCmd::Logs { id, node, tail } => {
+                let job = launch::Job::load(&id)?;
+                for n in job.nodes.iter().filter(|n| node.as_ref().is_none_or(|x| x == *n)) {
+                    let text = launch::tail(&Path::new(&job.dir).join(format!("{n}.log")), tail);
+                    for line in text.lines() {
+                        println!("[{n}] {line}");
+                    }
+                }
+            }
+            JobsCmd::Stop { id } => {
+                let job = launch::stop(&id)?;
+                say(json, &format!("job {} {}", job.id, job.state));
+            }
+        },
         Cmd::Tag { cmd } => {
             let (add, remove) = match cmd {
                 TagCmd::Add { tags } => (tags, vec![]),
@@ -1292,6 +1492,13 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split(' ').map(String::from).collect()
+    }
+
+    #[test]
+    fn say_prints_both_ways() {
+        // say() once called itself for plain output (v0.5.0): every message hung.
+        say(false, "plain");
+        say(true, "json");
     }
 
     #[test]

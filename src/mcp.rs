@@ -80,6 +80,37 @@ fn tools() -> Value {
             }}
         },
         {
+            "name": "launch",
+            "description": "Start a distributed job (e.g. torchrun) on a group of nodes in the background. Every node gets MASTER_ADDR, MASTER_PORT, NNODES, NODE_RANK, NCCL_SOCKET_IFNAME (LAN if all pairs share one, else the mesh); torchrun gets --nnodes/--node_rank/--master_addr/--master_port added automatically. If one node fails, the others are stopped. Returns a job id; follow it with job_status, stop it with job_stop. Copy code/data first with copy_to_nodes or share/fetch.",
+            "inputSchema": {"type": "object", "required": ["selectors", "command"], "properties": {
+                "selectors": selectors,
+                "command": {"type": "array", "items": {"type": "string"}, "description": "argv, e.g. [\"torchrun\", \"--nproc_per_node=8\", \"train.py\"], or a single shell command line."},
+                "master": {"type": "string"},
+                "port": {"type": "integer"},
+                "workdir": {"type": "string", "description": "Directory on the nodes (default: home)."},
+                "user": {"type": "string"},
+                "keep_going": {"type": "boolean"}
+            }}
+        },
+        {
+            "name": "job_status",
+            "description": "State of a job started with launch (running, succeeded, failed, stopped, lost), exit codes, the environment per node and the last lines of each node's log.",
+            "inputSchema": {"type": "object", "required": ["id"], "properties": {
+                "id": {"type": "string"},
+                "tail": {"type": "integer", "description": "Log lines per node (default 30)."}
+            }}
+        },
+        {
+            "name": "job_stop",
+            "description": "Stop a running job on all its nodes (kills the whole process tree there).",
+            "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}
+        },
+        {
+            "name": "list_jobs",
+            "description": "Jobs started with launch, newest first.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
             "name": "share",
             "description": "Share a local file or directory (dataset, checkpoint) with the network. Returns its id; other nodes download it with fetch. Needs meshvpn mcp to run as root.",
             "inputSchema": {"type": "object", "required": ["path"], "properties": {
@@ -233,6 +264,50 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             }
             Ok(json!({"master": master.name, "nodes": envs}))
         }
+        "launch" => {
+            let mut a: Vec<String> = strings(args, "selectors");
+            if a.is_empty() {
+                bail!("selectors are required");
+            }
+            for key in ["master", "workdir", "user"] {
+                if let Some(v) = args.get(key).and_then(Value::as_str) {
+                    a.extend([format!("--{key}"), v.to_string()]);
+                }
+            }
+            if let Some(p) = args.get("port").and_then(Value::as_u64) {
+                a.extend(["--port".to_string(), p.to_string()]);
+            }
+            if args.get("keep_going").and_then(Value::as_bool).unwrap_or(false) {
+                a.push("--keep-going".into());
+            }
+            a.push("--".into());
+            let command = match args.get("command") {
+                Some(Value::String(s)) => vec![s.clone()],
+                _ => strings(args, "command"),
+            };
+            if command.is_empty() {
+                bail!("command is required");
+            }
+            a.extend(command);
+            Ok(serde_json::to_value(crate::launch::detach(dir, &a)?)?)
+        }
+        "job_status" => {
+            let job = crate::launch::Job::load(text(args, "id")?)?;
+            let lines = args.get("tail").and_then(Value::as_u64).unwrap_or(30) as usize;
+            let mut v = serde_json::to_value(&job)?;
+            let tails: serde_json::Map<String, Value> = job
+                .nodes
+                .iter()
+                .map(|n| {
+                    let log = Path::new(&job.dir).join(format!("{n}.log"));
+                    (n.clone(), Value::String(crate::launch::tail(&log, lines)))
+                })
+                .collect();
+            v["log_tail"] = Value::Object(tails);
+            Ok(v)
+        }
+        "job_stop" => Ok(serde_json::to_value(crate::launch::stop(text(args, "id")?)?)?),
+        "list_jobs" => Ok(serde_json::to_value(crate::launch::Job::list())?),
         "share" => daemon(
             dir,
             Request::Share {

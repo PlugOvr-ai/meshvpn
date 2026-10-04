@@ -212,7 +212,7 @@ impl Remote {
     }
 
     /// A shell command on `node`: locally for this machine, over ssh otherwise.
-    fn command(&self, node: &NodeView, script: &str) -> Command {
+    pub(crate) fn command(&self, node: &NodeView, script: &str) -> Command {
         if node.is_self {
             let mut c = Command::new("sh");
             c.arg("-c").arg(script);

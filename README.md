@@ -187,8 +187,8 @@ nodes. Every command takes `--json` (errors too), and exit codes are stable: 0 o
 running, 4 needs root, 5 not found. Nodes are selected with **selectors**: `all`, `tag:<tag>`, node names or mesh IPs.
 
 **MCP server:** connect an agent directly with `claude mcp add meshvpn -- meshvpn mcp` (any MCP client works). Tools:
-`list_nodes`, `exec`, `copy_to_nodes`, `copy_from_nodes`, `network_matrix`, `training_env`, `share`, `fetch`,
-`list_objects`, `set_tags`, `node_status`.
+`list_nodes`, `exec`, `copy_to_nodes`, `copy_from_nodes`, `network_matrix`, `training_env`, `launch`, `job_status`,
+`job_stop`, `list_jobs`, `share`, `fetch`, `list_objects`, `set_tags`, `node_status`.
 
 | Command | What it does |
 |---|---|
@@ -199,6 +199,8 @@ running, 4 needs root, 5 not found. Nodes are selected with **selectors**: `all`
 | `meshvpn net matrix --measure` | RTT, mesh throughput and **direct LAN paths** between all nodes |
 | `meshvpn net route <node>` | The best address for heavy traffic to a node: its LAN address if both share one, otherwise the mesh |
 | `eval $(meshvpn net env --master gpu1 tag:gpu)` | On each node of a training job: `MASTER_ADDR`, `NODE_RANK`, `NNODES`, `NCCL_SOCKET_IFNAME`... for torchrun. Uses the LAN only if every pair of nodes shares one (mixed paths make NCCL hang), otherwise the mesh |
+| `meshvpn launch tag:gpu -- torchrun --nproc_per_node=8 train.py` | Start a distributed job on all selected nodes. Every node gets its environment (`MASTER_ADDR`, `NODE_RANK`, `NCCL_SOCKET_IFNAME`...), torchrun gets `--nnodes/--node_rank/--master_addr/--master_port` added, output is streamed and logged per node, and if one node fails the others are stopped. Ctrl+C, a lost connection or a killed launcher stop the job's whole process tree on every node |
+| `meshvpn launch ... --detach`, `meshvpn jobs [show/logs/stop]` | The same in the background, for agents: returns a job id |
 | `sudo meshvpn share ./dataset` | Share a dataset or checkpoint (file or directory); prints its id |
 | `sudo meshvpn fetch <id> /data` | Download it **from all nodes that have it at once**, over LAN paths where possible. Every 4 MB chunk is verified, interrupted downloads resume, and the node serves the data afterwards, so each node speeds up the next ones |
 | `meshvpn objects` | Shared objects and which nodes have them |
