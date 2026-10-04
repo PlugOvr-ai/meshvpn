@@ -239,7 +239,7 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 | Identity | Each node has an ed25519 key (its node id) and an X25519 key. |
 | Membership | A shared 32-byte network key from the invite. Links use Noise `XXpsk3` with it as the PSK: without the key, the handshake fails. Banning a node changes the key (the key is versioned). |
 | Addresses | `100.64.0.0/10` + 22 bits of `blake3(node id)`. Deterministic, so no allocation server is needed. |
-| Transport | TCP (the only thing an SSH tunnel can carry), with one link per pair of nodes. |
+| Transport | TCP links (the only thing an SSH tunnel or proxy can carry) for control traffic, and **direct UDP paths** for data wherever possible. Nodes publish their address candidates (LAN, public address as other nodes see it) and keep sending authenticated probes to each other, which opens a path through both NATs (hole punching). Data then goes directly over UDP; if a path stops answering it falls back to TCP or a relay within seconds. |
 | Discovery | Nodes sign a record (name, endpoints, neighbors, sequence number) and gossip all records they know. A new link gets the full table; changes are flooded. The state is saved to disk, so the mesh survives losing the bootstrap node. |
 | Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers) or the SSH tunnel's public port. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
@@ -259,8 +259,10 @@ Set `RUST_LOG=meshvpn=debug` for verbose logs.
   if you want to update manually.
 * The end-to-end layer has no replay protection or forward secrecy (the hop-by-hop Noise links have both).
 * IPv4 only, Linux only (the TUN setup and systemd integration).
-* The TCP transport means TCP-over-TCP, which works well on good links but degrades on lossy ones. There's no UDP hole
-  punching; NAT'd nodes that can't reach each other go through a relay instead.
+* Direct UDP paths work through the common kinds of NAT (one public port per internal port, as most home routers do).
+  "Hard" NATs that use a new port for every destination (some carrier-grade NATs and corporate firewalls) can't be
+  punched through. Those nodes keep using TCP and relays, which is slower on lossy links (TCP-over-TCP). For the best
+  results, allow UDP on port 7870 in front of public nodes, as you do for TCP. Switch it off with `udp = false`.
 * The mesh is full-mesh by design, which suits networks of up to a few dozen nodes.
 * Overlay IPs come from a 22-bit hash. A collision is unlikely in small networks; if one happens, the node with the
   lower id keeps the address.

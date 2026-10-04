@@ -21,6 +21,8 @@ use crate::keys::{Identity, NodeId, OVERLAY_NETMASK, overlay_ip};
 use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
 
+mod udp;
+
 /// Where IP packets for this node go: the kernel, or the TCP/IP stack in this process.
 enum PacketIo {
     Tun(Arc<tun::AsyncDevice>),
@@ -159,6 +161,14 @@ struct State {
     bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
     measure_seen: HashSet<u64>,
     measured: u64,
+    udp_paths: HashMap<NodeId, udp::UdpPath>,
+    udp_probing: HashMap<NodeId, udp::Probing>,
+    /// Our public UDP address(es) as other nodes see them.
+    udp_reflexive: Vec<SocketAddr>,
+    udp_keys: HashMap<NodeId, [u8; 32]>,
+    /// First 8 bytes of node ids, for the compact UDP data format.
+    id_prefix: HashMap<[u8; 8], NodeId>,
+    my_udp: Vec<String>,
 }
 
 pub struct Node {
@@ -174,6 +184,8 @@ pub struct Node {
     socks: Option<String>,
     /// Datasets/checkpoints this node shares (`meshvpn share`).
     pub shares: crate::share::Store,
+    /// Direct UDP paths (None: disabled, or no way out over UDP).
+    udp: Option<Arc<tokio::net::UdpSocket>>,
 }
 
 /// A link that finished the handshake and hello exchange and is registered.
@@ -299,6 +311,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     };
 
     let socks = cfg.effective_socks();
+    let udp = udp::bind(&cfg).await;
     let node = Arc::new(Node {
         dir: dir.clone(),
         ident,
@@ -310,6 +323,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         started: Instant::now(),
         socks,
         shares: crate::share::Store::load(&dir),
+        udp,
         cfg,
     });
 
@@ -407,6 +421,16 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     tokio::spawn(node.clone().update_loop());
     tokio::spawn(node.clone().inventory_loop());
     tokio::spawn(crate::share::serve(node.clone()));
+    if node.udp.is_some() {
+        tokio::spawn(node.clone().udp_loop());
+        let n = node.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                n.udp_probe_round();
+            }
+        });
+    }
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -457,6 +481,7 @@ impl Node {
         let mut neighbors: Vec<NodeId> = st.links.keys().copied().collect();
         neighbors.sort();
         st.my_endpoints = self.endpoints(st);
+        st.my_udp = self.udp_candidates(st);
         st.my_seq = now_ms().max(st.my_seq + 1);
         let info = NodeInfo {
             id: self.ident.id,
@@ -483,6 +508,7 @@ impl Node {
                 p
             },
             objects: st.objects_ad.clone(),
+            udp: st.my_udp.clone(),
             measured: st.measured,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
@@ -551,6 +577,7 @@ impl Node {
             );
         }
         st.ciphers.remove(&info.id);
+        st.udp_keys.remove(&info.id);
         let id = info.id;
         // A record we see for the first time may be stale (relayed from someone's memory), so
         // it only proves the node is alive once a newer version follows (every REANNOUNCE).
@@ -1177,6 +1204,10 @@ impl Node {
     fn is_online(&self, st: &State, id: &NodeId) -> bool {
         st.links.contains_key(id)
             || st
+                .udp_paths
+                .get(id)
+                .is_some_and(|p| p.last_rx.elapsed() < udp::PATH_TIMEOUT)
+            || st
                 .records
                 .get(id)
                 .and_then(|r| r.last_heard)
@@ -1195,6 +1226,11 @@ impl Node {
             }
         }
         st.ip_map = ip_map;
+        st.id_prefix = st
+            .records
+            .keys()
+            .map(|id| (id.0[..8].try_into().unwrap(), *id))
+            .collect();
 
         // Breadth-first search over the neighbor lists of online nodes.
         let mut routes: HashMap<NodeId, NodeId> = HashMap::new();
@@ -1234,6 +1270,21 @@ impl Node {
 
     /// Encrypts an IP packet end-to-end for `dst` and hands it to the first hop.
     pub(crate) fn send_packet(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
+        // Straight over UDP if there is a direct path.
+        let direct = {
+            let mut st = self.state.lock().unwrap();
+            let Some(&dst) = st.ip_map.get(&dst_ip) else { return };
+            st.udp_paths
+                .get(&dst)
+                .is_some_and(|p| p.usable())
+                .then(|| self.cipher_for(&mut st, &dst).map(|c| (dst, c)))
+                .flatten()
+        };
+        if let Some((dst, cipher)) = direct
+            && self.udp_send(&dst, &cipher, pkt)
+        {
+            return;
+        }
         let (dst, tx, cipher) = {
             let mut st = self.state.lock().unwrap();
             let Some(&dst) = st.ip_map.get(&dst_ip) else { return };
@@ -1724,7 +1775,10 @@ impl Node {
                 let mut st = self.state.lock().unwrap();
                 let ping = frame(T_PING, &(self.started.elapsed().as_micros() as u64).to_be_bytes());
                 self.broadcast(&st, &ping, None);
-                if last_announce.elapsed() >= REANNOUNCE || self.endpoints(&st) != st.my_endpoints {
+                if last_announce.elapsed() >= REANNOUNCE
+                    || self.endpoints(&st) != st.my_endpoints
+                    || self.udp_candidates(&st) != st.my_udp
+                {
                     self.announce(&mut st);
                     last_announce = Instant::now();
                 }
@@ -1815,7 +1869,10 @@ impl Node {
             .values()
             .map(|r| {
                 let id = r.info.id;
-                let path = if let Some(l) = st.links.get(&id) {
+                let udp = st.udp_paths.get(&id).filter(|p| p.usable());
+                let path = if let Some(p) = udp {
+                    format!("direct UDP {}", p.addr)
+                } else if let Some(l) = st.links.get(&id) {
                     format!("direct {}", l.addr)
                 } else if let Some(hop) = st.routes.get(&id) {
                     let via = st.records.get(hop).map(|r| r.info.name.clone()).unwrap_or(hop.short());
@@ -1829,7 +1886,10 @@ impl Node {
                     ip: overlay_ip(&id),
                     online: self.is_online(&st, &id),
                     path,
-                    rtt_ms: st.links.get(&id).and_then(|l| l.rtt).map(|d| d.as_millis() as u64),
+                    rtt_ms: udp
+                        .and_then(|p| p.rtt)
+                        .or_else(|| st.links.get(&id).and_then(|l| l.rtt))
+                        .map(|d| d.as_millis() as u64),
                     endpoints: r.info.endpoints.clone(),
                     last_seen_secs: r.last_heard.map(|t| t.elapsed().as_secs()),
                     tags: r.info.tags.clone(),

@@ -153,6 +153,9 @@ pub struct Config {
     pub publish_ssh_keys: bool,
     #[serde(default)]
     pub userspace: Userspace,
+    /// Direct UDP paths between nodes, also through NATs (falls back to TCP/relays).
+    #[serde(default = "default_true")]
+    pub udp: bool,
     /// Labels other nodes and agents can select this node by (`tag:gpu`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -200,6 +203,7 @@ impl Config {
             auto_update: true,
             publish_ssh_keys: true,
             userspace: Userspace::Auto,
+            udp: true,
             tags: vec![],
             socks_listen: default_socks_listen(),
             ssh_allow: vec![],

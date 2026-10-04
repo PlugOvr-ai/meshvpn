@@ -71,6 +71,9 @@ pub struct NodeInfo {
     /// This node's measurements towards other nodes (one row of the network matrix).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub perf: Vec<Perf>,
+    /// UDP address candidates (`ip:port`) for direct paths through NATs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp: Vec<String>,
     /// When this node last finished a requested measurement (ms since epoch).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub measured: u64,
@@ -247,6 +250,9 @@ impl SignedInfo {
                 bail!("invalid inventory");
             }
         }
+        if info.udp.len() > 8 || info.udp.iter().any(|a| a.parse::<std::net::SocketAddrV4>().is_err()) {
+            bail!("invalid udp candidates");
+        }
         if info.lan.len() > 16 || info.lan.iter().any(|l| crate::net::parse_cidr(l).is_none()) {
             bail!("invalid lan");
         }
@@ -376,6 +382,7 @@ mod tests {
             inventory: None,
             lan: vec![],
             perf: vec![],
+            udp: vec![],
             measured: 0,
             objects: vec![],
             version: String::new(),
