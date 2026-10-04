@@ -47,6 +47,10 @@ pub enum Request {
     Rename {
         name: String,
     },
+    Tags {
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
     /// Forget an offline node by name or id; `None` = all offline nodes.
     Forget {
         who: Option<String>,
@@ -133,6 +137,12 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                 },
                 Ok(Request::SshSetRules { rules, allow_all }) => match node.ssh_set_rules(rules, allow_all) {
                     Ok(()) => Response::Ok,
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::Tags { add, remove }) => match node.set_tags(add, remove) {
+                    Ok(tags) => Response::Message { text: tags.join(",") },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },

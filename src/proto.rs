@@ -38,6 +38,78 @@ pub struct NodeInfo {
     /// may allow (`meshvpn ssh allow`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_keys: Vec<SshKey>,
+    /// Free-form labels (`gpu`, `trainer`, `cluster-a`) for addressing groups of nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Hardware and load, so agents can pick suitable machines without logging in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Inventory>,
+    /// Physical networks (`ip/prefix`) this node is on, for direct LAN paths between nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lan: Vec<String>,
+    /// This node's measurements towards other nodes (one row of the network matrix).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perf: Vec<Perf>,
+    /// Shared datasets/checkpoints this node has completely and serves to others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<ObjectAd>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Inventory {
+    pub os: String,
+    pub arch: String,
+    pub kernel: String,
+    pub cpu_model: String,
+    pub cpu_cores: u32,
+    pub load1: f32,
+    pub mem_total_mb: u64,
+    pub mem_avail_mb: u64,
+    pub disk_total_gb: u64,
+    pub disk_free_gb: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<Gpu>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gpu_driver: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cuda: String,
+    /// Running without a TUN device (programs here reach the mesh via SOCKS only).
+    #[serde(default)]
+    pub userspace: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Gpu {
+    pub index: u32,
+    pub name: String,
+    pub mem_total_mb: u64,
+    pub mem_used_mb: u64,
+    pub util_pct: u32,
+}
+
+/// What a node measured towards `peer`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Perf {
+    pub peer: NodeId,
+    /// Round trip over the mesh link, microseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_us: Option<u32>,
+    /// Measured throughput over the mesh, Mbit/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_mbps: Option<f32>,
+    /// `peer`'s address on a LAN both share, verified reachable from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_ip: Option<String>,
+    /// When it was measured (ms since epoch).
+    pub at: u64,
+}
+
+/// A shared dataset or checkpoint (see `meshvpn share`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ObjectAd {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -46,6 +118,21 @@ pub struct SshKey {
     pub user: String,
     /// `<type> <base64>`, without comment.
     pub key: String,
+}
+
+/// Text from other nodes that ends up on terminals: short, no control characters.
+pub fn clean_text(t: &str) -> bool {
+    t.len() <= 128 && !t.chars().any(char::is_control)
+}
+
+pub fn valid_tag(t: &str) -> bool {
+    (1..=48).contains(&t.len())
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-_.=".contains(c))
+}
+
+pub fn valid_object_id(id: &str) -> bool {
+    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 pub fn valid_user(u: &str) -> bool {
@@ -110,6 +197,47 @@ impl SignedInfo {
             .any(|e| e.len() > 262 || e.chars().any(|c| c.is_control() || c.is_whitespace()))
         {
             bail!("invalid endpoint");
+        }
+        if !info.tags.iter().all(|t| valid_tag(t)) || info.tags.len() > 32 {
+            bail!("invalid tags");
+        }
+        if let Some(inv) = &info.inventory {
+            let texts = [
+                &inv.os,
+                &inv.arch,
+                &inv.kernel,
+                &inv.cpu_model,
+                &inv.gpu_driver,
+                &inv.cuda,
+            ];
+            if inv.gpus.len() > 32
+                || !texts
+                    .into_iter()
+                    .chain(inv.gpus.iter().map(|g| &g.name))
+                    .all(|t| clean_text(t))
+            {
+                bail!("invalid inventory");
+            }
+        }
+        if info.lan.len() > 16 || info.lan.iter().any(|l| crate::net::parse_cidr(l).is_none()) {
+            bail!("invalid lan");
+        }
+        if info.perf.len() > 1024
+            || info.perf.iter().any(|p| {
+                p.lan_ip
+                    .as_ref()
+                    .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_err())
+            })
+        {
+            bail!("invalid perf");
+        }
+        if info.objects.len() > 256
+            || info
+                .objects
+                .iter()
+                .any(|o| !valid_object_id(&o.id) || !clean_text(&o.name))
+        {
+            bail!("invalid objects");
         }
         // These end up in sshd's authorized keys: accept nothing but plain keys.
         if info.ssh_keys.len() > 64
@@ -216,6 +344,11 @@ mod tests {
             seq: 1,
             net: "n1".into(),
             ssh_keys: vec![],
+            tags: vec![],
+            inventory: None,
+            lan: vec![],
+            perf: vec![],
+            objects: vec![],
             version: String::new(),
         }
     }

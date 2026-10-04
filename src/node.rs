@@ -40,7 +40,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// Forget nodes we have not heard of for a week.
 const FORGET_AFTER_MS: u64 = 7 * 24 * 3600 * 1000;
-const GOSSIP_BATCH: usize = 32;
+/// Gossip messages stay well below the 64 KB link frame limit.
+const GOSSIP_BYTES: usize = 48 * 1024;
 /// An offline node whose name is now used by a newer, online node (typically the same machine
 /// set up again) is forgotten automatically after this long.
 const AUTO_FORGET_AFTER: Duration = Duration::from_secs(600);
@@ -147,6 +148,12 @@ struct State {
     ssh_allow_all: Vec<String>,
     /// This node's name (can change at runtime: `meshvpn rename`).
     my_name: String,
+    my_tags: Vec<String>,
+    inventory: Option<Inventory>,
+    /// Measurements towards other nodes (our row of the network matrix).
+    perf: HashMap<NodeId, Perf>,
+    /// Shared objects we serve completely.
+    objects_ad: Vec<ObjectAd>,
 }
 
 pub struct Node {
@@ -193,6 +200,10 @@ pub struct Status {
     pub update_available: Option<String>,
     #[serde(default)]
     pub banned: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub inventory: Option<Inventory>,
     /// Userspace mode: the SOCKS proxy programs use to reach the mesh.
     #[serde(default)]
     pub socks: Option<String>,
@@ -227,6 +238,12 @@ pub struct PeerStatus {
     pub rtt_ms: Option<u64>,
     pub endpoints: Vec<String>,
     pub last_seen_secs: Option<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub inventory: Option<Inventory>,
+    #[serde(default)]
+    pub objects: Vec<ObjectAd>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -249,6 +266,8 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
             Err(msg) => return Err(tun_error(&cfg, &msg)),
         }
     }
+    let userspace = tun_dev.is_none();
+    let inventory = tokio::task::spawn_blocking(move || crate::inventory::collect(userspace)).await?;
     let (io, start_stack) = match tun_dev {
         Some(t) => (PacketIo::Tun(Arc::new(t)), None),
         None => {
@@ -281,6 +300,8 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.key_version = node.cfg.key_version;
         st.banned = node.cfg.banned.iter().map(|b| (b.id, b.name.clone())).collect();
         st.my_name = node.cfg.name.clone();
+        st.my_tags = node.cfg.tags.clone();
+        st.inventory = Some(inventory);
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
         if let Some(r) = saved.rotation
@@ -360,6 +381,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     }
     tokio::spawn(node.clone().tick_loop());
     tokio::spawn(node.clone().update_loop());
+    tokio::spawn(node.clone().inventory_loop());
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -420,6 +442,19 @@ impl Node {
             seq: st.my_seq,
             net: self.net.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
+            tags: st.my_tags.clone(),
+            inventory: st.inventory.clone(),
+            lan: crate::net::local_lans()
+                .into_iter()
+                .map(|(_, ip, p)| format!("{ip}/{p}"))
+                .take(16)
+                .collect(),
+            perf: {
+                let mut p: Vec<Perf> = st.perf.values().cloned().collect();
+                p.sort_by_key(|x| x.peer);
+                p
+            },
+            objects: st.objects_ad.clone(),
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
             } else {
@@ -517,8 +552,9 @@ impl Node {
         if !changed.is_empty() {
             self.rebuild(&mut st);
             // Flood onwards; the seq check above stops loops.
-            let f = frame(T_GOSSIP, &serde_json::to_vec(&changed).unwrap());
-            self.broadcast(&st, &f, Some(from));
+            for f in gossip_frames(&changed) {
+                self.broadcast(&st, &f, Some(from));
+            }
             drop(st);
             self.update_hosts();
         }
@@ -527,10 +563,7 @@ impl Node {
     fn full_table(&self, st: &State) -> Vec<Vec<u8>> {
         let mut all: Vec<SignedInfo> = st.records.values().map(|r| r.signed.clone()).collect();
         all.extend(st.my_signed.clone());
-        let mut frames: Vec<Vec<u8>> = all
-            .chunks(GOSSIP_BATCH)
-            .map(|c| frame(T_GOSSIP, &serde_json::to_vec(c).unwrap()))
-            .collect();
+        let mut frames = gossip_frames(&all);
         if let Some((r, _)) = &st.rotation {
             frames.insert(0, frame(T_ROTATE, &serde_json::to_vec(r).unwrap()));
         }
@@ -1724,6 +1757,9 @@ impl Node {
                     rtt_ms: st.links.get(&id).and_then(|l| l.rtt).map(|d| d.as_millis() as u64),
                     endpoints: r.info.endpoints.clone(),
                     last_seen_secs: r.last_heard.map(|t| t.elapsed().as_secs()),
+                    tags: r.info.tags.clone(),
+                    inventory: r.info.inventory.clone(),
+                    objects: r.info.objects.clone(),
                 }
             })
             .collect();
@@ -1749,6 +1785,8 @@ impl Node {
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
             socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
+            tags: st.my_tags.clone(),
+            inventory: st.inventory.clone(),
             peers,
         }
     }
@@ -1819,6 +1857,41 @@ impl Node {
         // exec only returns on failure; let the service manager restart us.
         warn!("restarting {}: {err}", exe.display());
         std::process::exit(1);
+    }
+
+    /// `meshvpn tag add/rm`: changes this node's tags and tells everyone.
+    pub fn set_tags(&self, add: Vec<String>, remove: Vec<String>) -> Result<Vec<String>> {
+        if let Some(t) = add.iter().find(|t| !crate::proto::valid_tag(t)) {
+            bail!("invalid tag {t:?} (use a-z, 0-9, - _ . =)");
+        }
+        let mut st = self.state.lock().unwrap();
+        let mut tags = st.my_tags.clone();
+        tags.retain(|t| !remove.contains(t));
+        for t in add {
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
+        if tags.len() > 32 {
+            bail!("at most 32 tags");
+        }
+        let mut cfg = Config::load(&self.dir)?;
+        cfg.tags = tags.clone();
+        cfg.save(&self.dir)?;
+        st.my_tags = tags.clone();
+        self.announce(&mut st);
+        Ok(tags)
+    }
+
+    /// Keeps the inventory (load, free memory, GPU use) fresh.
+    async fn inventory_loop(self: Arc<Self>) {
+        let userspace = matches!(self.io, PacketIo::Userspace(_));
+        loop {
+            tokio::time::sleep(REANNOUNCE).await;
+            if let Ok(inv) = tokio::task::spawn_blocking(move || crate::inventory::collect(userspace)).await {
+                self.state.lock().unwrap().inventory = Some(inv);
+            }
+        }
     }
 
     /// `meshvpn rename NEW`: new name for this node; identity, IP and permissions stay.
@@ -1954,6 +2027,27 @@ fn ssh_client_config(userspace: bool) {
     if let Err(e) = std::fs::write(FILE, text) {
         debug!("writing {FILE}: {e}");
     }
+}
+
+/// Splits records into gossip frames by size (records carry inventory, measurements...).
+fn gossip_frames(records: &[SignedInfo]) -> Vec<Vec<u8>> {
+    let mut frames = vec![];
+    let mut batch: Vec<&SignedInfo> = vec![];
+    let mut size = 0;
+    for r in records {
+        let len = r.data.len() + r.sig.len() + 32;
+        if !batch.is_empty() && size + len > GOSSIP_BYTES {
+            frames.push(frame(T_GOSSIP, &serde_json::to_vec(&batch).unwrap()));
+            batch.clear();
+            size = 0;
+        }
+        batch.push(r);
+        size += len;
+    }
+    if !batch.is_empty() {
+        frames.push(frame(T_GOSSIP, &serde_json::to_vec(&batch).unwrap()));
+    }
+    frames
 }
 
 /// `meshvpn ssh allow everyone ...`

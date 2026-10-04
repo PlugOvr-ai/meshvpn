@@ -153,6 +153,9 @@ pub struct Config {
     pub publish_ssh_keys: bool,
     #[serde(default)]
     pub userspace: Userspace,
+    /// Labels other nodes and agents can select this node by (`tag:gpu`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// In userspace mode: SOCKS5 proxy through which programs here reach the mesh.
     #[serde(default = "default_socks_listen")]
     pub socks_listen: String,
@@ -197,6 +200,7 @@ impl Config {
             auto_update: true,
             publish_ssh_keys: true,
             userspace: Userspace::Auto,
+            tags: vec![],
             socks_listen: default_socks_listen(),
             ssh_allow: vec![],
             ssh_allow_all: vec![],

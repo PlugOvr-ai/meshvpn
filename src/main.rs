@@ -1,8 +1,11 @@
+mod agent;
 mod config;
 mod control;
 mod hosts;
+mod inventory;
 mod keys;
 mod link;
+mod net;
 mod node;
 mod proto;
 mod ssh;
@@ -27,6 +30,10 @@ struct Cli {
     /// Directory holding config and state.
     #[arg(long, global = true, env = "MESHVPN_DIR", default_value = "/etc/meshvpn")]
     dir: PathBuf,
+    /// Machine readable output (JSON on stdout, also for errors). Exit codes: 0 ok, 1 error,
+    /// 2 usage, 3 meshvpn not running, 4 needs root, 5 node/rule not found.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -53,10 +60,54 @@ enum Cmd {
     /// Run the VPN in the foreground (needs root).
     Up,
     /// Show this node and its peers.
-    Status {
-        /// Machine readable output.
+    Status,
+    /// List nodes with tags, hardware and GPUs. Selectors: all, tag:<tag>, names, mesh IPs.
+    Nodes {
+        /// Which nodes (default: all).
+        selectors: Vec<String>,
+        /// Only nodes that are online.
         #[arg(long)]
-        json: bool,
+        online: bool,
+        /// Only nodes with at least this many idle GPUs.
+        #[arg(long, value_name = "N")]
+        free_gpus: Option<usize>,
+    },
+    /// Label this node (e.g. gpu, trainer) so it can be selected as tag:<name>.
+    Tag {
+        #[command(subcommand)]
+        cmd: TagCmd,
+    },
+    /// Run a command on several nodes at once, e.g. `meshvpn exec tag:gpu -- nvidia-smi`.
+    /// Uses the password-less SSH logins (`meshvpn ssh`) of the target nodes.
+    Exec {
+        /// Nodes: all, tag:<tag>, names (several add up).
+        #[arg(required = true)]
+        selectors: Vec<String>,
+        /// The command (one argument = a shell command line, e.g. 'nvidia-smi | head').
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+        /// Account on the target nodes (default: you).
+        #[arg(long, short)]
+        user: Option<String>,
+        /// Give up on a node after this many seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Only online nodes (skip offline ones instead of failing on them).
+        #[arg(long)]
+        online: bool,
+    },
+    /// Copy files to or from nodes, e.g. `meshvpn cp ./data tag:gpu:/srv/` or
+    /// `meshvpn cp node1:/var/log/train.log ./logs`. The destination is a directory.
+    Cp {
+        /// Sources, then the destination. Remote: node:/path, tag:<tag>:/path, all:/path.
+        #[arg(required = true, num_args = 2..)]
+        paths: Vec<String>,
+        #[arg(long, short)]
+        user: Option<String>,
+        #[arg(long, default_value_t = 3600)]
+        timeout: u64,
+        #[arg(long)]
+        online: bool,
     },
     /// Connect to a node at HOST:PORT (e.g. a firewalled node's reverse tunnel port).
     AddPeer { addr: String },
@@ -104,6 +155,16 @@ enum Cmd {
     Install,
     /// Stop and remove the systemd service.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum TagCmd {
+    /// Add tags to this node.
+    Add { tags: Vec<String> },
+    /// Remove tags from this node.
+    Rm { tags: Vec<String> },
+    /// Show this node's tags.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -164,6 +225,9 @@ struct NodeOpts {
     /// Send all outgoing connections through this SOCKS5 proxy (HOST:PORT).
     #[arg(long)]
     socks_proxy: Option<String>,
+    /// Tags for this node (e.g. gpu,trainer), to select it as tag:<name>. Comma separated.
+    #[arg(long = "tag", value_name = "TAG", value_delimiter = ',')]
+    tags: Vec<String>,
     /// Run without a TUN device (for containers without NET_ADMIN). By default meshvpn
     /// switches to this mode by itself when no TUN device is available.
     #[arg(long)]
@@ -185,14 +249,51 @@ struct NodeOpts {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(e) = real_main(cli) {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+    let json = cli.json;
+    match real_main(cli) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let code = exit_code(&msg);
+            if json {
+                println!("{}", serde_json::json!({ "ok": false, "error": msg, "code": code }));
+            } else {
+                eprintln!("error: {msg}");
+            }
+            std::process::exit(code);
+        }
     }
 }
 
-fn real_main(cli: Cli) -> Result<()> {
+/// Stable exit codes, so scripts and agents can tell failures apart.
+fn exit_code(msg: &str) -> i32 {
+    if msg.contains("is not running") {
+        3
+    } else if msg.contains("try again with sudo") || msg.contains("needs root") || msg.contains("permission denied") {
+        4
+    } else if msg.contains("no node")
+        || msg.contains("no rule")
+        || msg.contains("not found")
+        || msg.contains("No such file")
+    {
+        5
+    } else {
+        1
+    }
+}
+
+/// Prints a plain message, or `{"ok": true, "message": ...}` with --json.
+fn say(json: bool, text: &str) {
+    if json {
+        println!("{}", serde_json::json!({ "ok": true, "message": text }));
+    } else {
+        say(json, &text);
+    }
+}
+
+fn real_main(cli: Cli) -> Result<i32> {
     let dir = cli.dir;
+    let json = cli.json;
     load_proxy_env(&dir);
     match cli.cmd {
         Cmd::Init { network, node } => {
@@ -226,7 +327,159 @@ fn real_main(cli: Cli) -> Result<()> {
             init_logging();
             tokio::runtime::Runtime::new()?.block_on(node::run(dir, cfg))?;
         }
-        Cmd::Status { json } => {
+        Cmd::Nodes {
+            selectors,
+            online,
+            free_gpus,
+        } => {
+            let all = agent::nodes(&agent::status(&dir)?);
+            let sel = if selectors.is_empty() {
+                vec!["all".to_string()]
+            } else {
+                selectors
+            };
+            let mut list = agent::select(&all, &sel)?;
+            list.retain(|n| (!online || n.online) && free_gpus.is_none_or(|g| n.free_gpus() >= g));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+            } else {
+                agent::print_nodes(&list);
+            }
+        }
+        Cmd::Tag { cmd } => {
+            let (add, remove) = match cmd {
+                TagCmd::Add { tags } => (tags, vec![]),
+                TagCmd::Rm { tags } => (vec![], tags),
+                TagCmd::List => {
+                    let tags = agent::status(&dir)?.tags;
+                    if json {
+                        println!("{}", serde_json::json!({ "tags": tags }));
+                    } else {
+                        println!(
+                            "{}",
+                            if tags.is_empty() {
+                                "(no tags)".into()
+                            } else {
+                                tags.join(" ")
+                            }
+                        );
+                    }
+                    return Ok(0);
+                }
+            };
+            require_root()?;
+            let tags: Vec<String> = if control::is_running(&dir) {
+                let req = control::Request::Tags { add, remove };
+                match tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))? {
+                    control::Response::Message { text } => {
+                        text.split(',').filter(|t| !t.is_empty()).map(String::from).collect()
+                    }
+                    _ => bail!("unexpected answer from meshvpn"),
+                }
+            } else {
+                let mut cfg = Config::load(&dir)?;
+                if let Some(t) = add.iter().find(|t| !proto::valid_tag(t)) {
+                    bail!("invalid tag {t:?} (use a-z, 0-9, - _ . =)");
+                }
+                cfg.tags.retain(|t| !remove.contains(t));
+                for t in add {
+                    if !cfg.tags.contains(&t) {
+                        cfg.tags.push(t);
+                    }
+                }
+                cfg.save(&dir)?;
+                cfg.tags
+            };
+            if json {
+                println!("{}", serde_json::json!({ "ok": true, "tags": tags }));
+            } else {
+                println!(
+                    "tags: {}",
+                    if tags.is_empty() {
+                        "(none)".into()
+                    } else {
+                        tags.join(" ")
+                    }
+                );
+            }
+        }
+        Cmd::Exec {
+            selectors,
+            command,
+            user,
+            timeout,
+            online,
+        } => {
+            let st = agent::status(&dir)?;
+            let mut targets = agent::select(&agent::nodes(&st), &selectors)?;
+            if online {
+                targets.retain(|n| n.online);
+            }
+            let remote = agent::Remote {
+                user: user.unwrap_or_else(agent::Remote::default_user),
+                socks: st.socks.is_some(),
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            let results = agent::exec(&targets, &remote, &command);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&agent::results_json(&results))?);
+            } else {
+                agent::print_results(&results, true);
+            }
+            return Ok(if results.iter().all(|r| r.ok) { 0 } else { 1 });
+        }
+        Cmd::Cp {
+            mut paths,
+            user,
+            timeout,
+            online,
+        } => {
+            let dest = paths.pop().unwrap();
+            let st = agent::status(&dir)?;
+            let all = agent::nodes(&st);
+            let remote = agent::Remote {
+                user: user.unwrap_or_else(agent::Remote::default_user),
+                socks: st.socks.is_some(),
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            let pick = |sel: &[String]| -> Result<Vec<agent::NodeView>> {
+                let mut t = agent::select(&all, sel)?;
+                if online {
+                    t.retain(|n| n.online);
+                }
+                Ok(t)
+            };
+            let results = match agent::parse_place(&dest) {
+                agent::Place::Remote(sel, dir_there) => {
+                    let mut sources = vec![];
+                    for p in &paths {
+                        match agent::parse_place(p) {
+                            agent::Place::Local(l) => sources.push(l),
+                            agent::Place::Remote(..) => bail!("copy either to nodes or from nodes, not between them"),
+                        }
+                    }
+                    agent::upload(&pick(&sel)?, &remote, &sources, &dir_there)?
+                }
+                agent::Place::Local(local) => {
+                    if paths.len() != 1 {
+                        bail!("download one remote path at a time");
+                    }
+                    match agent::parse_place(&paths[0]) {
+                        agent::Place::Remote(sel, src) => agent::download(&pick(&sel)?, &remote, &src, &local)?,
+                        agent::Place::Local(_) => bail!("both paths are local - use cp"),
+                    }
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&agent::results_json(&results))?);
+            } else {
+                agent::print_results(&results, false);
+                let ok = results.iter().filter(|r| r.ok).count();
+                println!("copied on {ok}/{} node(s)", results.len());
+            }
+            return Ok(if results.iter().all(|r| r.ok) { 0 } else { 1 });
+        }
+        Cmd::Status => {
             let resp = tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Status))?;
             let control::Response::Status(st) = resp else {
                 bail!("unexpected response")
@@ -318,7 +571,7 @@ fn real_main(cli: Cli) -> Result<()> {
                 if let control::Response::Message { text } =
                     tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
                 {
-                    println!("{text}");
+                    say(json, &text);
                 }
             } else {
                 // Not running: just change the config; the name goes out at the next start.
@@ -344,21 +597,21 @@ fn real_main(cli: Cli) -> Result<()> {
             let resp =
                 tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Ban { who }))?;
             if let control::Response::Message { text } = resp {
-                println!("{text}");
+                say(json, &text);
             }
         }
         Cmd::Forget { who, offline: _ } => {
             let resp =
                 tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Forget { who }))?;
             if let control::Response::Message { text } = resp {
-                println!("{text}");
+                say(json, &text);
             }
         }
-        Cmd::Update { check, force } => update_cmd(&dir, check, force)?,
+        Cmd::Update { check, force } => update_cmd(&dir, check, force, json)?,
         Cmd::Install => install(&dir)?,
         Cmd::Uninstall => uninstall()?,
     }
-    Ok(())
+    Ok(0)
 }
 
 /// systemd and sudo start meshvpn without the user's proxy variables, so install.sh saves the
@@ -417,6 +670,10 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
     if o.userspace {
         cfg.userspace = config::Userspace::Always;
     }
+    if let Some(t) = o.tags.iter().find(|t| !proto::valid_tag(t)) {
+        bail!("--tag: invalid tag {t:?} (use a-z, 0-9, - _ . =)");
+    }
+    cfg.tags = o.tags;
     if let Some(u) = o.ssh_allow_all.iter().find(|u| !proto::valid_user(u)) {
         bail!("--ssh-allow-all: invalid user name {u:?}");
     }
@@ -633,7 +890,7 @@ fn human_secs(s: u64) -> String {
     }
 }
 
-fn update_cmd(dir: &Path, check: bool, force: bool) -> Result<()> {
+fn update_cmd(dir: &Path, check: bool, force: bool, json: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     // A running daemon does it itself: it knows the way out (e.g. the SSH tunnel) and restarts.
     if control::is_running(dir) {
@@ -642,7 +899,7 @@ fn update_cmd(dir: &Path, check: bool, force: bool) -> Result<()> {
             force,
         };
         if let control::Response::Message { text } = rt.block_on(control::request(dir, &req))? {
-            println!("{text}");
+            say(json, &text);
         }
         return Ok(());
     }
