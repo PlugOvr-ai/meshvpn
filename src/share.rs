@@ -138,7 +138,7 @@ impl Store {
     pub fn ads(&self) -> Vec<ObjectAd> {
         let mut v: Vec<ObjectAd> = self.objects.lock().unwrap().values().map(Stored::ad).collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
-        v.truncate(256);
+        v.truncate(128); // keeps the node's record small enough for one link message
         v
     }
 

@@ -5,6 +5,7 @@ mod hosts;
 mod inventory;
 mod keys;
 mod link;
+mod mcp;
 mod net;
 mod node;
 mod proto;
@@ -97,6 +98,8 @@ enum Cmd {
     Unshare { id: String },
     /// Shared objects in the network and which nodes have them.
     Objects,
+    /// Model Context Protocol server on stdio for AI agents (`claude mcp add meshvpn -- meshvpn mcp`).
+    Mcp,
     /// Label this node (e.g. gpu, trainer) so it can be selected as tag:<name>.
     Tag {
         #[command(subcommand)]
@@ -576,6 +579,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 }
             }
         }
+        Cmd::Mcp => mcp::serve(dir.clone())?,
         Cmd::Tag { cmd } => {
             let (add, remove) = match cmd {
                 TagCmd::Add { tags } => (tags, vec![]),

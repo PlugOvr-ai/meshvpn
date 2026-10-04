@@ -180,6 +180,35 @@ to `from="<that node's mesh IP>"`, which meshvpn guarantees can't be spoofed. Ru
 not its name. Your other SSH settings and existing logins stay as they are. Needs OpenSSH with `sshd_config.d` support
 (Debian/Ubuntu/Fedora); a user without a key creates one with `ssh-keygen`.
 
+## AI agents and multi-node work
+
+meshvpn is built so that people and AI agents can work with many machines at once, including training models across
+nodes. Every command takes `--json` (errors too), and exit codes are stable: 0 ok, 1 error, 2 usage, 3 meshvpn not
+running, 4 needs root, 5 not found. Nodes are selected with **selectors**: `all`, `tag:<tag>`, node names or mesh IPs.
+
+**MCP server:** connect an agent directly with `claude mcp add meshvpn -- meshvpn mcp` (any MCP client works). Tools:
+`list_nodes`, `exec`, `copy_to_nodes`, `copy_from_nodes`, `network_matrix`, `training_env`, `share`, `fetch`,
+`list_objects`, `set_tags`, `node_status`.
+
+| Command | What it does |
+|---|---|
+| `meshvpn nodes [selectors] [--free-gpus N]` | Nodes with tags and hardware: CPU, memory, disk, GPUs with memory/utilisation, driver and CUDA. Nodes publish this themselves; no login needed |
+| `sudo meshvpn tag add gpu trainer` | Label this node (or `join --tag gpu,trainer`) |
+| `meshvpn exec tag:gpu -- nvidia-smi` | Run a command on many nodes in parallel; output and exit code per node (uses the password-less SSH logins) |
+| `meshvpn cp ./code tag:gpu:/srv/` / `meshvpn cp tag:gpu:/srv/out.log ./logs` | Copy to or from many nodes (the destination is a directory; downloads go to `logs/<node>/`) |
+| `meshvpn net matrix --measure` | RTT, mesh throughput and **direct LAN paths** between all nodes |
+| `meshvpn net route <node>` | The best address for heavy traffic to a node: its LAN address if both share one, otherwise the mesh |
+| `eval $(meshvpn net env --master gpu1 tag:gpu)` | On each node of a training job: `MASTER_ADDR`, `NODE_RANK`, `NNODES`, `NCCL_SOCKET_IFNAME`... for torchrun. Uses the LAN only if every pair of nodes shares one (mixed paths make NCCL hang), otherwise the mesh |
+| `sudo meshvpn share ./dataset` | Share a dataset or checkpoint (file or directory); prints its id |
+| `sudo meshvpn fetch <id> /data` | Download it **from all nodes that have it at once**, over LAN paths where possible. Every 4 MB chunk is verified, interrupted downloads resume, and the node serves the data afterwards, so each node speeds up the next ones |
+| `meshvpn objects` | Shared objects and which nodes have them |
+
+Notes: a LAN path counts only if the other node actually answers on its LAN address (Docker bridges, VPNs and similar
+interfaces are ignored). Throughput is measured over the encrypted mesh links, while several pairs may test at the same
+time, so take the numbers as approximate. Shared data travels encrypted over the mesh; over a direct LAN path it is
+authenticated (only network members can download) but not encrypted, like NCCL's own traffic. `share` and `fetch` need
+root, because the daemon reads and writes the files; fetched files belong to the user who ran `sudo`.
+
 ## Everyday use
 
 | Command | What it does |

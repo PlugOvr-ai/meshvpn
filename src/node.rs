@@ -475,7 +475,10 @@ impl Node {
                 .take(16)
                 .collect(),
             perf: {
+                // Bounded, so a record always fits into one link message: closest peers first.
                 let mut p: Vec<Perf> = st.perf.values().cloned().collect();
+                p.sort_by_key(|x| (x.lan_ip.is_none(), x.rtt_us.unwrap_or(u32::MAX)));
+                p.truncate(128);
                 p.sort_by_key(|x| x.peer);
                 p
             },
