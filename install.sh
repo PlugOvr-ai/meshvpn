@@ -8,7 +8,8 @@
 #   curl -fsSL .../install.sh | sudo sh -s -- init --endpoint my-server.example.com:7870
 #   curl -fsSL .../install.sh | sudo sh -s -- join mesh1-...
 #
-# Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin.
+# Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin,
+# MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub.
 set -eu
 
 REPO="PlugOvr-ai/meshvpn"
@@ -87,7 +88,9 @@ if [ -n "$PROXY" ]; then
     say "Using proxy $(printf '%s' "$PROXY" | sed 's#//[^@/]*@#//***@#') (from $PROXY_FROM)"
 fi
 
-if [ "$VERSION" = "latest" ]; then
+if [ -n "${MESHVPN_DOWNLOAD_URL:-}" ]; then
+    BASE="${MESHVPN_DOWNLOAD_URL%/}"
+elif [ "$VERSION" = "latest" ]; then
     BASE="https://github.com/$REPO/releases/latest/download"
 else
     BASE="https://github.com/$REPO/releases/download/$VERSION"

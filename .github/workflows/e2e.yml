@@ -1,0 +1,29 @@
+name: E2E
+
+# End-to-end tests: real meshvpn nodes in Docker containers (tests/e2e/run.py).
+# Called by CI on every push and by the release workflow before publishing.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build the static binary
+        run: cross build --release --target x86_64-unknown-linux-musl
+      - name: Make sure the TUN module is loaded
+        run: sudo modprobe tun || true
+      - name: End-to-end tests
+        run: python3 tests/e2e/run.py --binary target/x86_64-unknown-linux-musl/release/meshvpn -j 4

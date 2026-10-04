@@ -69,8 +69,12 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
 
+  e2e:
+    uses: ./.github/workflows/e2e.yml
+
   release:
-    needs: build
+    # Published only when every end-to-end test passed.
+    needs: [build, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

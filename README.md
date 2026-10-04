@@ -299,6 +299,20 @@ cargo test
 cargo build --release
 ```
 
+**End-to-end tests** run real meshvpn nodes in Docker containers. They cover joining and invites, admins and bans,
+NAT traversal through two routers, userspace mode, password-less SSH, `exec`/`cp`, launching jobs (including stopping
+them), GPU reservations, sharing data, the network matrix, `doctor`, MCP, `deploy.sh` and `install.sh` behind a proxy.
+They need Docker and a static binary:
+
+```sh
+cross build --release --target x86_64-unknown-linux-musl
+tests/e2e/run.py --binary target/x86_64-unknown-linux-musl/release/meshvpn -j 4    # all, about 2-3 minutes
+tests/e2e/run.py --binary ... --list                                                # what there is
+tests/e2e/run.py --binary ... --keep nat_traversal                                  # one; keep its containers if it fails
+```
+
+They run on every push, and a release is only published when all of them pass.
+
 To publish a release, push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow then builds static
 binaries for every architecture, `.deb`/`.rpm` packages and checksums, and attaches `install.sh`.
 

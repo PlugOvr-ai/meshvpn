@@ -22,3 +22,6 @@ jobs:
       - run: cargo test
       - name: Lint shell scripts
         run: shellcheck install.sh deploy.sh
+
+  e2e:
+    uses: ./.github/workflows/e2e.yml

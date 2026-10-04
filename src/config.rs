@@ -314,7 +314,10 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_dir(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    // A unique temporary file: several threads may save the same file at the same time.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

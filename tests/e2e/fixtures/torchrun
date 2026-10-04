@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+# Stand-in for torchrun: a real rendezvous over MASTER_ADDR:MASTER_PORT, then a few "steps".
+# Env: STEPS (default 3), FAIL_RANK (crash that rank at step 1).
+import os, socket, sys, time
+args = dict(a.lstrip("-").split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
+rank, n = int(args["node_rank"]), int(args["nnodes"])
+addr, port = args["master_addr"], int(args["master_port"])
+print(f"rank {rank}/{n} master {addr}:{port} nproc={args.get('nproc_per_node')} "
+      f"ifname={os.environ.get('NCCL_SOCKET_IFNAME')} cuda={os.environ.get('CUDA_VISIBLE_DEVICES')}", flush=True)
+if rank == 0:
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port)); srv.listen()
+    peers = sorted(srv.accept()[0].recv(64).decode() for _ in range(n - 1))
+    print("rendezvous complete:", " ".join(peers), flush=True)
+else:
+    for _ in range(150):
+        try:
+            s = socket.create_connection((addr, port), 2); break
+        except OSError:
+            time.sleep(0.2)
+    s.sendall(f"rank{rank}".encode())
+for i in range(int(os.environ.get("STEPS", "3"))):
+    if os.environ.get("FAIL_RANK") == str(rank) and i == 1:
+        print("simulated crash", flush=True); sys.exit(3)
+    print(f"step {i}", flush=True); time.sleep(1)
