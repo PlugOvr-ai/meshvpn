@@ -172,6 +172,8 @@ pub struct Node {
     next_link_id: AtomicU64,
     started: Instant,
     socks: Option<String>,
+    /// Datasets/checkpoints this node shares (`meshvpn share`).
+    pub shares: crate::share::Store,
 }
 
 /// A link that finished the handshake and hello exchange and is registered.
@@ -215,6 +217,9 @@ pub struct Status {
     pub perf: Vec<Perf>,
     #[serde(default)]
     pub measured: u64,
+    /// Objects this node shares.
+    #[serde(default)]
+    pub objects: Vec<ObjectAd>,
     /// Userspace mode: the SOCKS proxy programs use to reach the mesh.
     #[serde(default)]
     pub socks: Option<String>,
@@ -304,6 +309,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         next_link_id: AtomicU64::new(1),
         started: Instant::now(),
         socks,
+        shares: crate::share::Store::load(&dir),
         cfg,
     });
 
@@ -319,6 +325,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.my_name = node.cfg.name.clone();
         st.my_tags = node.cfg.tags.clone();
         st.inventory = Some(inventory);
+        st.objects_ad = node.shares.ads();
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
         if let Some(r) = saved.rotation
@@ -399,6 +406,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     tokio::spawn(node.clone().tick_loop());
     tokio::spawn(node.clone().update_loop());
     tokio::spawn(node.clone().inventory_loop());
+    tokio::spawn(crate::share::serve(node.clone()));
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1860,6 +1868,7 @@ impl Node {
                 .collect(),
             perf: st.perf.values().cloned().collect(),
             measured: st.measured,
+            objects: st.objects_ad.clone(),
             peers,
         }
     }
@@ -2110,6 +2119,51 @@ impl Node {
             let others: Vec<NodeId> = req.nodes.iter().copied().filter(|n| *n != self.ident.id).collect();
             tokio::spawn(self.clone().measure(Some(others), req.bytes.min(1 << 30)));
         }
+    }
+
+    // ----------------------------------------------------------------------------- sharing
+
+    /// Network keys, current first (the chunk server accepts any of them during a rotation).
+    pub fn network_keys(&self) -> Vec<[u8; 32]> {
+        let st = self.state.lock().unwrap();
+        let mut keys: Vec<(u32, [u8; 32])> = st.keys.iter().map(|(v, k)| (*v, *k)).collect();
+        keys.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+        keys.into_iter().map(|(_, k)| k).collect()
+    }
+
+    /// In userspace mode, connections into the mesh go through our own SOCKS proxy.
+    pub fn socks_addr(&self) -> Option<String> {
+        matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone())
+    }
+
+    /// Re-announces which objects we serve.
+    pub fn objects_changed(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.objects_ad = self.shares.ads();
+        self.announce(&mut st);
+    }
+
+    /// Online nodes that have object `id`, best first (verified LAN path, then low RTT).
+    pub fn holders(&self, id: &str) -> Vec<crate::share::Holder> {
+        let st = self.state.lock().unwrap();
+        let mut list: Vec<(bool, u32, crate::share::Holder)> = st
+            .records
+            .values()
+            .filter(|r| self.is_online(&st, &r.info.id) && r.info.objects.iter().any(|o| o.id == id))
+            .map(|r| {
+                let perf = st.perf.get(&r.info.id);
+                let lan_ip = perf.and_then(|p| p.lan_ip.as_ref()).and_then(|ip| ip.parse().ok());
+                let rtt = perf.and_then(|p| p.rtt_us).unwrap_or(u32::MAX);
+                let h = crate::share::Holder {
+                    name: r.info.name.clone(),
+                    mesh_ip: overlay_ip(&r.info.id),
+                    lan_ip,
+                };
+                (lan_ip.is_none(), rtt, h)
+            })
+            .collect();
+        list.sort_by_key(|(no_lan, rtt, _)| (*no_lan, *rtt));
+        list.into_iter().map(|(_, _, h)| h).collect()
     }
 
     /// Keeps the inventory (load, free memory, GPU use) fresh.

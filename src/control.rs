@@ -51,6 +51,19 @@ pub enum Request {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    Share {
+        path: String,
+        name: Option<String>,
+    },
+    Fetch {
+        id: String,
+        dest: String,
+        /// Give the files to this user (the one behind sudo).
+        owner: Option<u32>,
+    },
+    Unshare {
+        id: String,
+    },
     /// Ask these nodes (hex ids) to measure towards each other now.
     Measure {
         nodes: Vec<String>,
@@ -166,6 +179,50 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                         message: format!("{e:#}"),
                     },
                 },
+                Ok(Request::Share { path, name }) => {
+                    let n = node.clone();
+                    let res =
+                        tokio::task::spawn_blocking(move || crate::share::share(&n.shares, Path::new(&path), name))
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|r| r);
+                    match res {
+                        Ok(s) => {
+                            node.objects_changed();
+                            Response::Message {
+                                text: serde_json::json!({
+                                    "id": s.id, "name": s.manifest.name, "size": s.manifest.total,
+                                    "files": s.manifest.files.len(),
+                                })
+                                .to_string(),
+                            }
+                        }
+                        Err(e) => Response::Error {
+                            message: format!("{e:#}"),
+                        },
+                    }
+                }
+                Ok(Request::Fetch { id, dest, owner }) => {
+                    let holders = node.holders(&id);
+                    match crate::share::fetch(node.clone(), &id, Path::new(&dest), owner, holders).await {
+                        Ok(r) => Response::Message {
+                            text: serde_json::to_string(&r).unwrap(),
+                        },
+                        Err(e) => Response::Error {
+                            message: format!("{e:#}"),
+                        },
+                    }
+                }
+                Ok(Request::Unshare { id }) => {
+                    if node.shares.remove(&id) {
+                        node.objects_changed();
+                        Response::Ok
+                    } else {
+                        Response::Error {
+                            message: format!("object {id} not found here"),
+                        }
+                    }
+                }
                 Ok(Request::Rename { name }) => match node.rename(&name) {
                     Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {

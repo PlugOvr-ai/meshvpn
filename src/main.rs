@@ -8,6 +8,7 @@ mod link;
 mod net;
 mod node;
 mod proto;
+mod share;
 mod ssh;
 mod sshd;
 mod tui;
@@ -77,6 +78,25 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NetCmd,
     },
+    /// Share a file or directory (dataset, checkpoint) with the network; prints its id.
+    Share {
+        path: PathBuf,
+        /// Name shown to others (default: the file/directory name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Download a shared object into DIR - in parallel from every node that has it, over LAN
+    /// paths where possible. Resumes where it stopped; afterwards this node serves it too.
+    Fetch {
+        id: String,
+        /// Directory to download into.
+        #[arg(value_name = "DIR")]
+        dest: PathBuf,
+    },
+    /// Stop sharing an object (the files stay).
+    Unshare { id: String },
+    /// Shared objects in the network and which nodes have them.
+    Objects,
     /// Label this node (e.g. gpu, trainer) so it can be selected as tag:<name>.
     Tag {
         #[command(subcommand)]
@@ -448,6 +468,114 @@ fn real_main(cli: Cli) -> Result<i32> {
                 }
             }
         }
+        Cmd::Share { path, name } => {
+            require_root()?;
+            let path = std::path::absolute(&path)?.to_string_lossy().into_owned();
+            let req = control::Request::Share { path, name };
+            if let control::Response::Message { text } =
+                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
+            {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                if json {
+                    println!("{v}");
+                } else {
+                    println!(
+                        "shared {} ({} files, {}) as\n  {}\nfetch it on other nodes with: sudo meshvpn fetch {} <dir>",
+                        v["name"].as_str().unwrap_or(""),
+                        v["files"],
+                        human_bytes(v["size"].as_u64().unwrap_or(0)),
+                        v["id"].as_str().unwrap_or(""),
+                        v["id"].as_str().unwrap_or("")
+                    );
+                }
+            }
+        }
+        Cmd::Fetch { id, dest } => {
+            require_root()?;
+            let dest = std::path::absolute(&dest)?.to_string_lossy().into_owned();
+            let owner = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
+            if !json {
+                eprintln!("fetching {id}...");
+            }
+            let req = control::Request::Fetch { id, dest, owner };
+            if let control::Response::Message { text } =
+                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
+            {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                if json {
+                    println!("{v}");
+                } else {
+                    let from: Vec<String> = v["from"]
+                        .as_object()
+                        .map(|m| {
+                            m.iter()
+                                .map(|(k, b)| format!("{k} {}", human_bytes(b.as_u64().unwrap_or(0))))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "fetched {} into {}: {} in {:.1}s ({:.0} Mbit/s){}{}",
+                        v["name"].as_str().unwrap_or(""),
+                        v["dest"].as_str().unwrap_or(""),
+                        human_bytes(v["bytes"].as_u64().unwrap_or(0)),
+                        v["seconds"].as_f64().unwrap_or(0.0),
+                        v["mbit_per_s"].as_f64().unwrap_or(0.0),
+                        if from.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" from {}", from.join(", "))
+                        },
+                        match v["reused_bytes"].as_u64().unwrap_or(0) {
+                            0 => String::new(),
+                            r => format!(" ({} were already there)", human_bytes(r)),
+                        }
+                    );
+                }
+            }
+        }
+        Cmd::Unshare { id } => {
+            require_root()?;
+            tokio::runtime::Runtime::new()?
+                .block_on(control::request(&dir, &control::Request::Unshare { id: id.clone() }))?;
+            say(json, &format!("no longer sharing {id}"));
+        }
+        Cmd::Objects => {
+            let st = agent::status(&dir)?;
+            let mut objects: Vec<(proto::ObjectAd, Vec<String>)> = vec![];
+            for n in agent::nodes(&st) {
+                let list = if n.is_self {
+                    st.objects.clone()
+                } else {
+                    n.objects.clone()
+                };
+                for o in list {
+                    match objects.iter_mut().find(|(x, _)| x.id == o.id) {
+                        Some((_, holders)) => holders.push(n.name.clone()),
+                        None => objects.push((o, vec![n.name.clone()])),
+                    }
+                }
+            }
+            if json {
+                let v: Vec<serde_json::Value> = objects
+                    .iter()
+                    .map(|(o, h)| serde_json::json!({"id": o.id, "name": o.name, "size": o.size, "holders": h}))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else if objects.is_empty() {
+                println!("Nothing shared yet - share a file or directory with: sudo meshvpn share <path>");
+            } else {
+                println!("{:<32}  {:<24}  {:>9}  HOLDERS", "ID", "NAME", "SIZE");
+                for (o, h) in objects {
+                    println!(
+                        "{:<32}  {:<24}  {:>9}  {}",
+                        o.id,
+                        o.name,
+                        human_bytes(o.size),
+                        h.join(", ")
+                    );
+                }
+            }
+        }
         Cmd::Tag { cmd } => {
             let (add, remove) = match cmd {
                 TagCmd::Add { tags } => (tags, vec![]),
@@ -736,6 +864,14 @@ fn load_proxy_env(dir: &Path) {
             // Still single-threaded here: no other thread reads the environment yet.
             unsafe { std::env::set_var(key, value) };
         }
+    }
+}
+
+fn human_bytes(b: u64) -> String {
+    match b {
+        0..1_000_000 => format!("{:.0} kB", b as f64 / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", b as f64 / 1e6),
+        _ => format!("{:.2} GB", b as f64 / 1e9),
     }
 }
 
