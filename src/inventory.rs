@@ -108,7 +108,9 @@ pub fn collect(userspace: bool) -> Inventory {
     let meminfo = read("/proc/meminfo");
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
     let (disk_total_gb, disk_free_gb) = if unsafe { libc::statvfs(c"/".as_ptr(), &mut vfs) } == 0 {
-        let gb = |blocks: u64| blocks * vfs.f_frsize / 1_000_000_000;
+        // The field types differ between 32 and 64 bit platforms.
+        #[allow(clippy::useless_conversion)]
+        let gb = |blocks| u64::from(blocks) * u64::from(vfs.f_frsize) / 1_000_000_000;
         (gb(vfs.f_blocks), gb(vfs.f_bavail))
     } else {
         (0, 0)
