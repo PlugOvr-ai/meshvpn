@@ -146,6 +146,18 @@ pub struct NodeInfo {
     /// Shared datasets/checkpoints this node has completely and serves to others.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<ObjectAd>,
+    /// GPU reservations on this node (granted by this node, so they can't collide).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leases: Vec<Lease>,
+}
+
+/// GPUs of a node reserved for someone until `expires` (ms since epoch).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Lease {
+    pub id: String,
+    pub gpus: Vec<u32>,
+    pub holder: String,
+    pub expires: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -331,6 +343,14 @@ impl SignedInfo {
         {
             bail!("invalid perf");
         }
+        if info.leases.len() > 64
+            || info
+                .leases
+                .iter()
+                .any(|l| !clean_text(&l.holder) || l.id.len() > 16 || l.gpus.len() > 64)
+        {
+            bail!("invalid leases");
+        }
         if info.objects.len() > 256
             || info
                 .objects
@@ -454,6 +474,7 @@ mod tests {
             udp: vec![],
             measured: 0,
             objects: vec![],
+            leases: vec![],
             version: String::new(),
         }
     }

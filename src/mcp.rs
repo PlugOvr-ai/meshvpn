@@ -89,7 +89,32 @@ fn tools() -> Value {
                 "port": {"type": "integer"},
                 "workdir": {"type": "string", "description": "Directory on the nodes (default: home)."},
                 "user": {"type": "string"},
-                "keep_going": {"type": "boolean"}
+                "keep_going": {"type": "boolean"},
+                "gpus": {"type": "integer", "description": "Reserve this many GPUs per node for the job (CUDA_VISIBLE_DEVICES and --nproc_per_node are set); the job only starts if they are free."}
+            }}
+        },
+        {
+            "name": "gpu_list",
+            "description": "All GPUs of the selected nodes: model, memory, utilisation and state (free, busy, or reserved - by whom and how long).",
+            "inputSchema": {"type": "object", "properties": {"selectors": selectors}}
+        },
+        {
+            "name": "gpu_reserve",
+            "description": "Reserve GPUs so no other agent or job takes them: `count` per selected node (all or nothing), or with one=true on the single node with the most free GPUs. The node owning the GPUs grants it, so reservations never collide. Returns per node the reservation id and CUDA_VISIBLE_DEVICES. Reservations expire (default 2h): renew long jobs, release when done.",
+            "inputSchema": {"type": "object", "required": ["selectors"], "properties": {
+                "selectors": selectors,
+                "count": {"type": "integer", "description": "GPUs per node (default 1)."},
+                "one": {"type": "boolean"},
+                "for": {"type": "string", "description": "Duration, e.g. 30m, 2h (default 2h)."},
+                "note": {"type": "string", "description": "Shown to others, e.g. the job."}
+            }}
+        },
+        {
+            "name": "gpu_release",
+            "description": "Release GPU reservations by id (or renew them with renew_for, e.g. \"2h\").",
+            "inputSchema": {"type": "object", "required": ["ids"], "properties": {
+                "ids": {"type": "array", "items": {"type": "string"}},
+                "renew_for": {"type": "string"}
             }}
         },
         {
@@ -280,6 +305,9 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             if args.get("keep_going").and_then(Value::as_bool).unwrap_or(false) {
                 a.push("--keep-going".into());
             }
+            if let Some(g) = args.get("gpus").and_then(Value::as_u64) {
+                a.extend(["--gpus".to_string(), g.to_string()]);
+            }
             a.push("--".into());
             let command = match args.get("command") {
                 Some(Value::String(s)) => vec![s.clone()],
@@ -290,6 +318,54 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             }
             a.extend(command);
             Ok(serde_json::to_value(crate::launch::detach(dir, &a)?)?)
+        }
+        "gpu_list" => {
+            let (_, nodes) = targets(dir, args)?;
+            Ok(serde_json::to_value(crate::gpu::rows(&nodes))?)
+        }
+        "gpu_reserve" => {
+            let (st, mut nodes) = targets(dir, args)?;
+            nodes.retain(|n| n.online);
+            let count = args.get("count").and_then(Value::as_u64).unwrap_or(1) as u32;
+            let ttl = crate::parse_duration_ms(args.get("for").and_then(Value::as_str).unwrap_or("2h"))?;
+            let holder = crate::gpu::default_holder(args.get("note").and_then(Value::as_str));
+            let r = remote(&st, args, 60);
+            let grants = if args.get("one").and_then(Value::as_bool).unwrap_or(false) {
+                nodes.sort_by_key(|n| std::cmp::Reverse(n.free_gpus()));
+                let n = nodes
+                    .first()
+                    .ok_or_else(|| anyhow!("no node of the selection is online"))?;
+                if n.free_gpus() < count as usize {
+                    bail!(
+                        "no node of the selection has {count} free GPU(s) (most: {} on {})",
+                        n.free_gpus(),
+                        n.name
+                    );
+                }
+                vec![crate::gpu::reserve_on(dir, n, &r, count, None, ttl, &holder)?]
+            } else {
+                crate::gpu::reserve_all(dir, &nodes, &r, count, ttl, &holder)?
+            };
+            Ok(serde_json::to_value(grants)?)
+        }
+        "gpu_release" => {
+            let st = agent::status(dir)?;
+            let all = agent::nodes(&st);
+            let r = remote(&st, args, 60);
+            let renew = args
+                .get("renew_for")
+                .and_then(Value::as_str)
+                .map(crate::parse_duration_ms)
+                .transpose()?;
+            let mut out = vec![];
+            for id in strings(args, "ids") {
+                let n = crate::gpu::find_lease(&all, &id)?;
+                out.push(match renew {
+                    Some(ttl) => crate::gpu::renew_on(dir, n, &r, &id, ttl)?,
+                    None => crate::gpu::release_on(dir, n, &r, &id)?,
+                });
+            }
+            Ok(serde_json::to_value(out)?)
         }
         "job_status" => {
             let job = crate::launch::Job::load(text(args, "id")?)?;

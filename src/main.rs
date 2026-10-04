@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod control;
+mod gpu;
 mod hosts;
 mod inventory;
 mod keys;
@@ -69,6 +70,11 @@ enum Cmd {
         /// How long it is valid, e.g. 30m, 24h, 7d (managed networks).
         #[arg(long, default_value = "24h")]
         expires: String,
+    },
+    /// GPUs across the network: list them, reserve them for a job, release them.
+    Gpu {
+        #[command(subcommand)]
+        cmd: GpuCmd,
     },
     /// Admins of a managed network: only they invite, ban and change the admins.
     Admin {
@@ -139,6 +145,10 @@ enum Cmd {
         /// Don't stop the other nodes when one fails.
         #[arg(long)]
         keep_going: bool,
+        /// Reserve this many GPUs per node for the job (sets CUDA_VISIBLE_DEVICES and torchrun's
+        /// --nproc_per_node); fails before starting if they are not free.
+        #[arg(long)]
+        gpus: Option<u32>,
         /// Run in the background and print the job id (see `meshvpn jobs`).
         #[arg(long)]
         detach: bool,
@@ -264,6 +274,74 @@ enum NetCmd {
         master: Option<String>,
         #[arg(long, default_value_t = 29500)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum GpuCmd {
+    /// GPUs of the nodes: free, busy or reserved (by whom, how long).
+    List {
+        /// Which nodes (default: all).
+        selectors: Vec<String>,
+    },
+    /// Reserve GPUs: N on every selected node, or with --one on the single best node.
+    /// The node with the GPUs grants it (over SSH for other nodes), so reservations never
+    /// collide. Prints CUDA_VISIBLE_DEVICES per node.
+    Reserve {
+        #[arg(required = true)]
+        selectors: Vec<String>,
+        /// GPUs per node.
+        #[arg(long, short = 'n', default_value_t = 1)]
+        count: u32,
+        /// Exactly these GPUs (e.g. 0,1) - one node only.
+        #[arg(long, value_delimiter = ',')]
+        gpus: Option<Vec<u32>>,
+        /// How long (renew with `meshvpn gpu renew`), e.g. 30m, 2h, 1d.
+        #[arg(long = "for", default_value = "2h")]
+        duration: String,
+        /// Pick the one node with the most free GPUs among the selected.
+        #[arg(long)]
+        one: bool,
+        /// Who it is for (shown to others).
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, short)]
+        user: Option<String>,
+    },
+    /// Release reservations.
+    Release {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long, short)]
+        user: Option<String>,
+    },
+    /// Extend reservations.
+    Renew {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long = "for", default_value = "2h")]
+        duration: String,
+        #[arg(long, short)]
+        user: Option<String>,
+    },
+    #[command(hide = true)]
+    ReserveLocal {
+        #[arg(long)]
+        count: Option<u32>,
+        #[arg(long, value_delimiter = ',')]
+        gpus: Option<Vec<u32>>,
+        #[arg(long)]
+        ttl_ms: u64,
+        #[arg(long)]
+        holder: String,
+    },
+    #[command(hide = true)]
+    ReleaseLocal { id: String },
+    #[command(hide = true)]
+    RenewLocal {
+        id: String,
+        #[arg(long)]
+        ttl_ms: u64,
     },
 }
 
@@ -485,6 +563,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             let cfg = Config::load(&dir)?;
             print_invite(&dir, &cfg, uses, parse_duration_ms(&expires)?, json)?;
         }
+        Cmd::Gpu { cmd } => return gpu_cmd(&dir, cmd, json),
         Cmd::Admin { cmd } => {
             let req = match cmd {
                 AdminCmd::Status => control::Request::AdminStatus,
@@ -753,6 +832,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             keep_going,
             detach,
             job_dir,
+            gpus,
         } => {
             let opts = launch::Opts {
                 selectors: selectors.clone(),
@@ -762,6 +842,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 workdir: workdir.clone(),
                 keep_going,
                 command: command.clone(),
+                gpus,
             };
             if detach {
                 let mut args: Vec<String> = selectors;
@@ -773,6 +854,9 @@ fn real_main(cli: Cli) -> Result<i32> {
                 args.extend(["--port".to_string(), port.to_string()]);
                 if keep_going {
                     args.push("--keep-going".into());
+                }
+                if let Some(g) = gpus {
+                    args.extend(["--gpus".to_string(), g.to_string()]);
                 }
                 args.push("--".into());
                 args.extend(command);
@@ -1356,6 +1440,129 @@ fn make_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64) -> Result<Inv
     })
 }
 
+fn gpu_cmd(dir: &Path, cmd: GpuCmd, json: bool) -> Result<i32> {
+    // Run on the GPU node itself (over SSH from other nodes): always JSON.
+    let local = |req: control::Request| -> Result<i32> {
+        let rt = tokio::runtime::Runtime::new()?;
+        if let control::Response::Message { text } = rt.block_on(control::request(dir, &req))? {
+            println!("{text}");
+        }
+        Ok(0)
+    };
+    match cmd {
+        GpuCmd::ReserveLocal {
+            count,
+            gpus,
+            ttl_ms,
+            holder,
+        } => {
+            return local(control::Request::GpuReserve {
+                count,
+                indices: gpus,
+                ttl_ms,
+                holder,
+            });
+        }
+        GpuCmd::ReleaseLocal { id } => return local(control::Request::GpuRelease { id }),
+        GpuCmd::RenewLocal { id, ttl_ms } => return local(control::Request::GpuRenew { id, ttl_ms }),
+        _ => {}
+    }
+    let st = agent::status(dir)?;
+    let all = agent::nodes(&st);
+    let remote = |user: Option<String>| agent::Remote {
+        user: user.unwrap_or_else(agent::Remote::default_user),
+        socks: st.socks.is_some(),
+        timeout: std::time::Duration::from_secs(60),
+    };
+    let grants: Vec<gpu::Grant> = match cmd {
+        GpuCmd::List { selectors } => {
+            let sel = if selectors.is_empty() {
+                vec!["all".to_string()]
+            } else {
+                selectors
+            };
+            let rows = gpu::rows(&agent::select(&all, &sel)?);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                gpu::print_rows(&rows);
+            }
+            return Ok(0);
+        }
+        GpuCmd::Reserve {
+            selectors,
+            count,
+            gpus,
+            duration,
+            one,
+            note,
+            user,
+        } => {
+            let ttl = parse_duration_ms(&duration)?;
+            let holder = gpu::default_holder(note.as_deref());
+            let mut nodes = agent::select(&all, &selectors)?;
+            nodes.retain(|n| n.online);
+            if one || gpus.is_some() {
+                nodes.sort_by_key(|n| std::cmp::Reverse(n.free_gpus()));
+                let n = nodes
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no node of the selection is online"))?;
+                if gpus.is_none() && n.free_gpus() < count as usize {
+                    bail!(
+                        "no node of the selection has {count} free GPU(s) (most: {} on {})",
+                        n.free_gpus(),
+                        n.name
+                    );
+                }
+                vec![gpu::reserve_on(
+                    dir,
+                    n,
+                    &remote(user),
+                    count,
+                    gpus.as_deref(),
+                    ttl,
+                    &holder,
+                )?]
+            } else {
+                gpu::reserve_all(dir, &nodes, &remote(user), count, ttl, &holder)?
+            }
+        }
+        GpuCmd::Release { ids, user } => {
+            let mut out = vec![];
+            for id in ids {
+                let n = gpu::find_lease(&all, &id)?;
+                out.push(gpu::release_on(dir, n, &remote(user.clone()), &id)?);
+            }
+            out
+        }
+        GpuCmd::Renew { ids, duration, user } => {
+            let ttl = parse_duration_ms(&duration)?;
+            let mut out = vec![];
+            for id in ids {
+                let n = gpu::find_lease(&all, &id)?;
+                out.push(gpu::renew_on(dir, n, &remote(user.clone()), &id, ttl)?);
+            }
+            out
+        }
+        _ => unreachable!(),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&grants)?);
+    } else {
+        for g in &grants {
+            println!(
+                "{}: GPUs {} - reservation {} until {} min from now  (CUDA_VISIBLE_DEVICES={})",
+                g.node,
+                g.cuda_visible_devices,
+                g.lease.id,
+                g.lease.expires.saturating_sub(gpu::now_ms()) / 60_000,
+                g.cuda_visible_devices
+            );
+        }
+    }
+    Ok(0)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1364,7 +1571,7 @@ fn now_ms() -> u64 {
 }
 
 /// `30m`, `24h`, `7d` or seconds.
-fn parse_duration_ms(s: &str) -> Result<u64> {
+pub(crate) fn parse_duration_ms(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num

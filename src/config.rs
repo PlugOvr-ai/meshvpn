@@ -357,6 +357,9 @@ pub struct SavedState {
     pub roster: Option<crate::proto::SignedDoc>,
     #[serde(default)]
     pub claims: Vec<crate::proto::ClaimMsg>,
+    /// GPU reservations on this node.
+    #[serde(default)]
+    pub leases: Vec<crate::proto::Lease>,
 }
 
 impl SavedState {

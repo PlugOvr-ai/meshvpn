@@ -48,6 +48,20 @@ pub enum Request {
         name: String,
     },
     AdminStatus,
+    /// GPU reservations on this node (allowed for every local user: they are advisory).
+    GpuReserve {
+        count: Option<u32>,
+        indices: Option<Vec<u32>>,
+        ttl_ms: u64,
+        holder: String,
+    },
+    GpuRelease {
+        id: String,
+    },
+    GpuRenew {
+        id: String,
+        ttl_ms: u64,
+    },
     AdminEnable,
     AdminChange {
         who: String,
@@ -133,6 +147,14 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                     text: node.authorized_keys(&user),
                 },
                 Ok(Request::SshList) => Response::Message { text: node.ssh_list() },
+                Ok(Request::GpuReserve {
+                    count,
+                    indices,
+                    ttl_ms,
+                    holder,
+                }) => lease_reply(node.gpu_reserve(count, indices, ttl_ms, holder)),
+                Ok(Request::GpuRelease { id }) => lease_reply(node.gpu_release(&id)),
+                Ok(Request::GpuRenew { id, ttl_ms }) => lease_reply(node.gpu_renew(&id, ttl_ms)),
                 Ok(Request::AdminStatus) => Response::Message {
                     text: node.admin_status().to_string(),
                 },
@@ -281,6 +303,17 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
             out.push(b'\n');
             let _ = w.write_all(&out).await;
         });
+    }
+}
+
+fn lease_reply(r: anyhow::Result<crate::proto::Lease>) -> Response {
+    match r {
+        Ok(l) => Response::Message {
+            text: serde_json::to_string(&l).unwrap(),
+        },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 

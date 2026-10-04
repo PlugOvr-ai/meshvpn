@@ -23,6 +23,9 @@ use crate::agent::{self, NodeView, Remote, sh_quote};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// GPU reservations of a job last this long and are renewed every 5 minutes.
+const LEASE_TTL_MS: u64 = 15 * 60 * 1000;
+
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
@@ -35,6 +38,8 @@ pub struct Opts {
     pub workdir: Option<String>,
     pub keep_going: bool,
     pub command: Vec<String>,
+    /// Reserve this many GPUs per node for the job (and set CUDA_VISIBLE_DEVICES).
+    pub gpus: Option<u32>,
 }
 
 /// What a job looks like on disk (`~/.local/state/meshvpn/jobs/<id>/job.json`).
@@ -55,6 +60,9 @@ pub struct Job {
     pub env: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
     pub results: Vec<NodeResult>,
+    /// GPU reservations of the job, per node.
+    #[serde(default)]
+    pub gpus: Vec<crate::gpu::Grant>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -150,6 +158,12 @@ pub fn add_torchrun_args(cmd: &[String], env: &HashMap<String, String>) -> Vec<S
             extra.push(format!("{}={value}", names[0]));
         }
     }
+    // One process per reserved GPU, unless the user says otherwise.
+    if let Some(n) = env.get("MESHVPN_GPUS")
+        && !has(&["--nproc_per_node", "--nproc-per-node"])
+    {
+        extra.push(format!("--nproc_per_node={n}"));
+    }
     let mut out = cmd[..at].to_vec();
     out.extend(extra);
     out.extend(cmd[at..].iter().cloned());
@@ -231,6 +245,48 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
         .and_then(|d| d.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(new_id);
+
+    // GPUs: reserved on every node before anything starts (all or nothing), renewed while the
+    // job runs, released at the end - and expiring on their own if the launcher dies.
+    let grants: Vec<crate::gpu::Grant> = match opts.gpus {
+        Some(n) => {
+            let holder = crate::gpu::default_holder(Some(&format!("job {id}")));
+            crate::gpu::reserve_all(dir, &group, &remote, n, LEASE_TTL_MS, &holder)?
+        }
+        None => vec![],
+    };
+    for g in &grants {
+        if let Some(e) = env.get_mut(&g.node) {
+            e.insert("CUDA_VISIBLE_DEVICES".into(), g.cuda_visible_devices.clone());
+            e.insert("MESHVPN_GPUS".into(), g.lease.gpus.len().to_string());
+            e.insert("MESHVPN_GPU_LEASE".into(), g.lease.id.clone());
+        }
+    }
+    let renewing = Arc::new(AtomicBool::new(true));
+    if !grants.is_empty() {
+        let (renewing, grants, group, remote, dir) = (
+            renewing.clone(),
+            grants.clone(),
+            group.clone(),
+            remote.clone(),
+            dir.to_path_buf(),
+        );
+        std::thread::spawn(move || {
+            while renewing.load(Ordering::SeqCst) {
+                for _ in 0..300 {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if !renewing.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                for g in &grants {
+                    if let Some(n) = group.iter().find(|n| n.name == g.node) {
+                        let _ = crate::gpu::renew_on(&dir, n, &remote, &g.lease.id, LEASE_TTL_MS);
+                    }
+                }
+            }
+        });
+    }
     let dir_path = job_dir.unwrap_or_else(|| jobs_dir().join(&id));
     std::fs::create_dir_all(&dir_path)?;
     let mut job = Job {
@@ -245,6 +301,7 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
         dir: dir_path.display().to_string(),
         env: env.clone(),
         results: vec![],
+        gpus: grants.clone(),
     };
     job.save()?;
 
@@ -371,6 +428,12 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    renewing.store(false, Ordering::SeqCst);
+    for g in &grants {
+        if let Some(n) = group.iter().find(|n| n.name == g.node) {
+            let _ = crate::gpu::release_on(dir, n, &remote, &g.lease.id);
+        }
+    }
     job.results = running
         .iter()
         .map(|r| NodeResult {

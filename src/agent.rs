@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::control::{self, Request, Response};
 use crate::node::Status;
-use crate::proto::{Inventory, ObjectAd, Perf};
+use crate::proto::{Inventory, Lease, ObjectAd, Perf};
 
 /// One node as agents see it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -37,13 +37,18 @@ pub struct NodeView {
     /// When it last finished a requested measurement (ms since epoch).
     #[serde(skip)]
     pub measured: u64,
+    /// GPU reservations on this node.
+    pub leases: Vec<Lease>,
 }
 
 impl NodeView {
+    /// GPUs that are idle and not reserved.
     pub fn free_gpus(&self) -> usize {
+        let reserved: Vec<u32> = self.leases.iter().flat_map(|l| l.gpus.iter().copied()).collect();
         self.inventory.as_ref().map_or(0, |i| {
             i.gpus
                 .iter()
+                .filter(|g| !reserved.contains(&g.index))
                 .filter(|g| g.util_pct < 10 && g.mem_used_mb * 10 < g.mem_total_mb.max(1))
                 .count()
         })
@@ -74,6 +79,7 @@ pub fn nodes(st: &Status) -> Vec<NodeView> {
         lan: st.lan.clone(),
         perf: st.perf.clone(),
         measured: st.measured,
+        leases: st.leases.clone(),
     }];
     out.extend(st.peers.iter().map(|p| NodeView {
         name: p.name.clone(),
@@ -89,6 +95,7 @@ pub fn nodes(st: &Status) -> Vec<NodeView> {
         lan: p.lan.clone(),
         perf: p.perf.clone(),
         measured: p.measured,
+        leases: p.leases.clone(),
     }));
     out
 }
@@ -185,6 +192,7 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+#[derive(Clone)]
 pub struct Remote {
     pub user: String,
     /// Userspace mode: ssh has to go through meshvpn.

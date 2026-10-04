@@ -22,6 +22,7 @@ use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
 
 mod admin;
+mod gpu;
 mod udp;
 
 /// Where IP packets for this node go: the kernel, or the TCP/IP stack in this process.
@@ -175,6 +176,7 @@ struct State {
     claims: HashMap<NodeId, admin::Admitted>,
     trusted_admins: Vec<NodeId>,
     my_claim: Option<ClaimMsg>,
+    leases: Vec<Lease>,
 }
 
 pub struct Node {
@@ -238,6 +240,8 @@ pub struct Status {
     /// Objects this node shares.
     #[serde(default)]
     pub objects: Vec<ObjectAd>,
+    #[serde(default)]
+    pub leases: Vec<Lease>,
     /// Userspace mode: the SOCKS proxy programs use to reach the mesh.
     #[serde(default)]
     pub socks: Option<String>,
@@ -284,6 +288,8 @@ pub struct PeerStatus {
     pub perf: Vec<Perf>,
     #[serde(default)]
     pub measured: u64,
+    #[serde(default)]
+    pub leases: Vec<Lease>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -349,6 +355,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
         st.trusted_admins = node.cfg.trusted_admins.clone();
+        st.leases = saved.leases.clone();
         st.my_claim = node.own_claim();
         if let Some(r) = saved.roster.clone() {
             node.apply_roster(&mut st, r);
@@ -525,6 +532,7 @@ impl Node {
             },
             objects: st.objects_ad.clone(),
             udp: st.my_udp.clone(),
+            leases: st.leases.clone(),
             measured: st.measured,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
@@ -1844,6 +1852,7 @@ impl Node {
                     info!("forgot {} long-gone node(s)", before - st.records.len());
                 }
                 st.forgotten.retain(|_, f| f.at > cutoff);
+                self.expire_leases(&mut st);
                 self.auto_forget(&mut st);
                 self.rebuild(&mut st);
                 self.dial_candidates(&mut st)
@@ -1869,6 +1878,7 @@ impl Node {
             rotation: st.rotation.as_ref().map(|(r, _)| r.clone()),
             roster: st.roster.as_ref().map(|(r, _)| r.clone()),
             claims: st.claims.values().map(|a| a.msg.clone()).collect(),
+            leases: st.leases.clone(),
         };
         drop(st);
         if let Err(e) = saved.save(&self.dir) {
@@ -1945,6 +1955,7 @@ impl Node {
                     lan: r.info.lan.clone(),
                     perf: r.info.perf.clone(),
                     measured: r.info.measured,
+                    leases: r.info.leases.iter().filter(|l| l.expires > now_ms()).cloned().collect(),
                 }
             })
             .collect();
@@ -1979,6 +1990,7 @@ impl Node {
             perf: st.perf.values().cloned().collect(),
             measured: st.measured,
             objects: st.objects_ad.clone(),
+            leases: st.leases.clone(),
             peers,
         }
     }
