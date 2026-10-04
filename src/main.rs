@@ -186,6 +186,7 @@ fn main() {
 
 fn real_main(cli: Cli) -> Result<()> {
     let dir = cli.dir;
+    load_proxy_env(&dir);
     match cli.cmd {
         Cmd::Init { network, node } => {
             let key = keys::random32();
@@ -325,6 +326,29 @@ fn real_main(cli: Cli) -> Result<()> {
         Cmd::Uninstall => uninstall()?,
     }
     Ok(())
+}
+
+/// systemd and sudo start meshvpn without the user's proxy variables, so install.sh saves the
+/// system's proxy in `<dir>/proxy.env`. Variables that are already set win.
+fn load_proxy_env(dir: &Path) {
+    const VARS: &[&str] = &["https_proxy", "http_proxy", "all_proxy", "no_proxy"];
+    let Ok(text) = std::fs::read_to_string(dir.join("proxy.env")) else {
+        return;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim().trim_matches('"'));
+        if !VARS.contains(&key) || value.is_empty() {
+            continue;
+        }
+        let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+        if !set(key) && !set(&key.to_uppercase()) {
+            // Still single-threaded here: no other thread reads the environment yet.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
 }
 
 fn init_logging() {

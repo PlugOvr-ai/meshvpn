@@ -35,6 +35,58 @@ else
     SUDO=""
 fi
 
+# --- Proxy -----------------------------------------------------------------------------------
+# `curl ... | sudo sh` loses the caller's environment (sudo resets it), so also look where proxies
+# are configured system-wide. The proxy found is used for the downloads below and saved for
+# meshvpn itself (auto-updates), which systemd starts without these variables.
+PROXY="" PROXY_FROM="" NOPROXY=""
+proxy_in_file() { # $1 = variable name pattern, $2... = files
+    pattern="$1"; shift
+    sed -n "s/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}\($pattern\)=[\"']\{0,1\}\([^\"'[:space:]]*\).*/\3/p" "$@" 2>/dev/null | head -n 1
+}
+for v in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy ALL_PROXY; do
+    eval "val=\${$v:-}"
+    if [ -n "$val" ]; then PROXY="$val"; PROXY_FROM="environment"; break; fi
+done
+if [ -z "$PROXY" ]; then
+    for f in /etc/environment /etc/profile.d/*.sh; do
+        [ -r "$f" ] || continue
+        val="$(proxy_in_file 'https_proxy\|HTTPS_PROXY\|http_proxy\|HTTP_PROXY' "$f")"
+        if [ -n "$val" ]; then PROXY="$val"; PROXY_FROM="$f"; break; fi
+    done
+fi
+if [ -z "$PROXY" ] && command -v apt-config >/dev/null 2>&1; then
+    val="$(apt-config dump 2>/dev/null | sed -n 's/^Acquire::https\{0,1\}::Proxy "\(.*\)";$/\1/p' | grep -vi '^\(direct\|false\|\)$' | head -n 1)"
+    [ -z "$val" ] || { PROXY="$val"; PROXY_FROM="apt configuration"; }
+fi
+if [ -z "$PROXY" ]; then
+    for f in /etc/dnf/dnf.conf /etc/yum.conf; do
+        val="$(sed -n 's/^proxy[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null | head -n 1)"
+        if [ -n "$val" ] && [ "$val" != "_none_" ]; then PROXY="$val"; PROXY_FROM="$f"; break; fi
+    done
+fi
+if [ -z "$PROXY" ] && [ -n "${SUDO_USER:-}" ] && command -v gsettings >/dev/null 2>&1; then
+    # Desktop proxy setting of the user who ran sudo (GNOME and friends).
+    if [ "$(sudo -u "$SUDO_USER" gsettings get org.gnome.system.proxy mode 2>/dev/null)" = "'manual'" ]; then
+        host="$(sudo -u "$SUDO_USER" gsettings get org.gnome.system.proxy.https host 2>/dev/null | tr -d "'")"
+        port="$(sudo -u "$SUDO_USER" gsettings get org.gnome.system.proxy.https port 2>/dev/null)"
+        if [ -z "$host" ]; then
+            host="$(sudo -u "$SUDO_USER" gsettings get org.gnome.system.proxy.http host 2>/dev/null | tr -d "'")"
+            port="$(sudo -u "$SUDO_USER" gsettings get org.gnome.system.proxy.http port 2>/dev/null)"
+        fi
+        [ -z "$host" ] || [ "${port:-0}" = 0 ] || { PROXY="http://$host:$port"; PROXY_FROM="desktop settings of $SUDO_USER"; }
+    fi
+fi
+if [ -n "$PROXY" ]; then
+    case "$PROXY" in *://*) ;; *) PROXY="http://$PROXY" ;; esac
+    NOPROXY="${no_proxy:-${NO_PROXY:-}}"
+    [ -n "$NOPROXY" ] || NOPROXY="$(proxy_in_file 'no_proxy\|NO_PROXY' /etc/environment /etc/profile.d/*.sh)"
+    NOPROXY="${NOPROXY:+$NOPROXY,}localhost,127.0.0.1,::1"
+    export http_proxy="$PROXY" https_proxy="$PROXY" HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY"
+    export no_proxy="$NOPROXY" NO_PROXY="$NOPROXY"
+    say "Using proxy $(printf '%s' "$PROXY" | sed 's#//[^@/]*@#//***@#') (from $PROXY_FROM)"
+fi
+
 if [ "$VERSION" = "latest" ]; then
     BASE="https://github.com/$REPO/releases/latest/download"
 else
@@ -68,6 +120,11 @@ fi
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 $SUDO mkdir -p "$BIN_DIR"
 $SUDO install -m 0755 "$TMP/meshvpn" "$BIN_DIR/meshvpn"
+if [ -n "$PROXY" ]; then
+    # meshvpn reads this when the variables are missing (systemd service, sudo).
+    printf 'https_proxy=%s\nhttp_proxy=%s\nno_proxy=%s\n' "$PROXY" "$PROXY" "$NOPROXY" \
+        | $SUDO sh -c 'mkdir -p /etc/meshvpn && chmod 700 /etc/meshvpn && umask 077 && cat > /etc/meshvpn/proxy.env'
+fi
 say "Installed $("$BIN_DIR/meshvpn" --version) to $BIN_DIR/meshvpn"
 
 [ -c /dev/net/tun ] || say "warning: /dev/net/tun is missing - load it with 'modprobe tun' (containers need it passed in)."

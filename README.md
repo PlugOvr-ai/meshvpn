@@ -29,6 +29,12 @@ To install and join a network in one step (this also starts the service):
 curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
 ```
 
+**Behind a proxy**, the installer uses it automatically. `sudo` drops your environment, so besides `https_proxy` /
+`http_proxy` it also checks `/etc/environment`, `/etc/profile.d`, apt's and dnf/yum's proxy settings and the GNOME proxy
+setting of the user who ran `sudo`. The proxy is saved in `/etc/meshvpn/proxy.env` (root-only), so the service's
+automatic updates use it too. Proxy auto-configuration (PAC) isn't supported; set `https_proxy` in that case. Mesh
+connections themselves don't go through the proxy.
+
 The [releases page](https://github.com/PlugOvr-ai/meshvpn/releases/latest) also has `.deb` packages
 (`sudo apt install ./meshvpn_*.deb`), `.rpm` packages and plain tarballs. To build from source, run
 `cargo install --git https://github.com/PlugOvr-ai/meshvpn`.
