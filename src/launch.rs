@@ -249,9 +249,18 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
     job.save()?;
 
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
-        libc::signal(libc::SIGHUP, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
     }
 
     // Start everything at once.
