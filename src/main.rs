@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod control;
+mod doctor;
 mod gpu;
 mod hosts;
 mod inventory;
@@ -83,6 +84,8 @@ enum Cmd {
     },
     /// Run the VPN in the foreground (needs root).
     Up,
+    /// Check this machine's setup and say how to fix problems.
+    Doctor,
     /// Show this node and its peers.
     Status,
     /// List nodes with tags, hardware and GPUs. Selectors: all, tag:<tag>, names, mesh IPs.
@@ -822,6 +825,19 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Mcp => mcp::serve(dir.clone())?,
+        Cmd::Doctor => {
+            let checks = doctor::diagnose(&dir);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&checks)?);
+            } else {
+                doctor::print(&checks);
+            }
+            return Ok(if checks.iter().any(|c| c.level == doctor::Level::Fail) {
+                1
+            } else {
+                0
+            });
+        }
         Cmd::Launch {
             selectors,
             command,

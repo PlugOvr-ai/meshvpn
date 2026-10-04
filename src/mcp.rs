@@ -165,6 +165,11 @@ fn tools() -> Value {
             }}
         },
         {
+            "name": "doctor",
+            "description": "Check this machine's meshvpn setup (daemon, interface, address conflicts e.g. with Tailscale, firewall, peers, direct UDP paths, SSH logins, admins, updates). Every problem comes with a fix.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
             "name": "node_status",
             "description": "Status of this node: name, mesh IP, mode (kernel/userspace), endpoints, warnings, update availability.",
             "inputSchema": {"type": "object", "properties": {}}
@@ -426,6 +431,7 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
                 remove: strings(args, "remove"),
             },
         ),
+        "doctor" => Ok(serde_json::to_value(crate::doctor::diagnose(dir))?),
         "node_status" => {
             let mut st = serde_json::to_value(agent::status(dir)?)?;
             if let Some(o) = st.as_object_mut() {

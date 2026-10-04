@@ -188,7 +188,8 @@ running, 4 needs root, 5 not found. Nodes are selected with **selectors**: `all`
 
 **MCP server:** connect an agent directly with `claude mcp add meshvpn -- meshvpn mcp` (any MCP client works). Tools:
 `list_nodes`, `exec`, `copy_to_nodes`, `copy_from_nodes`, `network_matrix`, `training_env`, `launch`, `job_status`,
-`job_stop`, `list_jobs`, `share`, `fetch`, `list_objects`, `set_tags`, `node_status`.
+`job_stop`, `list_jobs`, `gpu_list`, `gpu_reserve`, `gpu_release`, `share`, `fetch`, `list_objects`, `set_tags`,
+`node_status`, `doctor`.
 
 | Command | What it does |
 |---|---|
@@ -201,6 +202,9 @@ running, 4 needs root, 5 not found. Nodes are selected with **selectors**: `all`
 | `eval $(meshvpn net env --master gpu1 tag:gpu)` | On each node of a training job: `MASTER_ADDR`, `NODE_RANK`, `NNODES`, `NCCL_SOCKET_IFNAME`... for torchrun. Uses the LAN only if every pair of nodes shares one (mixed paths make NCCL hang), otherwise the mesh |
 | `meshvpn launch tag:gpu -- torchrun --nproc_per_node=8 train.py` | Start a distributed job on all selected nodes. Every node gets its environment (`MASTER_ADDR`, `NODE_RANK`, `NCCL_SOCKET_IFNAME`...), torchrun gets `--nnodes/--node_rank/--master_addr/--master_port` added, output is streamed and logged per node, and if one node fails the others are stopped. Ctrl+C, a lost connection or a killed launcher stop the job's whole process tree on every node |
 | `meshvpn launch ... --detach`, `meshvpn jobs [show/logs/stop]` | The same in the background, for agents: returns a job id |
+| `meshvpn gpu list` | Every GPU in the network: free, busy, or reserved (by whom, how long) |
+| `meshvpn gpu reserve tag:gpu -n 2 [--for 2h] [--one]` | Reserve GPUs, so no other agent or job takes them: per node (all or nothing), or on the single best node. The node with the GPUs grants it, so reservations never collide. Prints `CUDA_VISIBLE_DEVICES`. Expires unless renewed (`gpu renew`), release with `gpu release`. Advisory, like Slurm without cgroups |
+| `meshvpn launch --gpus 4 tag:gpu -- torchrun ...` | Reserve 4 GPUs per node for the job, set `CUDA_VISIBLE_DEVICES` and `--nproc_per_node`, release them at the end (they expire 15 min after a crashed launcher) |
 | `sudo meshvpn share ./dataset` | Share a dataset or checkpoint (file or directory); prints its id |
 | `sudo meshvpn fetch <id> /data` | Download it **from all nodes that have it at once**, over LAN paths where possible. Every 4 MB chunk is verified, interrupted downloads resume, and the node serves the data afterwards, so each node speeds up the next ones |
 | `meshvpn objects` | Shared objects and which nodes have them |
@@ -216,6 +220,7 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | Command | What it does |
 |---|---|
 | `meshvpn status` | This node and its peers (no sudo needed) |
+| `sudo meshvpn doctor` | Checks the setup (daemon, Tailscale conflicts, firewalls, peers, UDP paths, SSH logins, admins, updates) and says how to fix each problem |
 | `sudo meshvpn invite [--uses N] [--expires 24h]` | Print an invite code for a new machine (single-use and valid for 24 h by default) |
 | `meshvpn admin status` / `sudo meshvpn admin add\|rm <node>` | Who the admins are; change them |
 | `sudo meshvpn update` | Install the latest release now. Nodes also update themselves automatically: they check every ~6 hours; disable with `auto_update = false` |
