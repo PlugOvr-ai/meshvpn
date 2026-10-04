@@ -68,8 +68,8 @@ labbox   100.92.238.33    online        -  relay via server
 $ ssh labbox.mesh
 ```
 
-Any member can print a new invite with `sudo meshvpn invite`. Use `sudo meshvpn up` instead of `install` to run in the
-foreground.
+Admins print more invites with `sudo meshvpn invite` (see *Admins and invites* below). Use `sudo meshvpn up` instead of
+`install` to run in the foreground.
 
 ## Nodes behind a firewall (reverse SSH tunnel)
 
@@ -216,13 +216,31 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | Command | What it does |
 |---|---|
 | `meshvpn status` | This node and its peers (no sudo needed) |
-| `sudo meshvpn invite` | Print an invite code for a new machine |
+| `sudo meshvpn invite [--uses N] [--expires 24h]` | Print an invite code for a new machine (single-use and valid for 24 h by default) |
+| `meshvpn admin status` / `sudo meshvpn admin add\|rm <node>` | Who the admins are; change them |
 | `sudo meshvpn update` | Install the latest release now. Nodes also update themselves automatically: they check every ~6 hours; disable with `auto_update = false` |
 | `sudo meshvpn forget <name>` | Remove an offline node (e.g. an old identity of a re-installed machine) from all nodes. `--offline` forgets all offline nodes. If an offline node's name is taken by a newer online node, it's forgotten automatically after 10 minutes |
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
 | `sudo meshvpn rename <name>` | Give this node a new name. It becomes `<name>.mesh` on every node within seconds; its IP, SSH permissions and links stay. Names already taken are refused |
 | `sudo meshvpn add-peer host:port` | Connect to a node at an address, e.g. an inbound-only node |
+
+### Admins and invites
+
+New networks are **managed**: the node that ran `init` is the admin. Only admins can invite new nodes, ban nodes and
+change the admins (`sudo meshvpn admin add <node>`, `admin rm <node>`). Every other member can still forget offline
+nodes, tag and rename itself, share data and choose who may log in to it.
+
+An invite holds a **ticket** signed by an admin. By default it admits one node within 24 hours (`--uses 5`,
+`--expires 7d` to change that). The new node binds the ticket to its identity when it first connects. A second node
+with the same invite is rejected, and so is a node that only has the network key (for example from an old invite).
+The first member to see a new node countersigns its admission, so members that were offline at the time accept it later
+too. Rejected attempts show up as warnings in the admins' logs.
+
+Networks created before v0.7 (or with `init --open`) are **open**: everybody with the network key may invite and ban.
+Make one managed with `sudo meshvpn admin enable` on your main node. That node becomes the admin, every node known at
+that moment stays a member, and old invites stop working. Do it soon after updating: until then any member could run it
+first.
 
 ### Banning a node
 
@@ -252,8 +270,10 @@ Set `RUST_LOG=meshvpn=debug` for verbose logs.
 
 ## Security model and limitations
 
-* Everyone with the network key is a trusted member, and all members are equal: any member can ban any other. Treat
-  invite codes like passwords. Banning is covered above; if two members ban nodes at the same moment, run the ban again.
+* In managed networks (the default since v0.7) only admins invite, ban and change the admins. In open networks every
+  member can do all of that. Members are trusted either way: they can reach each other's services and share data.
+  Treat invite codes like passwords until they are used or expire. If two admins ban nodes at the same moment, run the
+  ban again.
 * Updates are downloaded from this repository's GitHub releases and checked against the published SHA-256 checksums.
   That protects against corrupted downloads, but not against a compromised GitHub account. Set `auto_update = false`
   if you want to update manually.

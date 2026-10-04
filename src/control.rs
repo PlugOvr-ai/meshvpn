@@ -47,6 +47,17 @@ pub enum Request {
     Rename {
         name: String,
     },
+    AdminStatus,
+    AdminEnable,
+    AdminChange {
+        who: String,
+        add: bool,
+    },
+    /// A signed invite ticket (managed networks; admins only).
+    IssueTicket {
+        uses: u32,
+        valid_ms: u64,
+    },
     Tags {
         add: Vec<String>,
         remove: Vec<String>,
@@ -122,6 +133,9 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                     text: node.authorized_keys(&user),
                 },
                 Ok(Request::SshList) => Response::Message { text: node.ssh_list() },
+                Ok(Request::AdminStatus) => Response::Message {
+                    text: node.admin_status().to_string(),
+                },
                 Ok(Request::SshOverview) => Response::SshOverview(Box::new(node.ssh_overview())),
                 // Allowed for everyone: it only measures (agents usually run unprivileged).
                 Ok(Request::Measure { nodes, bytes }) => {
@@ -223,6 +237,26 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                         }
                     }
                 }
+                Ok(Request::AdminEnable) => match node.admin_enable() {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::AdminChange { who, add }) => match node.admin_change(&who, add) {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::IssueTicket { uses, valid_ms }) => match node.issue_ticket(uses, valid_ms) {
+                    Ok((ticket, admins)) => Response::Message {
+                        text: serde_json::json!({ "ticket": ticket, "admins": admins }).to_string(),
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
                 Ok(Request::Rename { name }) => match node.rename(&name) {
                     Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {

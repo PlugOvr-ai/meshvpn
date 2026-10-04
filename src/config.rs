@@ -176,6 +176,14 @@ pub struct Config {
     pub old_keys: Vec<OldKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banned: Vec<BannedNode>,
+    /// Managed networks: admins to trust (from the invite), the invite's ticket, and this
+    /// node's admission made from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_admins: Vec<crate::keys::NodeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<crate::proto::SignedDoc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<crate::proto::ClaimMsg>,
     /// Who may log in here over SSH without a password (see `meshvpn ssh`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_allow: Vec<SshAllow>,
@@ -207,6 +215,9 @@ impl Config {
             tags: vec![],
             socks_listen: default_socks_listen(),
             ssh_allow: vec![],
+            trusted_admins: vec![],
+            ticket: None,
+            claim: None,
             ssh_allow_all: vec![],
             socks_proxy: None,
             no_outbound: false,
@@ -341,6 +352,11 @@ pub struct SavedState {
     /// The latest ban / key rotation, relayed to members that were offline.
     #[serde(default)]
     pub rotation: Option<crate::proto::SignedRotation>,
+    /// Managed networks: the admin roster and the admissions of invited nodes.
+    #[serde(default)]
+    pub roster: Option<crate::proto::SignedDoc>,
+    #[serde(default)]
+    pub claims: Vec<crate::proto::ClaimMsg>,
 }
 
 impl SavedState {
@@ -368,6 +384,11 @@ pub struct Invite {
     pub id: String,
     #[serde(default)]
     pub v: u32,
+    /// Managed networks: the admission ticket, and the admins to trust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<crate::proto::SignedDoc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admins: Vec<crate::keys::NodeId>,
 }
 
 impl Invite {
@@ -418,6 +439,8 @@ mod tests {
             bootstrap: vec!["a.example:7870".into()],
             id: "abc".into(),
             v: 3,
+            ticket: None,
+            admins: vec![],
         };
         let back = Invite::decode(&format!("  {}\n", inv.encode())).unwrap();
         assert_eq!(back.key, inv.key);

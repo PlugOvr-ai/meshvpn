@@ -48,6 +48,9 @@ enum Cmd {
         /// Name of the network.
         #[arg(long, default_value = "mesh")]
         network: String,
+        /// Open network: everybody with an invite may invite others and ban (no admins).
+        #[arg(long)]
+        open: bool,
         #[command(flatten)]
         node: NodeOpts,
     },
@@ -59,7 +62,19 @@ enum Cmd {
         node: NodeOpts,
     },
     /// Print an invite code that lets another machine join.
-    Invite,
+    Invite {
+        /// How many nodes may join with it (managed networks).
+        #[arg(long, default_value_t = 1)]
+        uses: u32,
+        /// How long it is valid, e.g. 30m, 24h, 7d (managed networks).
+        #[arg(long, default_value = "24h")]
+        expires: String,
+    },
+    /// Admins of a managed network: only they invite, ban and change the admins.
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
     /// Run the VPN in the foreground (needs root).
     Up,
     /// Show this node and its peers.
@@ -253,6 +268,19 @@ enum NetCmd {
 }
 
 #[derive(Subcommand)]
+enum AdminCmd {
+    /// Managed or open, who the admins are, who joined with which invite.
+    Status,
+    /// Make an existing open network managed, with this node as its admin. Every node known
+    /// now stays a member; new nodes then need an invite from an admin.
+    Enable,
+    /// Make a node an admin.
+    Add { node: String },
+    /// Take admin rights away.
+    Rm { node: String },
+}
+
+#[derive(Subcommand)]
 enum JobsCmd {
     /// All jobs, newest first.
     List,
@@ -414,12 +442,27 @@ fn real_main(cli: Cli) -> Result<i32> {
     let json = cli.json;
     load_proxy_env(&dir);
     match cli.cmd {
-        Cmd::Init { network, node } => {
+        Cmd::Init { network, open, node } => {
             let key = keys::random32();
             let cfg = create(&dir, node, config::sanitize_name(&network), key, vec![])?;
+            if !open {
+                // Managed from the start: this node is the first admin.
+                let ident = Identity::from_config(&cfg)?;
+                let roster = proto::Roster {
+                    net: cfg.network_id(),
+                    version: 1,
+                    admins: vec![ident.id],
+                    members: vec![ident.id],
+                    issuer: ident.id,
+                    at: now_ms(),
+                };
+                let mut saved = SavedState::load(&dir);
+                saved.roster = Some(proto::SignedDoc::sign(&roster, &ident));
+                saved.save(&dir)?;
+            }
             println!("Created network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
-            print_invite(&dir, &cfg);
+            print_invite(&dir, &cfg, 1, 24 * 3600 * 1000, false)?;
             enable_ssh_logins(&cfg);
             print_next_steps(&dir, &cfg);
         }
@@ -429,6 +472,8 @@ fn real_main(cli: Cli) -> Result<i32> {
             let mut cfg = create(&dir, node, inv.network, key, inv.bootstrap)?;
             cfg.network_id = inv.id;
             cfg.key_version = inv.v;
+            cfg.trusted_admins = inv.admins;
+            cfg.ticket = inv.ticket;
             cfg.save(&dir)?;
             println!("Joined network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
@@ -436,9 +481,67 @@ fn real_main(cli: Cli) -> Result<i32> {
             enable_ssh_logins(&cfg);
             print_next_steps(&dir, &cfg);
         }
-        Cmd::Invite => {
+        Cmd::Invite { uses, expires } => {
             let cfg = Config::load(&dir)?;
-            print_invite(&dir, &cfg);
+            print_invite(&dir, &cfg, uses, parse_duration_ms(&expires)?, json)?;
+        }
+        Cmd::Admin { cmd } => {
+            let req = match cmd {
+                AdminCmd::Status => control::Request::AdminStatus,
+                AdminCmd::Enable => {
+                    require_root()?;
+                    control::Request::AdminEnable
+                }
+                AdminCmd::Add { node } => {
+                    require_root()?;
+                    control::Request::AdminChange { who: node, add: true }
+                }
+                AdminCmd::Rm { node } => {
+                    require_root()?;
+                    control::Request::AdminChange { who: node, add: false }
+                }
+            };
+            let status = matches!(req, control::Request::AdminStatus);
+            if let control::Response::Message { text } =
+                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
+            {
+                if !status {
+                    say(json, &text);
+                } else if json {
+                    println!("{text}");
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    if v["managed"] == true {
+                        println!("managed network (roster v{})", v["version"]);
+                        let admins: Vec<&str> = v["admins"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|a| a.as_str())
+                            .collect();
+                        println!("  admins:      {}", admins.join(", "));
+                        println!(
+                            "  this node:   {}",
+                            if v["this_node_is_admin"] == true {
+                                "admin"
+                            } else {
+                                "member"
+                            }
+                        );
+                        println!("  members from before it became managed: {}", v["members_from_before"]);
+                        for a in v["admitted_by_invite"].as_array().into_iter().flatten() {
+                            println!(
+                                "  joined by invite: {} (invited by {})",
+                                a["node"].as_str().unwrap_or("?"),
+                                a["invited_by"].as_str().unwrap_or("?")
+                            );
+                        }
+                    } else {
+                        println!("open network: everybody with the network key may invite and ban.");
+                        println!("make it managed (this node becomes admin): sudo meshvpn admin enable");
+                    }
+                }
+            }
         }
         Cmd::Up => {
             let cfg = Config::load(&dir)?;
@@ -1215,7 +1318,7 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
     }
 }
 
-fn make_invite(dir: &Path, cfg: &Config) -> Invite {
+fn make_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64) -> Result<Invite> {
     let mut boot: Vec<String> = cfg.static_endpoints();
     let saved = SavedState::load(dir);
     let net = cfg.network_id();
@@ -1241,19 +1344,106 @@ fn make_invite(dir: &Path, cfg: &Config) -> Invite {
     boot.retain(|e| seen.insert(e.clone()));
     boot.truncate(12);
 
-    Invite {
+    let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms)?;
+    Ok(Invite {
         network: cfg.network.clone(),
         key: cfg.network_key.clone(),
         bootstrap: boot,
         id: cfg.network_id(),
         v: cfg.key_version,
-    }
+        ticket,
+        admins,
+    })
 }
 
-fn print_invite(dir: &Path, cfg: &Config) {
-    let inv = make_invite(dir, cfg);
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// `30m`, `24h`, `7d` or seconds.
+fn parse_duration_ms(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("invalid duration {s:?} (e.g. 30m, 24h, 7d)"))?;
+    let secs = match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        _ => bail!("invalid duration {s:?} (e.g. 30m, 24h, 7d)"),
+    };
+    Ok(secs * 1000)
+}
+
+/// In a managed network: a ticket signed by this node, which must be an admin.
+fn invite_ticket(
+    dir: &Path,
+    cfg: &Config,
+    uses: u32,
+    valid_ms: u64,
+) -> Result<(Option<proto::SignedDoc>, Vec<keys::NodeId>)> {
+    if control::is_running(dir) {
+        let req = control::Request::IssueTicket { uses, valid_ms };
+        let control::Response::Message { text } =
+            tokio::runtime::Runtime::new()?.block_on(control::request(dir, &req))?
+        else {
+            bail!("unexpected answer from meshvpn");
+        };
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        return Ok((
+            serde_json::from_value(v["ticket"].clone())?,
+            serde_json::from_value(v["admins"].clone())?,
+        ));
+    }
+    // Not running: sign it ourselves, if the saved roster says we are an admin.
+    let Some(signed) = SavedState::load(dir).roster else {
+        return Ok((None, vec![]));
+    };
+    let roster: proto::Roster = signed.open(|r: &proto::Roster| r.issuer)?;
+    let ident = Identity::from_config(cfg)?;
+    if !roster.admins.contains(&ident.id) {
+        bail!("only admins can invite in this managed network (see meshvpn admin status)");
+    }
+    let mut id = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    let ticket = proto::Ticket {
+        net: cfg.network_id(),
+        id: id.iter().map(|b| format!("{b:02x}")).collect(),
+        expires: now_ms() + valid_ms,
+        uses: uses.max(1),
+        issuer: ident.id,
+    };
+    Ok((Some(proto::SignedDoc::sign(&ticket, &ident)), roster.admins))
+}
+
+fn print_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64, json: bool) -> Result<()> {
+    let inv = make_invite(dir, cfg, uses, valid_ms)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "invite": inv.encode(),
+                "managed": inv.ticket.is_some(),
+                "uses": inv.ticket.as_ref().map(|_| uses),
+                "expires_ms": inv.ticket.as_ref().map(|_| now_ms() + valid_ms),
+            })
+        );
+        return Ok(());
+    }
     let boot = &inv.bootstrap;
-    println!("Invite code (treat it like a password - it grants access to the network):\n");
+    match &inv.ticket {
+        Some(_) => println!(
+            "Invite code - good for {} new node(s), valid for {} (treat it like a password):\n",
+            uses.max(1),
+            human_duration(valid_ms)
+        ),
+        None => println!("Invite code (treat it like a password - it grants access to the network):\n"),
+    }
     println!("  {}\n", inv.encode());
     println!("On the new machine run:\n");
     println!("  sudo meshvpn join {}\n", inv.encode());
@@ -1263,6 +1453,17 @@ fn print_invite(dir: &Path, cfg: &Config) {
         println!("or add one to `endpoints` in {}.", Config::path(dir).display());
     } else {
         println!("The new node will first contact: {}", boot.join(", "));
+    }
+    Ok(())
+}
+
+fn human_duration(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..120 => format!("{s} seconds"),
+        120..7200 => format!("{} minutes", s / 60),
+        7200..172800 => format!("{} hours", s / 3600),
+        _ => format!("{} days", s / 86400),
     }
 }
 

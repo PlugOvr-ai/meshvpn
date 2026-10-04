@@ -19,6 +19,72 @@ pub const T_BENCH_END: u8 = 10;
 pub const T_BENCH_RESULT: u8 = 11;
 /// "Please measure now" for a set of nodes (flooded).
 pub const T_MEASURE: u8 = 12;
+/// The admin roster (managed networks), and admissions of new nodes (flooded).
+pub const T_ROSTER: u8 = 13;
+pub const T_CLAIM: u8 = 14;
+
+/// A JSON document signed by a node.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SignedDoc {
+    pub data: String,
+    pub sig: String,
+}
+
+impl SignedDoc {
+    pub fn sign<T: Serialize>(value: &T, ident: &Identity) -> Self {
+        let data = serde_json::to_string(value).unwrap();
+        let sig = b64(&ident.sign(data.as_bytes()));
+        SignedDoc { data, sig }
+    }
+
+    /// Parses and checks the signature of the node `signer` names in the document.
+    pub fn open<T: serde::de::DeserializeOwned>(&self, signer: impl Fn(&T) -> NodeId) -> Result<T> {
+        let v: T = serde_json::from_str(&self.data)?;
+        verify(&signer(&v), self.data.as_bytes(), &unb64(&self.sig)?)?;
+        Ok(v)
+    }
+}
+
+/// Who runs a managed network: only admins invite, ban and change the roster. Every version is
+/// signed by an admin of the previous one. `members` are the nodes admitted without a ticket
+/// (those that were there when the network became managed).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Roster {
+    pub net: String,
+    pub version: u32,
+    pub admins: Vec<NodeId>,
+    pub members: Vec<NodeId>,
+    pub issuer: NodeId,
+    pub at: u64,
+}
+
+/// An invitation ticket, signed by an admin: good for `uses` new nodes until `expires`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Ticket {
+    pub net: String,
+    pub id: String,
+    pub expires: u64,
+    pub uses: u32,
+    pub issuer: NodeId,
+}
+
+/// A new node binding a ticket to itself (signed by that node).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Claim {
+    pub net: String,
+    pub ticket: SignedDoc,
+    pub node: NodeId,
+    pub at: u64,
+}
+
+/// A claim as it travels, with the countersignature of the member that first saw it while
+/// the ticket was still valid - so nodes that were offline then can still accept it later.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClaimMsg {
+    pub claim: SignedDoc,
+    #[serde(default)]
+    pub witness: Option<(NodeId, String)>,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct BenchMsg {
@@ -350,6 +416,9 @@ pub struct Hello {
     /// Random per-connection value; used to pick the same link on both sides when two race.
     #[serde(default)]
     pub nonce: u64,
+    /// A new node's admission (managed networks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimMsg>,
 }
 
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {

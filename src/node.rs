@@ -21,6 +21,7 @@ use crate::keys::{Identity, NodeId, OVERLAY_NETMASK, overlay_ip};
 use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
 
+mod admin;
 mod udp;
 
 /// Where IP packets for this node go: the kernel, or the TCP/IP stack in this process.
@@ -169,6 +170,11 @@ struct State {
     /// First 8 bytes of node ids, for the compact UDP data format.
     id_prefix: HashMap<[u8; 8], NodeId>,
     my_udp: Vec<String>,
+    /// Managed networks (see node/admin.rs).
+    roster: Option<(SignedDoc, Roster)>,
+    claims: HashMap<NodeId, admin::Admitted>,
+    trusted_admins: Vec<NodeId>,
+    my_claim: Option<ClaimMsg>,
 }
 
 pub struct Node {
@@ -342,6 +348,16 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.objects_ad = node.shares.ads();
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
+        st.trusted_admins = node.cfg.trusted_admins.clone();
+        st.my_claim = node.own_claim();
+        if let Some(r) = saved.roster.clone() {
+            node.apply_roster(&mut st, r);
+        }
+        for c in saved.claims.clone() {
+            if let Err(e) = node.accept_claim(&mut st, c) {
+                debug!("dropping saved admission: {e:#}");
+            }
+        }
         if let Some(r) = saved.rotation
             && let Ok(body) = r.verify(&node.net)
             && body.version == st.key_version
@@ -564,6 +580,9 @@ impl Node {
         if st.banned.contains_key(&info.id) {
             return false;
         }
+        if !Self::admitted(st, &info.id) {
+            return false; // managed network, and this node has no admission (yet)
+        }
         if live && info.seq > now_ms() + 3_600_000 {
             debug!("dropping record from the future for {}", info.id);
             return false;
@@ -619,7 +638,9 @@ impl Node {
     fn full_table(&self, st: &State) -> Vec<Vec<u8>> {
         let mut all: Vec<SignedInfo> = st.records.values().map(|r| r.signed.clone()).collect();
         all.extend(st.my_signed.clone());
-        let mut frames = gossip_frames(&all);
+        // Roster and admissions first: the records of invited nodes depend on them.
+        let mut frames = self.admin_frames(st);
+        frames.extend(gossip_frames(&all));
         if let Some((r, _)) = &st.rotation {
             frames.insert(0, frame(T_ROTATE, &serde_json::to_vec(r).unwrap()));
         }
@@ -908,8 +929,8 @@ impl Node {
                 return false;
             }
         };
-        if st.banned.contains_key(&r.issuer) {
-            return false;
+        if st.banned.contains_key(&r.issuer) || !Self::is_admin(st, &r.issuer) {
+            return false; // in managed networks only admins ban
         }
         let current = st.rotation.as_ref().map(|(_, c)| (c.version, c.issuer));
         let newer =
@@ -1006,6 +1027,9 @@ impl Node {
     /// `meshvpn ban NAME|ID`: bans the node everywhere and gives everyone else a new key.
     pub fn ban(&self, who: &str) -> Result<String> {
         let mut st = self.state.lock().unwrap();
+        if !Self::is_admin(&st, &self.ident.id) {
+            bail!("only admins can ban in this managed network (see meshvpn admin status)");
+        }
         let w = who.trim().to_lowercase();
         if w == st.my_name || (w.len() >= 4 && self.ident.id.hex().starts_with(&w)) {
             bail!("{w} is this node");
@@ -1410,8 +1434,9 @@ impl Node {
                         match node.establish(stream, false, addr.to_string()).await {
                             Ok(est) => node.serve(est).await,
                             Err(e)
-                                if e.to_string().contains("banned")
-                                    || e.to_string().contains("outdated network key") =>
+                                if ["banned", "outdated network key", "not admitted"]
+                                    .iter()
+                                    .any(|k| e.to_string().contains(k)) =>
                             {
                                 warn!("rejected connection from {addr}: {e:#}")
                             }
@@ -1469,10 +1494,12 @@ impl Node {
 
         let my_signed = self.state.lock().unwrap().my_signed.clone().unwrap();
         let my_nonce = rand::rngs::OsRng.next_u64();
+        let my_claim = self.state.lock().unwrap().my_claim.clone();
         let hello = Hello {
             info: my_signed,
             observed,
             nonce: my_nonce,
+            claim: my_claim,
         };
         writer.send(&frame(T_HELLO, &serde_json::to_vec(&hello)?)).await?;
         let msg = timeout(HANDSHAKE_TIMEOUT, reader.recv())
@@ -1491,9 +1518,24 @@ impl Node {
             bail!("connected to myself");
         }
         {
-            let st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap();
             if st.banned.contains_key(&peer) {
                 bail!("{} ({peer}) is banned", info.name);
+            }
+            // Managed network: the network key is not enough, the node needs an admission.
+            if !Self::admitted(&st, &peer) {
+                let Some(c) = hello.claim.clone() else {
+                    bail!(
+                        "{} ({peer}) is not admitted to this managed network (it needs an invite from an \
+                         admin: meshvpn invite on an admin node)",
+                        info.name
+                    );
+                };
+                match self.accept_claim(&mut st, c) {
+                    Ok(Some(m)) => self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None),
+                    Ok(None) => {}
+                    Err(e) => bail!("{} ({peer}) is not admitted: {e:#}", info.name),
+                }
             }
             // An old network key is only good for members that got the new one sealed for
             // them; they receive it right after connecting.
@@ -1599,6 +1641,9 @@ impl Node {
                 T_GOSSIP => self.handle_gossip(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
                 T_MEASURE => self.handle_measure(peer, payload),
+                T_ROSTER | T_CLAIM => {
+                    self.dispatch_admin(kind, peer, payload);
+                }
                 T_BENCH_START => {
                     if let Ok(m) = serde_json::from_slice::<BenchMsg>(payload) {
                         self.state
@@ -1822,6 +1867,8 @@ impl Node {
             peers: st.records.values().map(|r| r.signed.clone()).collect(),
             forgotten: st.forgotten.values().copied().collect(),
             rotation: st.rotation.as_ref().map(|(r, _)| r.clone()),
+            roster: st.roster.as_ref().map(|(r, _)| r.clone()),
+            claims: st.claims.values().map(|a| a.msg.clone()).collect(),
         };
         drop(st);
         if let Err(e) = saved.save(&self.dir) {
