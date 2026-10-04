@@ -154,6 +154,11 @@ struct State {
     perf: HashMap<NodeId, Perf>,
     /// Shared objects we serve completely.
     objects_ad: Vec<ObjectAd>,
+    /// Throughput tests: being received (per peer), and waiting for their result.
+    bench_rx: HashMap<NodeId, (u64, Instant, u64)>,
+    bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
+    measure_seen: HashSet<u64>,
+    measured: u64,
 }
 
 pub struct Node {
@@ -204,6 +209,12 @@ pub struct Status {
     pub tags: Vec<String>,
     #[serde(default)]
     pub inventory: Option<Inventory>,
+    #[serde(default)]
+    pub lan: Vec<String>,
+    #[serde(default)]
+    pub perf: Vec<Perf>,
+    #[serde(default)]
+    pub measured: u64,
     /// Userspace mode: the SOCKS proxy programs use to reach the mesh.
     #[serde(default)]
     pub socks: Option<String>,
@@ -244,6 +255,12 @@ pub struct PeerStatus {
     pub inventory: Option<Inventory>,
     #[serde(default)]
     pub objects: Vec<ObjectAd>,
+    #[serde(default)]
+    pub lan: Vec<String>,
+    #[serde(default)]
+    pub perf: Vec<Perf>,
+    #[serde(default)]
+    pub measured: u64,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -455,6 +472,7 @@ impl Node {
                 p
             },
             objects: st.objects_ad.clone(),
+            measured: st.measured,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
             } else {
@@ -1351,7 +1369,18 @@ impl Node {
         let fut = async {
             match &self.socks {
                 Some(proxy) => link::socks5_connect(proxy, addr).await,
-                None => Ok(TcpStream::connect(addr).await?),
+                None => {
+                    // Never run a link through the mesh itself: a name like `hub` may resolve to
+                    // a mesh address via the /etc/hosts entries meshvpn maintains.
+                    let targets: Vec<SocketAddr> = tokio::net::lookup_host(addr)
+                        .await?
+                        .filter(|a| !is_overlay(a.ip()))
+                        .collect();
+                    if targets.is_empty() {
+                        bail!("{addr} only resolves to mesh addresses");
+                    }
+                    Ok(TcpStream::connect(&targets[..]).await?)
+                }
             }
         };
         timeout(CONNECT_TIMEOUT, fut).await.map_err(|_| anyhow!("timed out"))?
@@ -1507,6 +1536,41 @@ impl Node {
                 }
                 T_GOSSIP => self.handle_gossip(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
+                T_MEASURE => self.handle_measure(peer, payload),
+                T_BENCH_START => {
+                    if let Ok(m) = serde_json::from_slice::<BenchMsg>(payload) {
+                        self.state
+                            .lock()
+                            .unwrap()
+                            .bench_rx
+                            .insert(peer, (m.id, Instant::now(), 0));
+                    }
+                }
+                T_BENCH_DATA => {
+                    if let Some(b) = self.state.lock().unwrap().bench_rx.get_mut(&peer) {
+                        b.2 += payload.len() as u64;
+                    }
+                }
+                T_BENCH_END => {
+                    let mut st = self.state.lock().unwrap();
+                    if let Some((id, started, bytes)) = st.bench_rx.remove(&peer) {
+                        let secs = started.elapsed().as_secs_f64().max(1e-6);
+                        let mbps = (bytes as f64 * 8.0 / secs / 1e6) as f32;
+                        if let Some(l) = st.links.get(&peer) {
+                            let _ = l.tx.try_send(frame(
+                                T_BENCH_RESULT,
+                                &serde_json::to_vec(&BenchMsg { id, mbps }).unwrap(),
+                            ));
+                        }
+                    }
+                }
+                T_BENCH_RESULT => {
+                    if let Ok(m) = serde_json::from_slice::<BenchMsg>(payload)
+                        && let Some(w) = self.state.lock().unwrap().bench_wait.remove(&m.id)
+                    {
+                        let _ = w.send(m.mbps);
+                    }
+                }
                 T_ROTATE => self.handle_rotation(peer, payload),
                 T_PING => {
                     let st = self.state.lock().unwrap();
@@ -1760,6 +1824,9 @@ impl Node {
                     tags: r.info.tags.clone(),
                     inventory: r.info.inventory.clone(),
                     objects: r.info.objects.clone(),
+                    lan: r.info.lan.clone(),
+                    perf: r.info.perf.clone(),
+                    measured: r.info.measured,
                 }
             })
             .collect();
@@ -1787,6 +1854,12 @@ impl Node {
             socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
             tags: st.my_tags.clone(),
             inventory: st.inventory.clone(),
+            lan: crate::net::local_lans()
+                .into_iter()
+                .map(|(_, ip, p)| format!("{ip}/{p}"))
+                .collect(),
+            perf: st.perf.values().cloned().collect(),
+            measured: st.measured,
             peers,
         }
     }
@@ -1883,9 +1956,174 @@ impl Node {
         Ok(tags)
     }
 
+    // ----------------------------------------------------------------------------- measuring
+
+    /// Throughput to a directly linked peer: sends `bytes` of test data, the peer reports
+    /// how fast it arrived.
+    async fn bench(self: &Arc<Self>, peer: NodeId, bytes: u64) -> Option<f32> {
+        let (tx, id, done) = {
+            let mut st = self.state.lock().unwrap();
+            let tx = st.links.get(&peer)?.tx.clone();
+            let id = rand::rngs::OsRng.next_u64();
+            let (otx, orx) = tokio::sync::oneshot::channel();
+            st.bench_wait.insert(id, otx);
+            (tx, id, orx)
+        };
+        let msg = serde_json::to_vec(&BenchMsg { id, mbps: 0.0 }).unwrap();
+        let data = frame(T_BENCH_DATA, &vec![0u8; 60_000]);
+        let run = async {
+            tx.send(frame(T_BENCH_START, &msg)).await.ok()?;
+            let mut sent = 0u64;
+            while sent < bytes {
+                tx.send(data.clone()).await.ok()?;
+                sent += 60_000;
+            }
+            tx.send(frame(T_BENCH_END, &msg)).await.ok()?;
+            done.await.ok()
+        };
+        let res = timeout(Duration::from_secs(90), run).await.ok().flatten();
+        self.state.lock().unwrap().bench_wait.remove(&id);
+        res
+    }
+
+    /// Round trip to a directly linked peer, measured now.
+    async fn ping(&self, peer: NodeId) -> Option<Duration> {
+        let before = {
+            let mut st = self.state.lock().unwrap();
+            let link = st.links.get_mut(&peer)?;
+            let sent = link.rtt.take();
+            let f = frame(T_PING, &(self.started.elapsed().as_micros() as u64).to_be_bytes());
+            let _ = link.tx.try_send(f);
+            sent
+        };
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let st = self.state.lock().unwrap();
+            if let Some(rtt) = st.links.get(&peer).and_then(|l| l.rtt) {
+                return Some(rtt);
+            }
+        }
+        before
+    }
+
+    /// `peer`'s address on a LAN we share, if it answers there (a refused connection counts:
+    /// the machine is reachable).
+    async fn lan_check(info: &NodeInfo) -> Option<Ipv4Addr> {
+        let mine = crate::net::local_lans();
+        let mut ports: Vec<u16> = info
+            .endpoints
+            .iter()
+            .filter_map(|e| e.rsplit(':').next()?.parse().ok())
+            .collect();
+        ports.push(22);
+        ports.dedup();
+        for l in &info.lan {
+            let Some((ip, _)) = crate::net::parse_cidr(l) else {
+                continue;
+            };
+            if !mine
+                .iter()
+                .any(|(_, m, p)| *m != ip && crate::net::same_subnet(*m, *p, ip))
+            {
+                continue;
+            }
+            for port in &ports {
+                match timeout(Duration::from_secs(1), TcpStream::connect((ip, *port))).await {
+                    Ok(Ok(_)) => return Some(ip),
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Some(ip),
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Fills our row of the network matrix: RTT and LAN path for every online peer, and the
+    /// throughput of direct links when `bytes` > 0. Then tells everyone.
+    pub async fn measure(self: Arc<Self>, only: Option<Vec<NodeId>>, bytes: u64) {
+        let peers: Vec<NodeInfo> = {
+            let st = self.state.lock().unwrap();
+            st.records
+                .values()
+                .filter(|r| self.is_online(&st, &r.info.id))
+                .filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.info.id)))
+                .map(|r| r.info.clone())
+                .collect()
+        };
+        // Round trips first: during throughput tests pings queue behind the test data.
+        let mut rtts = HashMap::new();
+        for info in &peers {
+            rtts.insert(info.id, self.ping(info.id).await);
+        }
+        for info in peers {
+            let rtt = rtts.remove(&info.id).flatten();
+            let mbps = if bytes > 0 {
+                self.bench(info.id, bytes).await
+            } else {
+                None
+            };
+            let lan_ip = Self::lan_check(&info).await;
+            let mut st = self.state.lock().unwrap();
+            let rtt_us = rtt
+                .or_else(|| st.links.get(&info.id).and_then(|l| l.rtt))
+                .map(|d| d.as_micros() as u32);
+            let old_mbps = st.perf.get(&info.id).and_then(|p| p.mesh_mbps);
+            st.perf.insert(
+                info.id,
+                Perf {
+                    peer: info.id,
+                    rtt_us,
+                    mesh_mbps: mbps.or(old_mbps),
+                    lan_ip: lan_ip.map(|i| i.to_string()),
+                    at: now_ms(),
+                },
+            );
+        }
+        let mut st = self.state.lock().unwrap();
+        let alive: HashSet<NodeId> = st.records.keys().copied().collect();
+        st.perf.retain(|id, _| alive.contains(id));
+        if bytes > 0 {
+            st.measured = now_ms();
+        }
+        self.announce(&mut st);
+    }
+
+    fn handle_measure(self: &Arc<Self>, from: NodeId, payload: &[u8]) {
+        let Ok(req) = serde_json::from_slice::<MeasureReq>(payload) else {
+            return;
+        };
+        self.start_measure(req, Some(from));
+    }
+
+    /// Floods a measurement request; nodes in it measure towards the others in it.
+    pub fn start_measure(self: &Arc<Self>, req: MeasureReq, from: Option<NodeId>) {
+        let mut st = self.state.lock().unwrap();
+        if !st.measure_seen.insert(req.nonce) {
+            return;
+        }
+        if st.measure_seen.len() > 1000 {
+            st.measure_seen.clear();
+        }
+        self.broadcast(&st, &frame(T_MEASURE, &serde_json::to_vec(&req).unwrap()), from);
+        drop(st);
+        if req.nodes.contains(&self.ident.id) {
+            let others: Vec<NodeId> = req.nodes.iter().copied().filter(|n| *n != self.ident.id).collect();
+            tokio::spawn(self.clone().measure(Some(others), req.bytes.min(1 << 30)));
+        }
+    }
+
     /// Keeps the inventory (load, free memory, GPU use) fresh.
     async fn inventory_loop(self: Arc<Self>) {
         let userspace = matches!(self.io, PacketIo::Userspace(_));
+        // Light measurements (RTT, LAN paths) every 5 minutes; throughput only on request.
+        let node = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            loop {
+                node.clone().measure(None, 0).await;
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
         loop {
             tokio::time::sleep(REANNOUNCE).await;
             if let Ok(inv) = tokio::task::spawn_blocking(move || crate::inventory::collect(userspace)).await {

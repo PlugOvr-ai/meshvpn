@@ -51,6 +51,11 @@ pub enum Request {
         add: Vec<String>,
         remove: Vec<String>,
     },
+    /// Ask these nodes (hex ids) to measure towards each other now.
+    Measure {
+        nodes: Vec<String>,
+        bytes: u64,
+    },
     /// Forget an offline node by name or id; `None` = all offline nodes.
     Forget {
         who: Option<String>,
@@ -105,6 +110,20 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                 },
                 Ok(Request::SshList) => Response::Message { text: node.ssh_list() },
                 Ok(Request::SshOverview) => Response::SshOverview(Box::new(node.ssh_overview())),
+                // Allowed for everyone: it only measures (agents usually run unprivileged).
+                Ok(Request::Measure { nodes, bytes }) => {
+                    use rand::RngCore;
+                    let req = crate::proto::MeasureReq {
+                        nonce: rand::rngs::OsRng.next_u64(),
+                        nodes: nodes
+                            .iter()
+                            .filter_map(|n| crate::keys::Key32::from_hex(n).ok())
+                            .collect(),
+                        bytes,
+                    };
+                    node.start_measure(req, None);
+                    Response::Ok
+                }
                 Ok(_) if !privileged => Response::Error {
                     message: "permission denied - try again with sudo".into(),
                 },

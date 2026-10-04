@@ -72,6 +72,11 @@ enum Cmd {
         #[arg(long, value_name = "N")]
         free_gpus: Option<usize>,
     },
+    /// Network between nodes: latency/throughput matrix, LAN paths, training environment.
+    Net {
+        #[command(subcommand)]
+        cmd: NetCmd,
+    },
     /// Label this node (e.g. gpu, trainer) so it can be selected as tag:<name>.
     Tag {
         #[command(subcommand)]
@@ -155,6 +160,36 @@ enum Cmd {
     Install,
     /// Stop and remove the systemd service.
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum NetCmd {
+    /// Latency, mesh throughput and direct LAN paths between nodes.
+    Matrix {
+        /// Which nodes (default: all).
+        selectors: Vec<String>,
+        /// Measure now (sends test data between the nodes) instead of showing the last results.
+        #[arg(long)]
+        measure: bool,
+        /// Test data per pair in MB, with --measure.
+        #[arg(long, default_value_t = 16)]
+        mb: u64,
+    },
+    /// The best address to reach a node from here: its LAN address if both share one, else
+    /// its mesh address.
+    Route { node: String },
+    /// Environment for distributed training on THIS node (run it on every node of the group):
+    /// MASTER_ADDR, NODE_RANK, NCCL_SOCKET_IFNAME ... `eval $(meshvpn net env --master gpu1 tag:gpu)`
+    Env {
+        /// The nodes of the training job.
+        #[arg(required = true)]
+        selectors: Vec<String>,
+        /// Rank 0 (default: the first node by name).
+        #[arg(long)]
+        master: Option<String>,
+        #[arg(long, default_value_t = 29500)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -287,7 +322,7 @@ fn say(json: bool, text: &str) {
     if json {
         println!("{}", serde_json::json!({ "ok": true, "message": text }));
     } else {
-        say(json, &text);
+        say(json, text);
     }
 }
 
@@ -344,6 +379,73 @@ fn real_main(cli: Cli) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&list)?);
             } else {
                 agent::print_nodes(&list);
+            }
+        }
+        Cmd::Net { cmd } => {
+            let st = agent::status(&dir)?;
+            let all = agent::nodes(&st);
+            match cmd {
+                NetCmd::Matrix { selectors, measure, mb } => {
+                    let sel = if selectors.is_empty() {
+                        vec!["all".to_string()]
+                    } else {
+                        selectors
+                    };
+                    let mut group = agent::select(&all, &sel)?;
+                    if measure {
+                        if !json {
+                            eprintln!("measuring between {} nodes ({mb} MB per pair)...", group.len());
+                        }
+                        group = agent::measure(&dir, &group, mb)?;
+                    }
+                    let edges = agent::matrix(&group);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&edges)?);
+                    } else {
+                        agent::print_matrix(&edges);
+                    }
+                }
+                NetCmd::Route { node } => {
+                    let to = agent::select(&all, &[node])?.remove(0);
+                    let r = agent::route(&all[0], &to, st.socks.is_some());
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "{}: use {} ({})",
+                            r.node,
+                            r.best,
+                            match (&r.lan_ip, &r.interface) {
+                                (Some(_), Some(i)) => format!("direct LAN path via {i}"),
+                                (Some(_), None) => "direct LAN path".into(),
+                                (None, _) => format!("over the mesh, no shared LAN; mesh IP {}", r.mesh_ip),
+                            }
+                        );
+                    }
+                }
+                NetCmd::Env {
+                    selectors,
+                    master,
+                    port,
+                } => {
+                    let group = agent::select(&all, &selectors)?;
+                    let master = match master {
+                        Some(m) => agent::select(&all, &[m])?.remove(0),
+                        None => group.iter().min_by_key(|n| n.name.clone()).unwrap().clone(),
+                    };
+                    let vars = agent::training_env(&all[0], &group, &master, port)?;
+                    if json {
+                        let map: serde_json::Map<String, serde_json::Value> = vars
+                            .into_iter()
+                            .map(|(k, v)| (k, serde_json::Value::String(v)))
+                            .collect();
+                        println!("{}", serde_json::Value::Object(map));
+                    } else {
+                        for (k, v) in vars {
+                            println!("export {k}={}", agent::sh_quote(&v));
+                        }
+                    }
+                }
             }
         }
         Cmd::Tag { cmd } => {

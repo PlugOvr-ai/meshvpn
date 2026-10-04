@@ -12,6 +12,27 @@ pub const T_PING: u8 = 4;
 pub const T_PONG: u8 = 5;
 pub const T_FORGET: u8 = 6;
 pub const T_ROTATE: u8 = 7;
+/// Throughput test over a link: start, test data, end, and the receiver's result.
+pub const T_BENCH_START: u8 = 8;
+pub const T_BENCH_DATA: u8 = 9;
+pub const T_BENCH_END: u8 = 10;
+pub const T_BENCH_RESULT: u8 = 11;
+/// "Please measure now" for a set of nodes (flooded).
+pub const T_MEASURE: u8 = 12;
+
+#[derive(Serialize, Deserialize)]
+pub struct BenchMsg {
+    pub id: u64,
+    #[serde(default)]
+    pub mbps: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MeasureReq {
+    pub nonce: u64,
+    pub nodes: Vec<NodeId>,
+    pub bytes: u64,
+}
 
 /// Header of a data frame: dst(32) src(32) ttl(1) nonce(24), followed by the sealed IP packet.
 pub const DATA_HDR: usize = 32 + 32 + 1 + 24;
@@ -50,6 +71,9 @@ pub struct NodeInfo {
     /// This node's measurements towards other nodes (one row of the network matrix).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub perf: Vec<Perf>,
+    /// When this node last finished a requested measurement (ms since epoch).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub measured: u64,
     /// Shared datasets/checkpoints this node has completely and serves to others.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objects: Vec<ObjectAd>,
@@ -121,6 +145,10 @@ pub struct SshKey {
 }
 
 /// Text from other nodes that ends up on terminals: short, no control characters.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 pub fn clean_text(t: &str) -> bool {
     t.len() <= 128 && !t.chars().any(char::is_control)
 }
@@ -348,6 +376,7 @@ mod tests {
             inventory: None,
             lan: vec![],
             perf: vec![],
+            measured: 0,
             objects: vec![],
             version: String::new(),
         }

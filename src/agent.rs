@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::control::{self, Request, Response};
 use crate::node::Status;
-use crate::proto::{Inventory, ObjectAd};
+use crate::proto::{Inventory, ObjectAd, Perf};
 
 /// One node as agents see it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -30,6 +30,13 @@ pub struct NodeView {
     pub rtt_ms: Option<u64>,
     pub inventory: Option<Inventory>,
     pub objects: Vec<ObjectAd>,
+    /// Physical networks of the node.
+    pub lan: Vec<String>,
+    /// The node's measurements towards others (its row of the network matrix).
+    pub perf: Vec<Perf>,
+    /// When it last finished a requested measurement (ms since epoch).
+    #[serde(skip)]
+    pub measured: u64,
 }
 
 impl NodeView {
@@ -64,6 +71,9 @@ pub fn nodes(st: &Status) -> Vec<NodeView> {
         rtt_ms: Some(0),
         inventory: st.inventory.clone(),
         objects: vec![],
+        lan: st.lan.clone(),
+        perf: st.perf.clone(),
+        measured: st.measured,
     }];
     out.extend(st.peers.iter().map(|p| NodeView {
         name: p.name.clone(),
@@ -76,6 +86,9 @@ pub fn nodes(st: &Status) -> Vec<NodeView> {
         rtt_ms: p.rtt_ms,
         inventory: p.inventory.clone(),
         objects: p.objects.clone(),
+        lan: p.lan.clone(),
+        perf: p.perf.clone(),
+        measured: p.measured,
     }));
     out
 }
@@ -485,4 +498,207 @@ pub fn results_json(results: &[RunResult]) -> serde_json::Value {
         "ok": results.iter().all(|r| r.ok),
         "results": results,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Network matrix, LAN paths and training environment
+
+#[derive(Serialize, Clone)]
+pub struct Edge {
+    pub from: String,
+    pub to: String,
+    pub rtt_ms: Option<f64>,
+    pub mesh_mbps: Option<f32>,
+    /// `to`'s address on a LAN both share, verified from `from`.
+    pub lan_ip: Option<String>,
+    pub age_s: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// What every selected node measured towards the others.
+pub fn matrix(nodes: &[NodeView]) -> Vec<Edge> {
+    let mut edges = vec![];
+    for from in nodes {
+        for to in nodes.iter().filter(|t| t.id != from.id) {
+            if let Some(p) = from.perf.iter().find(|p| p.peer.hex() == to.id) {
+                edges.push(Edge {
+                    from: from.name.clone(),
+                    to: to.name.clone(),
+                    rtt_ms: p.rtt_us.map(|u| u as f64 / 1000.0),
+                    mesh_mbps: p.mesh_mbps,
+                    lan_ip: p.lan_ip.clone(),
+                    age_s: now_ms().saturating_sub(p.at) / 1000,
+                });
+            }
+        }
+    }
+    edges
+}
+
+/// Asks the nodes to measure towards each other and waits until all rows are fresh.
+pub fn measure(dir: &Path, nodes: &[NodeView], mb: u64) -> Result<Vec<NodeView>> {
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let started = now_ms();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(control::request(
+        dir,
+        &Request::Measure {
+            nodes: ids.clone(),
+            bytes: mb * 1_000_000,
+        },
+    ))?;
+    let deadline = Instant::now() + Duration::from_secs(30 + nodes.len() as u64 * (mb / 4).max(5));
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let fresh: Vec<NodeView> = select(&self::nodes(&status(dir)?), &ids)?;
+        let pending: Vec<&str> = fresh
+            .iter()
+            .filter(|n| n.online && n.measured < started)
+            .map(|n| n.name.as_str())
+            .collect();
+        if pending.is_empty() {
+            return Ok(fresh);
+        }
+        if Instant::now() > deadline {
+            eprintln!(
+                "note: no fresh results from {} yet - showing what is there",
+                pending.join(", ")
+            );
+            return Ok(fresh);
+        }
+    }
+}
+
+pub fn print_matrix(edges: &[Edge]) {
+    if edges.is_empty() {
+        println!("No measurements yet - run with --measure.");
+        return;
+    }
+    let w = edges
+        .iter()
+        .map(|e| e.from.len().max(e.to.len()))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!(
+        "{:<w$}  {:<w$}  {:>9}  {:>12}  {:<17}  AGE",
+        "FROM", "TO", "RTT", "MESH", "LAN PATH"
+    );
+    for e in edges {
+        let rtt = e.rtt_ms.map(|r| format!("{r:.1} ms")).unwrap_or("-".into());
+        let mbps = e.mesh_mbps.map(|m| format!("{m:.0} Mbit/s")).unwrap_or("-".into());
+        let lan = e.lan_ip.clone().unwrap_or("-".into());
+        println!(
+            "{:<w$}  {:<w$}  {rtt:>9}  {mbps:>12}  {lan:<17}  {}s",
+            e.from, e.to, e.age_s
+        );
+    }
+}
+
+#[derive(Serialize)]
+pub struct Route {
+    pub node: String,
+    pub mesh_ip: Ipv4Addr,
+    /// Verified address on a LAN both share - use it for heavy traffic.
+    pub lan_ip: Option<String>,
+    /// Local interface for `best`.
+    pub interface: Option<String>,
+    pub best: String,
+}
+
+pub fn route(me: &NodeView, to: &NodeView, userspace: bool) -> Route {
+    let lan_ip = if to.is_self {
+        None
+    } else {
+        me.perf
+            .iter()
+            .find(|p| p.peer.hex() == to.id)
+            .and_then(|p| p.lan_ip.clone())
+    };
+    let interface = match &lan_ip {
+        Some(ip) => ip.parse().ok().and_then(crate::net::lan_interface_for),
+        None if userspace => None,
+        None => Some("mesh0".into()),
+    };
+    Route {
+        node: to.name.clone(),
+        mesh_ip: to.ip,
+        best: lan_ip.clone().unwrap_or_else(|| to.ip.to_string()),
+        lan_ip,
+        interface,
+    }
+}
+
+/// Environment for distributed training (torchrun/NCCL) on THIS node, for the group `group`
+/// with `master` as rank 0. Uses the LAN only if every pair in the group verified a LAN path
+/// (mixing LAN and mesh addresses makes NCCL hang); otherwise the mesh for everyone.
+pub fn training_env(me: &NodeView, group: &[NodeView], master: &NodeView, port: u16) -> Result<Vec<(String, String)>> {
+    if !group.iter().any(|n| n.id == me.id) {
+        bail!("this node ({}) is not in the selected group", me.name);
+    }
+    if !group.iter().any(|n| n.id == master.id) {
+        bail!("the master ({}) is not in the selected group", master.name);
+    }
+    let lan_between = |a: &NodeView, b: &NodeView| -> Option<String> {
+        a.perf
+            .iter()
+            .find(|p| p.peer.hex() == b.id)
+            .and_then(|p| p.lan_ip.clone())
+    };
+    let all_lan = group.iter().all(|a| {
+        group
+            .iter()
+            .filter(|b| b.id != a.id)
+            .all(|b| lan_between(a, b).is_some())
+    });
+    let (master_addr, iface) = if group.len() == 1 {
+        ("127.0.0.1".to_string(), "lo".to_string())
+    } else if all_lan {
+        // The master's LAN address as the others see it; our interface on that LAN.
+        let peer = group.iter().find(|n| n.id != master.id).unwrap();
+        let addr = lan_between(peer, master).unwrap();
+        let towards = if me.id == master.id {
+            lan_between(master, peer)
+        } else {
+            Some(addr.clone())
+        };
+        let iface = towards
+            .and_then(|a| a.parse().ok())
+            .and_then(crate::net::lan_interface_for)
+            .ok_or_else(|| anyhow!("no local interface on the LAN towards {}", master.name))?;
+        (addr, iface)
+    } else {
+        if let Some(n) = group.iter().find(|n| n.inventory.as_ref().is_some_and(|i| i.userspace)) {
+            bail!(
+                "no LAN path between all nodes, and {} runs in userspace mode (no mesh0 interface for NCCL)",
+                n.name
+            );
+        }
+        (master.ip.to_string(), "mesh0".to_string())
+    };
+    let mut ranked: Vec<&NodeView> = group.iter().collect();
+    ranked.sort_by_key(|n| (n.id != master.id, n.name.clone()));
+    let rank = ranked.iter().position(|n| n.id == me.id).unwrap();
+    Ok(vec![
+        ("MASTER_ADDR".into(), master_addr),
+        ("MASTER_PORT".into(), port.to_string()),
+        ("NNODES".into(), group.len().to_string()),
+        ("NODE_RANK".into(), rank.to_string()),
+        ("NCCL_SOCKET_IFNAME".into(), iface.clone()),
+        ("GLOO_SOCKET_IFNAME".into(), iface),
+        (
+            "MESHVPN_PATH".into(),
+            if all_lan || group.len() == 1 {
+                "lan".into()
+            } else {
+                "mesh".into()
+            },
+        ),
+    ])
 }
