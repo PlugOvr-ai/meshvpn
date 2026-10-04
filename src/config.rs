@@ -93,6 +93,21 @@ pub struct BannedNode {
     pub name: String,
 }
 
+/// Whether to run without a TUN device (TCP/IP stack in meshvpn itself).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Userspace {
+    /// Kernel TUN device if available, userspace otherwise (e.g. containers without NET_ADMIN).
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+fn default_socks_listen() -> String {
+    "127.0.0.1:1055".into()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     /// Human readable node name (becomes `<name>.mesh` in /etc/hosts).
@@ -136,6 +151,11 @@ pub struct Config {
     /// log in without a password.
     #[serde(default = "default_true")]
     pub publish_ssh_keys: bool,
+    #[serde(default)]
+    pub userspace: Userspace,
+    /// In userspace mode: SOCKS5 proxy through which programs here reach the mesh.
+    #[serde(default = "default_socks_listen")]
+    pub socks_listen: String,
     /// Make all outgoing connections through this SOCKS5 proxy (`host:port`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socks_proxy: Option<String>,
@@ -176,6 +196,8 @@ impl Config {
             manage_hosts: true,
             auto_update: true,
             publish_ssh_keys: true,
+            userspace: Userspace::Auto,
+            socks_listen: default_socks_listen(),
             ssh_allow: vec![],
             ssh_allow_all: vec![],
             socks_proxy: None,

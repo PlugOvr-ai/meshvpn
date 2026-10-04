@@ -9,6 +9,7 @@ mod ssh;
 mod sshd;
 mod tui;
 mod update;
+mod userspace;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -80,6 +81,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<SshCmd>,
     },
+    /// Connect stdin/stdout to HOST:PORT in the mesh (for ssh's ProxyCommand in userspace mode).
+    Nc { host: String, port: u16 },
     /// Used by sshd (AuthorizedKeysCommand): prints the keys that may log in as USER.
     #[command(hide = true)]
     SshAuthorizedKeys { user: String },
@@ -161,6 +164,10 @@ struct NodeOpts {
     /// Send all outgoing connections through this SOCKS5 proxy (HOST:PORT).
     #[arg(long)]
     socks_proxy: Option<String>,
+    /// Run without a TUN device (for containers without NET_ADMIN). By default meshvpn
+    /// switches to this mode by itself when no TUN device is available.
+    #[arg(long)]
+    userspace: bool,
     /// Never connect out; wait for other nodes to connect in.
     #[arg(long)]
     no_outbound: bool,
@@ -268,6 +275,32 @@ fn real_main(cli: Cli) -> Result<()> {
             {
                 println!("{}", text.trim_end());
             }
+        }
+        Cmd::Nc { host, port } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            // Through the userspace stack if meshvpn runs in that mode, directly otherwise.
+            let socks = match rt.block_on(control::request(&dir, &control::Request::Status)) {
+                Ok(control::Response::Status(st)) => st.socks,
+                _ => None,
+            };
+            rt.block_on(async {
+                match socks {
+                    Some(proxy) => userspace::netcat(&proxy, &host, port).await,
+                    None => {
+                        let s = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+                        let (mut r, mut w) = s.into_split();
+                        let up = async {
+                            let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut w).await;
+                            let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+                        };
+                        let down = async {
+                            let _ = tokio::io::copy(&mut r, &mut tokio::io::stdout()).await;
+                        };
+                        tokio::join!(up, down);
+                        Ok(())
+                    }
+                }
+            })?;
         }
         Cmd::SshAuthorizedKeys { user } => {
             // Called by sshd for every login attempt: never fail loudly, just offer nothing.
@@ -381,6 +414,9 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
     cfg.interface = o.interface;
     cfg.socks_proxy = o.socks_proxy;
     cfg.no_outbound = o.no_outbound;
+    if o.userspace {
+        cfg.userspace = config::Userspace::Always;
+    }
     if let Some(u) = o.ssh_allow_all.iter().find(|u| !proto::valid_user(u)) {
         bail!("--ssh-allow-all: invalid user name {u:?}");
     }
@@ -560,6 +596,9 @@ fn print_status(st: &node::Status) {
     }
     if let Some(t) = &st.ssh_tunnel {
         println!("  ssh tunnel:   {t}");
+    }
+    if let Some(s) = &st.socks {
+        println!("  mode:         userspace (no TUN device) - programs reach the mesh via socks5h://{s}");
     }
     if let Some(o) = &st.outbound_via {
         println!("  outgoing via: {o}");

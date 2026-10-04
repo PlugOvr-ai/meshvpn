@@ -16,10 +16,18 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, SavedState};
+use crate::config::{Config, SavedState, Userspace};
 use crate::keys::{Identity, NodeId, OVERLAY_NETMASK, overlay_ip};
 use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
+
+/// Where IP packets for this node go: the kernel, or the TCP/IP stack in this process.
+enum PacketIo {
+    Tun(Arc<tun::AsyncDevice>),
+    Userspace(crate::userspace::StackTx),
+}
+
+const OVERLAY_PREFIX: u8 = 10;
 
 const TICK: Duration = Duration::from_secs(10);
 const REANNOUNCE: Duration = Duration::from_secs(30);
@@ -147,7 +155,7 @@ pub struct Node {
     ident: Identity,
     net: String,
     my_ip: Ipv4Addr,
-    tun: Arc<tun::AsyncDevice>,
+    io: PacketIo,
     state: Mutex<State>,
     next_link_id: AtomicU64,
     started: Instant,
@@ -185,6 +193,9 @@ pub struct Status {
     pub update_available: Option<String>,
     #[serde(default)]
     pub banned: Vec<String>,
+    /// Userspace mode: the SOCKS proxy programs use to reach the mesh.
+    #[serde(default)]
+    pub socks: Option<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -225,27 +236,26 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     let keys = cfg.all_keys()?;
     let my_ip = overlay_ip(&ident.id);
 
-    let mut tcfg = tun::Configuration::default();
-    tcfg.tun_name(&cfg.interface)
-        .address(my_ip)
-        .netmask(OVERLAY_NETMASK)
-        .mtu(cfg.mtu)
-        .up();
-    let tun = tun::create_as_async(&tcfg).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("ermission") || msg.contains("EPERM") || msg.contains("Operation not permitted") {
-            anyhow!("cannot create the network interface: {msg}\n  -> meshvpn needs root: run `sudo meshvpn up`")
-        } else if msg.contains("busy") || msg.contains("os error 16") {
-            anyhow!(
-                "cannot create network interface {}: it is already in use, most likely by another meshvpn \
-                 that is still running (see `pgrep -a meshvpn`; if you installed the service, a copy started \
-                 by hand with `meshvpn up` has to be stopped first)",
-                cfg.interface
-            )
-        } else {
-            anyhow!("cannot create network interface {}: {msg}", cfg.interface)
+    // Kernel TUN device if possible; otherwise (containers without /dev/net/tun or NET_ADMIN)
+    // a TCP/IP stack in this process.
+    let mut tun_dev = None;
+    let mut userspace_reason = None;
+    if cfg.userspace == Userspace::Always {
+        userspace_reason = Some("userspace = \"always\" in the config".to_string());
+    } else {
+        match create_tun(&cfg, my_ip) {
+            Ok(t) => tun_dev = Some(t),
+            Err(msg) if cfg.userspace == Userspace::Auto && tun_unavailable(&msg) => userspace_reason = Some(msg),
+            Err(msg) => return Err(tun_error(&cfg, &msg)),
         }
-    })?;
+    }
+    let (io, start_stack) = match tun_dev {
+        Some(t) => (PacketIo::Tun(Arc::new(t)), None),
+        None => {
+            let (tx, start) = crate::userspace::start(my_ip, OVERLAY_PREFIX, cfg.mtu as usize);
+            (PacketIo::Userspace(tx), Some(start))
+        }
+    };
 
     let socks = cfg.effective_socks();
     let node = Arc::new(Node {
@@ -253,7 +263,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         ident,
         net: cfg.network_id(),
         my_ip,
-        tun: Arc::new(tun),
+        io,
         state: Mutex::new(State::default()),
         next_link_id: AtomicU64::new(1),
         started: Instant::now(),
@@ -327,7 +337,27 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     if let Some(s) = &node.socks {
         info!("outgoing connections go through SOCKS proxy {s}");
     }
-    tokio::spawn(node.clone().tun_loop());
+    match (&node.io, start_stack) {
+        (PacketIo::Userspace(tx), Some(start)) => {
+            warn!(
+                "no TUN device ({}): running in userspace mode - mesh connections to this node reach \
+                 the services listening here; programs reach the mesh through socks5h://{}",
+                userspace_reason.unwrap_or_default(),
+                node.cfg.socks_listen
+            );
+            start(node.clone());
+            tokio::spawn(crate::userspace::socks_server(
+                node.clone(),
+                tx.clone(),
+                node.cfg.socks_listen.clone(),
+            ));
+            ssh_client_config(true);
+        }
+        _ => {
+            tokio::spawn(node.clone().tun_loop());
+            ssh_client_config(false);
+        }
+    }
     tokio::spawn(node.clone().tick_loop());
     tokio::spawn(node.clone().update_loop());
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
@@ -1141,7 +1171,7 @@ impl Node {
     }
 
     /// Encrypts an IP packet end-to-end for `dst` and hands it to the first hop.
-    fn send_packet(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
+    pub(crate) fn send_packet(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
         let (dst, tx, cipher) = {
             let mut st = self.state.lock().unwrap();
             let Some(&dst) = st.ip_map.get(&dst_ip) else { return };
@@ -1203,10 +1233,43 @@ impl Node {
         Some(pkt)
     }
 
+    /// Hands an IP packet for this node to the kernel or the userspace stack.
+    async fn deliver(&self, pkt: Vec<u8>) {
+        match &self.io {
+            PacketIo::Tun(tun) => {
+                let _ = tun.send(&pkt).await;
+            }
+            PacketIo::Userspace(tx) => {
+                let _ = tx.send(crate::userspace::Cmd::Packet(pkt));
+            }
+        }
+    }
+
+    pub fn my_ip(&self) -> Ipv4Addr {
+        self.my_ip
+    }
+
+    /// Mesh address of `host` (`name`, `name.mesh` or a mesh IP); None if it isn't in the mesh.
+    pub fn resolve(&self, host: &str) -> Option<Ipv4Addr> {
+        let h = host.trim_end_matches('.').to_lowercase();
+        let h = h.strip_suffix(".mesh").unwrap_or(&h);
+        if let Ok(ip) = h.parse::<Ipv4Addr>() {
+            return is_overlay(IpAddr::V4(ip)).then_some(ip);
+        }
+        let st = self.state.lock().unwrap();
+        if h == st.my_name {
+            return Some(self.my_ip);
+        }
+        let mut matches: Vec<&Record> = st.records.values().filter(|r| r.info.name == h).collect();
+        matches.sort_by_key(|r| (!self.is_online(&st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+        matches.first().map(|r| overlay_ip(&r.info.id))
+    }
+
     async fn tun_loop(self: Arc<Self>) {
         let mut buf = vec![0u8; 65536];
         loop {
-            let n = match self.tun.recv(&mut buf).await {
+            let PacketIo::Tun(tun) = &self.io else { return };
+            let n = match tun.recv(&mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
                     warn!("reading from {}: {e}", self.cfg.interface);
@@ -1406,7 +1469,7 @@ impl Node {
             match kind {
                 T_DATA => {
                     if let Some(pkt) = self.handle_data(msg) {
-                        let _ = self.tun.send(&pkt).await;
+                        self.deliver(pkt).await;
                     }
                 }
                 T_GOSSIP => self.handle_gossip(peer, payload),
@@ -1685,6 +1748,7 @@ impl Node {
             version: crate::update::CURRENT.into(),
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
+            socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
             peers,
         }
     }
@@ -1821,6 +1885,75 @@ pub fn check_name_free<'a>(name: &str, mut others: impl Iterator<Item = &'a Stri
         );
     }
     Ok(())
+}
+
+fn create_tun(cfg: &Config, my_ip: Ipv4Addr) -> std::result::Result<tun::AsyncDevice, String> {
+    let mut tcfg = tun::Configuration::default();
+    tcfg.tun_name(&cfg.interface)
+        .address(my_ip)
+        .netmask(OVERLAY_NETMASK)
+        .mtu(cfg.mtu)
+        .up();
+    tun::create_as_async(&tcfg).map_err(|e| e.to_string())
+}
+
+fn permission_problem(msg: &str) -> bool {
+    msg.contains("ermission") || msg.contains("EPERM") || msg.contains("not permitted")
+}
+
+/// The TUN device can't be had here (and probably never will): use the userspace stack.
+fn tun_unavailable(msg: &str) -> bool {
+    let missing = msg.contains("No such file") || msg.contains("No such device") || msg.contains("os error 2");
+    // Not root on a normal machine is a mistake (sudo forgotten), not a reason to switch modes.
+    let root_or_container = unsafe { libc::geteuid() } == 0 || crate::userspace::in_container();
+    missing || (permission_problem(msg) && root_or_container)
+}
+
+fn tun_error(cfg: &Config, msg: &str) -> anyhow::Error {
+    if msg.contains("busy") || msg.contains("os error 16") {
+        anyhow!(
+            "cannot create network interface {}: it is already in use, most likely by another meshvpn \
+             that is still running (see `pgrep -a meshvpn`; if you installed the service, a copy started \
+             by hand with `meshvpn up` has to be stopped first)",
+            cfg.interface
+        )
+    } else if crate::userspace::in_container() {
+        anyhow!(
+            "cannot create network interface {}: {msg}\n  This container has no access to /dev/net/tun.\n  \
+             Either start it with   docker run --cap-add=NET_ADMIN --device=/dev/net/tun ...\n  \
+             (compose: cap_add: [NET_ADMIN] and devices: [\"/dev/net/tun:/dev/net/tun\"]),\n  \
+             or let meshvpn run without it: set  userspace = \"auto\"  in the config.",
+            cfg.interface
+        )
+    } else if permission_problem(msg) {
+        anyhow!("cannot create the network interface: {msg}\n  -> meshvpn needs root: run `sudo meshvpn up`")
+    } else {
+        anyhow!("cannot create network interface {}: {msg}", cfg.interface)
+    }
+}
+
+/// In userspace mode, `ssh user@host.mesh` has to go through meshvpn: an ssh client drop-in
+/// does that transparently. In kernel mode it is removed again.
+fn ssh_client_config(userspace: bool) {
+    const FILE: &str = "/etc/ssh/ssh_config.d/meshvpn.conf";
+    if !userspace {
+        if std::fs::read_to_string(FILE).is_ok_and(|t| t.contains("Managed by meshvpn")) {
+            let _ = std::fs::remove_file(FILE);
+        }
+        return;
+    }
+    if !std::path::Path::new("/etc/ssh/ssh_config.d").is_dir() {
+        return;
+    }
+    let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/meshvpn"));
+    let text = format!(
+        "# Managed by meshvpn (userspace mode): ssh to *.mesh hosts goes through meshvpn.\n\
+         Host *.mesh\n    ProxyCommand {} nc %h %p\n",
+        exe.display()
+    );
+    if let Err(e) = std::fs::write(FILE, text) {
+        debug!("writing {FILE}: {e}");
+    }
 }
 
 /// `meshvpn ssh allow everyone ...`

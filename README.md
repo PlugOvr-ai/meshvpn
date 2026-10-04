@@ -115,6 +115,24 @@ jump host with `restrict,port-forwarding,command="echo meshvpn-ok"`: port forwar
 connection the device reaches the other nodes and GitHub (for updates). The script detects how the device reaches the
 jump host; if it can't, pass `--jump user@host[:port]`. Run the script again to update the device.
 
+## Containers without NET_ADMIN (userspace mode)
+
+meshvpn normally creates a network interface (`mesh0`), which needs `/dev/net/tun` and the `NET_ADMIN` capability. In a
+container that has neither, it switches to **userspace mode** by itself and runs a small TCP/IP stack in its own
+process:
+
+* **Into the container:** other nodes reach the services listening in the container directly (`ssh`, `curl
+  http://box.mesh:8080`, ...); ping works. Ports where nothing listens are refused.
+* **Out of the container:** programs reach the mesh (and, if they like, the internet) through the SOCKS5 proxy
+  `socks5h://127.0.0.1:1055`, e.g. `ALL_PROXY=socks5h://127.0.0.1:1055 curl http://hub.mesh:8000`. `ssh user@host.mesh`
+  works without any setup (meshvpn adds a `ProxyCommand` for `*.mesh` to `/etc/ssh/ssh_config.d`), and `meshvpn nc
+  host port` connects stdin/stdout for other tools.
+
+`meshvpn status` shows `mode: userspace`. Force it with `--userspace` (init/join) or `userspace = "always"`, or switch it
+off with `userspace = "never"`. Limits: TCP and ping only (no UDP); programs that ignore proxy settings can't reach out to
+the mesh; and it is slower than kernel mode (about 30-40 MB/s).
+If you can change how the container is started, `--cap-add=NET_ADMIN --device=/dev/net/tun` gives the full kernel mode.
+
 ## Password-less SSH between nodes
 
 Each machine decides for itself who may log in to it without a password. Open the editor on the machine you want to log

@@ -127,7 +127,7 @@ if [ -n "$PROXY" ]; then
 fi
 say "Installed $("$BIN_DIR/meshvpn" --version) to $BIN_DIR/meshvpn"
 
-[ -c /dev/net/tun ] || say "warning: /dev/net/tun is missing - load it with 'modprobe tun' (containers need it passed in)."
+[ -c /dev/net/tun ] || say "note: no /dev/net/tun here (e.g. a container without NET_ADMIN) - meshvpn runs in userspace mode: other nodes reach the services here, programs here reach the mesh via socks5h://127.0.0.1:1055 (ssh to *.mesh works directly)."
 command -v ssh >/dev/null 2>&1 || say "note: install openssh-client if this machine should use a reverse SSH tunnel."
 
 # Optional: set the machine up right away, e.g. `sh -s -- join mesh1-...`.
