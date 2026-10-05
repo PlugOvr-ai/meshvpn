@@ -8,16 +8,28 @@
 #   curl -fsSL .../install.sh | sudo sh -s -- init --endpoint my-server.example.com:7870
 #   curl -fsSL .../install.sh | sudo sh -s -- join mesh1-...
 #
+# Without root (rootless: binary in ~/.local/bin, config in ~/.config/meshvpn, userspace
+# networking, a systemd user service). Used automatically when sudo is missing:
+#
+#   curl -fsSL .../install.sh | sh -s -- --user join mesh1-...
+#
 # Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin,
-# MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub.
+# MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub,
+# MESHVPN_ROOTLESS=1 for the same as --user.
 set -eu
 
 REPO="PlugOvr-ai/meshvpn"
-BIN_DIR="${MESHVPN_BIN_DIR:-/usr/local/bin}"
 VERSION="${MESHVPN_VERSION:-latest}"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+ROOTLESS="${MESHVPN_ROOTLESS:-}"
+[ "$ROOTLESS" = 0 ] && ROOTLESS=""
+if [ "${1:-}" = "--user" ] || [ "${1:-}" = "--rootless" ]; then
+    ROOTLESS=1
+    shift
+fi
 
 [ "$(uname -s)" = "Linux" ] || die "meshvpn currently supports Linux only (found $(uname -s))."
 
@@ -29,11 +41,25 @@ case "$(uname -m)" in
     *) die "no prebuilt binary for CPU architecture $(uname -m) - build from source: cargo install --git https://github.com/$REPO" ;;
 esac
 
-if [ "$(id -u)" -ne 0 ]; then
-    command -v sudo >/dev/null 2>&1 || die "please run as root"
-    SUDO="sudo"
+if [ -n "$ROOTLESS" ] && [ "$(id -u)" -eq 0 ]; then
+    die "--user is for installing without root - as root, run the installer without it"
+fi
+if [ "$(id -u)" -ne 0 ] && [ -z "$ROOTLESS" ] && ! command -v sudo >/dev/null 2>&1; then
+    say "Not root and no sudo here: installing rootless (for the current user only)."
+    ROOTLESS=1
+fi
+SUDO=""
+if [ -n "$ROOTLESS" ]; then
+    [ -n "${HOME:-}" ] || die "HOME is not set"
+    BIN_DIR="${MESHVPN_BIN_DIR:-$HOME/.local/bin}"
+    MESH_DIR="${MESHVPN_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshvpn}"
+    DIR_ARGS="--dir $MESH_DIR"
+    case "$MESH_DIR" in *" "*) die "MESHVPN_DIR must not contain spaces" ;; esac
 else
-    SUDO=""
+    BIN_DIR="${MESHVPN_BIN_DIR:-/usr/local/bin}"
+    MESH_DIR="/etc/meshvpn"
+    DIR_ARGS=""
+    [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 fi
 
 # --- Proxy -----------------------------------------------------------------------------------
@@ -126,9 +152,35 @@ $SUDO install -m 0755 "$TMP/meshvpn" "$BIN_DIR/meshvpn"
 if [ -n "$PROXY" ]; then
     # meshvpn reads this when the variables are missing (systemd service, sudo).
     printf 'https_proxy=%s\nhttp_proxy=%s\nno_proxy=%s\n' "$PROXY" "$PROXY" "$NOPROXY" \
-        | $SUDO sh -c 'mkdir -p /etc/meshvpn && chmod 700 /etc/meshvpn && umask 077 && cat > /etc/meshvpn/proxy.env'
+        | $SUDO sh -c "mkdir -p '$MESH_DIR' && chmod 700 '$MESH_DIR' && umask 077 && cat > '$MESH_DIR/proxy.env'"
 fi
 say "Installed $("$BIN_DIR/meshvpn" --version) to $BIN_DIR/meshvpn"
+
+if [ -n "$ROOTLESS" ]; then
+    say "Rootless install: config in $MESH_DIR, userspace networking - other nodes reach the services here, ssh to *.mesh works directly, other programs reach the mesh via socks5h://127.0.0.1:1055."
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) say "note: $BIN_DIR is not in your PATH - add it, e.g.: echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.profile" ;;
+    esac
+    # shellcheck disable=SC2086
+    if [ $# -gt 0 ]; then
+        "$BIN_DIR/meshvpn" $DIR_ARGS "$@"
+        case "$1" in
+            init | join) "$BIN_DIR/meshvpn" $DIR_ARGS install ;;
+        esac
+    elif [ -f "$MESH_DIR/config.toml" ]; then
+        # Already set up: restart on the new version.
+        "$BIN_DIR/meshvpn" $DIR_ARGS install
+    else
+        # Plain `meshvpn` picks this directory by itself unless the machine also has a root install.
+        if [ -d /etc/meshvpn ] || [ -n "${MESHVPN_DIR:-}" ]; then MV="meshvpn --dir $MESH_DIR"; else MV="meshvpn"; fi
+        echo
+        echo "Next: create a network with   $MV init"
+        echo "      or join one with        $MV join <invite>"
+        echo "      then start it with      $MV install"
+    fi
+    exit 0
+fi
 
 [ -c /dev/net/tun ] || say "note: no /dev/net/tun here (e.g. a container without NET_ADMIN) - meshvpn runs in userspace mode: other nodes reach the services here, programs here reach the mesh via socks5h://127.0.0.1:1055 (ssh to *.mesh works directly)."
 command -v ssh >/dev/null 2>&1 || say "note: install openssh-client if this machine should use a reverse SSH tunnel."

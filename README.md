@@ -133,6 +133,24 @@ off with `userspace = "never"`. Limits: TCP and ping only (no UDP); programs tha
 the mesh; and it is slower than kernel mode (about 30-40 MB/s).
 If you can change how the container is started, `--cap-add=NET_ADMIN --device=/dev/net/tun` gives the full kernel mode.
 
+## Without root (rootless install)
+
+No sudo on the machine? Install meshvpn for your user only (this is also what happens automatically when `sudo` is
+missing):
+
+```sh
+curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sh -s -- --user join mesh1-...
+```
+
+This puts the binary in `~/.local/bin`, the configuration in `~/.config/meshvpn` and nothing anywhere else (apart from a
+marked `Host *.mesh` block in `~/.ssh/config`). It runs in userspace mode (above), so the same applies: other nodes
+reach your services, you reach the mesh through `ssh user@node.mesh` or the SOCKS proxy. `meshvpn install` starts it as a
+**systemd user service** (to keep it running when you are logged out an admin can run `sudo loginctl enable-linger
+<user>`), or, where there is no systemd (containers), in the background with a `@reboot` crontab entry. `meshvpn status`,
+`rename`, `tags`, `share`, `invite`, `update` (auto-updates too) and `uninstall` work without sudo. What a rootless install
+can't do: write `/etc/hosts` (names work through ssh and the proxy only) and set up sshd for password-less logins *into*
+this machine. Only one rootless install per machine can use the default ports.
+
 ## Password-less SSH between nodes
 
 Each machine decides for itself who may log in to it without a password. Open the editor on the machine you want to log

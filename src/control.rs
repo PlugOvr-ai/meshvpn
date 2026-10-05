@@ -117,7 +117,14 @@ pub fn socket_path(dir: &Path) -> PathBuf {
     if dir == Path::new("/etc/meshvpn") {
         PathBuf::from("/run/meshvpn.sock")
     } else {
-        dir.join("meshvpn.sock")
+        let path = dir.join("meshvpn.sock");
+        // Unix socket paths are limited to ~108 bytes; a deep directory gets one in /tmp.
+        if path.as_os_str().len() < 100 {
+            return path;
+        }
+        let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let hash = blake3::hash(abs.as_os_str().as_encoded_bytes()).to_hex();
+        std::env::temp_dir().join(format!("meshvpn-{}.sock", &hash[..16]))
     }
 }
 
@@ -325,7 +332,11 @@ pub async fn request(dir: &Path, req: &Request) -> Result<Response> {
     let path = socket_path(dir);
     let stream = UnixStream::connect(&path).await.map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            anyhow::anyhow!("meshvpn is not running - start it with `sudo meshvpn up` (or `sudo meshvpn install`)")
+            anyhow::anyhow!(
+                "meshvpn is not running - start it with `{}` (or `{}`)",
+                crate::config::hint("sudo meshvpn up"),
+                crate::config::hint("sudo meshvpn install")
+            )
         }
         std::io::ErrorKind::PermissionDenied => anyhow::anyhow!("permission denied - try again with sudo"),
         _ => anyhow::Error::from(e),

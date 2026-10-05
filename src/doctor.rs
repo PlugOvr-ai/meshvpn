@@ -32,7 +32,7 @@ fn check(name: &'static str, level: Level, detail: impl Into<String>, fix: Optio
         name,
         level,
         detail: detail.into(),
-        fix: fix.map(String::from),
+        fix: fix.map(crate::config::hint),
     }
 }
 
@@ -96,7 +96,17 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
         format!("meshvpn {} ({exe})", env!("CARGO_PKG_VERSION")),
         None,
     ));
-    if !root() {
+    if crate::config::rootless() {
+        c.push(check(
+            "privileges",
+            Level::Info,
+            format!(
+                "rootless install in {}: userspace networking, no /etc/hosts entries, no firewall or sshd changes",
+                dir.display()
+            ),
+            None,
+        ));
+    } else if !root() {
         c.push(check(
             "privileges",
             Level::Info,
@@ -134,7 +144,8 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     // --- daemon
     let st = status(dir);
     let procs = daemons();
-    let service = run("systemctl", &["is-active", "meshvpn"]).map(|s| s.trim().to_string());
+    let user: &[&str] = if crate::config::rootless() { &["--user"] } else { &[] };
+    let service = run("systemctl", &[user, &["is-active", "meshvpn"]].concat()).map(|s| s.trim().to_string());
     match &st {
         Some(st) => c.push(check(
             "daemon",
@@ -143,7 +154,11 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             None,
         )),
         None => {
-            let journal = run("journalctl", &["-u", "meshvpn", "-n", "30", "--no-pager"]).unwrap_or_default();
+            let journal = run(
+                "journalctl",
+                &[user, &["-u", "meshvpn", "-n", "30", "--no-pager"]].concat(),
+            )
+            .unwrap_or_default();
             let last_error = journal
                 .lines()
                 .rev()
@@ -208,7 +223,11 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             "interface",
             Level::Info,
             format!("userspace mode (no TUN device): programs reach the mesh via socks5h://{s}"),
-            Some("for the full kernel mode give the container --cap-add=NET_ADMIN --device=/dev/net/tun"),
+            if crate::config::rootless() {
+                Some("for kernel mode (all programs, names in /etc/hosts) install meshvpn as root instead")
+            } else {
+                Some("for the full kernel mode give the container --cap-add=NET_ADMIN --device=/dev/net/tun")
+            },
         ));
     } else {
         c.push(check(
@@ -339,7 +358,14 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     // --- SSH logins
     if let Some(cfg) = &cfg {
         let has_rules = !cfg.ssh_allow.is_empty() || !cfg.ssh_allow_all.is_empty();
-        if has_rules {
+        if has_rules && crate::config::rootless() {
+            c.push(check(
+                "ssh logins",
+                Level::Warn,
+                "password-less logins are configured, but a rootless install can't set up sshd",
+                Some("install meshvpn as root on this machine for password-less logins"),
+            ));
+        } else if has_rules {
             let effective = run("sshd", &["-T"])
                 .or_else(|| run("/usr/sbin/sshd", &["-T"]))
                 .unwrap_or_default();

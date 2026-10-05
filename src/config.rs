@@ -13,6 +13,55 @@ pub const DEFAULT_PORT: u16 = 7870;
 pub const DEFAULT_SOCKS_PORT: u16 = 1081;
 const INVITE_PREFIX: &str = "mesh1-";
 
+/// Where a root install keeps its config (and finds its socket in /run).
+pub const SYSTEM_DIR: &str = "/etc/meshvpn";
+
+/// The config directory of a rootless install: `$XDG_CONFIG_HOME/meshvpn` or `~/.config/meshvpn`.
+pub fn user_dir() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(x) => PathBuf::from(x),
+        None => PathBuf::from(std::env::var_os("HOME").filter(|v| !v.is_empty())?).join(".config"),
+    };
+    Some(base.join("meshvpn"))
+}
+
+/// The directory to use when none is given. Root always uses the system install. Other users
+/// use their own rootless install if they have one, else the machine's system install (so
+/// `meshvpn status` works without sudo), and set up a new rootless install if neither exists.
+pub fn default_dir() -> PathBuf {
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from(SYSTEM_DIR);
+    }
+    match user_dir() {
+        Some(u) if u.join("config.toml").exists() || !Path::new(SYSTEM_DIR).exists() => u,
+        _ => PathBuf::from(SYSTEM_DIR),
+    }
+}
+
+static ROOTLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Decided once at startup: a non-root user working with a directory other than the system one.
+pub fn set_rootless(dir: &Path) {
+    let rootless = unsafe { libc::geteuid() } != 0 && dir != Path::new(SYSTEM_DIR);
+    ROOTLESS.store(rootless, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Runs without root: userspace networking, no /etc/hosts, a systemd user service.
+pub fn rootless() -> bool {
+    ROOTLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Adapts a command suggestion to the install: no sudo and user services when rootless.
+pub fn hint(text: &str) -> String {
+    if !rootless() {
+        return text.to_string();
+    }
+    text.replace("sudo systemctl ", "systemctl --user ")
+        .replace("journalctl -u", "journalctl --user -u")
+        .replace("sudo meshvpn", "meshvpn")
+        .replace("sudo pkill", "pkill")
+}
+
 fn default_iface() -> String {
     "mesh0".into()
 }
@@ -207,10 +256,10 @@ impl Config {
             bootstrap: vec![],
             interface: default_iface(),
             mtu: default_mtu(),
-            manage_hosts: true,
+            manage_hosts: !rootless(),
             auto_update: true,
             publish_ssh_keys: true,
-            userspace: Userspace::Auto,
+            userspace: if rootless() { Userspace::Always } else { Userspace::Auto },
             udp: true,
             tags: vec![],
             socks_listen: default_socks_listen(),
@@ -339,7 +388,19 @@ pub fn create_dir(dir: &Path) -> Result<()> {
 
 fn permission_hint(e: std::io::Error, path: &Path) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
-        anyhow::anyhow!("permission denied writing {} - try again with sudo", path.display())
+        let rootless = match user_dir() {
+            Some(u) if path.starts_with(SYSTEM_DIR) => {
+                format!(
+                    " (or, without root, set up a rootless install with --dir {})",
+                    u.display()
+                )
+            }
+            _ => String::new(),
+        };
+        anyhow::anyhow!(
+            "permission denied writing {} - try again with sudo{rootless}",
+            path.display()
+        )
     } else {
         anyhow::Error::from(e).context(format!("writing {}", path.display()))
     }

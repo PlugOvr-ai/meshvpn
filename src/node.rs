@@ -421,19 +421,31 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     }
     match (&node.io, start_stack) {
         (PacketIo::Userspace(tx), Some(start)) => {
-            warn!(
-                "no TUN device ({}): running in userspace mode - mesh connections to this node reach \
-                 the services listening here; programs reach the mesh through socks5h://{}",
-                userspace_reason.unwrap_or_default(),
-                node.cfg.socks_listen
-            );
+            if crate::config::rootless() {
+                info!(
+                    "rootless: userspace mode - mesh connections to this node reach the services listening \
+                     here; programs reach the mesh through socks5h://{}",
+                    node.cfg.socks_listen
+                );
+            } else {
+                warn!(
+                    "no TUN device ({}): running in userspace mode - mesh connections to this node reach \
+                     the services listening here; programs reach the mesh through socks5h://{}",
+                    userspace_reason.unwrap_or_default(),
+                    node.cfg.socks_listen
+                );
+            }
             start(node.clone());
             tokio::spawn(crate::userspace::socks_server(
                 node.clone(),
                 tx.clone(),
                 node.cfg.socks_listen.clone(),
             ));
-            ssh_client_config(true);
+            if crate::config::rootless() {
+                user_ssh_config(&node.dir, true);
+            } else {
+                ssh_client_config(true);
+            }
         }
         _ => {
             tokio::spawn(node.clone().tun_loop());
@@ -2038,7 +2050,10 @@ impl Node {
             let auto = self.cfg.auto_update && !crate::update::is_dev_build();
             match self.update_now(!auto, false).await {
                 Ok(msg) if msg.contains("available") => {
-                    info!("{msg} - install it with: sudo meshvpn update")
+                    info!(
+                        "{msg} - install it with: {}",
+                        crate::config::hint("sudo meshvpn update")
+                    )
                 }
                 Ok(msg) => debug!("{msg}"),
                 Err(e) => debug!("update check failed: {e:#}"),
@@ -2392,7 +2407,8 @@ fn permission_problem(msg: &str) -> bool {
 fn tun_unavailable(msg: &str) -> bool {
     let missing = msg.contains("No such file") || msg.contains("No such device") || msg.contains("os error 2");
     // Not root on a normal machine is a mistake (sudo forgotten), not a reason to switch modes.
-    let root_or_container = unsafe { libc::geteuid() } == 0 || crate::userspace::in_container();
+    let root_or_container =
+        unsafe { libc::geteuid() } == 0 || crate::userspace::in_container() || crate::config::rootless();
     missing || (permission_problem(msg) && root_or_container)
 }
 
@@ -2440,6 +2456,51 @@ fn ssh_client_config(userspace: bool) {
     );
     if let Err(e) = std::fs::write(FILE, text) {
         debug!("writing {FILE}: {e}");
+    }
+}
+
+/// Rootless: the same for this user, as a marked block in ~/.ssh/config (system files are off
+/// limits). Kept up to date when the binary or directory moves.
+pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    const BEGIN: &str = "# >>> meshvpn (rootless userspace mode): ssh to *.mesh goes through meshvpn";
+    const END: &str = "# <<< meshvpn";
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let ssh_dir = PathBuf::from(home).join(".ssh");
+    let file = ssh_dir.join("config");
+    let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("meshvpn"));
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let block = format!(
+        "{BEGIN}\nHost *.mesh\n    ProxyCommand {} --dir {} nc %h %p\n{END}\n",
+        crate::agent::sh_quote(&exe.to_string_lossy()),
+        crate::agent::sh_quote(&dir.to_string_lossy())
+    );
+    let old = std::fs::read_to_string(&file).unwrap_or_default();
+    let block = if enable { block } else { String::new() };
+    let new = match (old.find(BEGIN), old.find(END)) {
+        (Some(b), Some(e)) if e > b => {
+            let end = old[e..].find('\n').map_or(old.len(), |n| e + n + 1);
+            format!("{}{block}{}", &old[..b], &old[end..])
+        }
+        _ if !enable => old.clone(),
+        _ if old.is_empty() || old.ends_with('\n') => format!("{old}{block}"),
+        _ => format!("{old}\n{block}"),
+    };
+    if new == old {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&ssh_dir);
+    let _ = std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700));
+    match std::fs::write(&file, new) {
+        Ok(()) => {
+            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+            if enable {
+                info!("ssh to <node>.mesh goes through meshvpn ({})", file.display());
+            }
+        }
+        Err(e) => warn!("writing {}: {e}", file.display()),
     }
 }
 

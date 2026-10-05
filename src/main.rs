@@ -32,9 +32,10 @@ use keys::{Identity, overlay_ip};
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Directory holding config and state.
-    #[arg(long, global = true, env = "MESHVPN_DIR", default_value = "/etc/meshvpn")]
-    dir: PathBuf,
+    /// Directory holding config and state [default: /etc/meshvpn as root, else
+    /// ~/.config/meshvpn for a rootless install, or /etc/meshvpn if only that exists].
+    #[arg(long, global = true, env = "MESHVPN_DIR")]
+    dir: Option<PathBuf>,
     /// Machine readable output (JSON on stdout, also for errors). Exit codes: 0 ok, 1 error,
     /// 2 usage, 3 meshvpn not running, 4 needs root, 5 node/rule not found.
     #[arg(long, global = true)]
@@ -519,7 +520,8 @@ fn say(json: bool, text: &str) {
 }
 
 fn real_main(cli: Cli) -> Result<i32> {
-    let dir = cli.dir;
+    let dir = cli.dir.unwrap_or_else(config::default_dir);
+    config::set_rootless(&dir);
     let json = cli.json;
     load_proxy_env(&dir);
     match cli.cmd {
@@ -571,15 +573,15 @@ fn real_main(cli: Cli) -> Result<i32> {
             let req = match cmd {
                 AdminCmd::Status => control::Request::AdminStatus,
                 AdminCmd::Enable => {
-                    require_root()?;
+                    require_owner()?;
                     control::Request::AdminEnable
                 }
                 AdminCmd::Add { node } => {
-                    require_root()?;
+                    require_owner()?;
                     control::Request::AdminChange { who: node, add: true }
                 }
                 AdminCmd::Rm { node } => {
-                    require_root()?;
+                    require_owner()?;
                     control::Request::AdminChange { who: node, add: false }
                 }
             };
@@ -620,7 +622,10 @@ fn real_main(cli: Cli) -> Result<i32> {
                         }
                     } else {
                         println!("open network: everybody with the network key may invite and ban.");
-                        println!("make it managed (this node becomes admin): sudo meshvpn admin enable");
+                        println!(
+                            "{}",
+                            config::hint("make it managed (this node becomes admin): sudo meshvpn admin enable")
+                        );
                     }
                 }
             }
@@ -717,7 +722,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Share { path, name } => {
-            require_root()?;
+            require_owner()?;
             let path = std::path::absolute(&path)?.to_string_lossy().into_owned();
             let req = control::Request::Share { path, name };
             if let control::Response::Message { text } =
@@ -739,7 +744,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Fetch { id, dest } => {
-            require_root()?;
+            require_owner()?;
             let dest = std::path::absolute(&dest)?.to_string_lossy().into_owned();
             let owner = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
             if !json {
@@ -782,7 +787,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Unshare { id } => {
-            require_root()?;
+            require_owner()?;
             tokio::runtime::Runtime::new()?
                 .block_on(control::request(&dir, &control::Request::Unshare { id: id.clone() }))?;
             say(json, &format!("no longer sharing {id}"));
@@ -810,7 +815,10 @@ fn real_main(cli: Cli) -> Result<i32> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else if objects.is_empty() {
-                println!("Nothing shared yet - share a file or directory with: sudo meshvpn share <path>");
+                println!(
+                    "{}",
+                    config::hint("Nothing shared yet - share a file or directory with: sudo meshvpn share <path>")
+                );
             } else {
                 println!("{:<32}  {:<24}  {:>9}  HOLDERS", "ID", "NAME", "SIZE");
                 for (o, h) in objects {
@@ -1004,7 +1012,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     return Ok(0);
                 }
             };
-            require_root()?;
+            require_owner()?;
             let tags: Vec<String> = if control::is_running(&dir) {
                 let req = control::Request::Tags { add, remove };
                 match tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))? {
@@ -1202,7 +1210,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Rename { name } => {
-            require_root()?;
+            require_owner()?;
             if control::is_running(&dir) {
                 let req = control::Request::Rename { name };
                 if let control::Response::Message { text } =
@@ -1246,7 +1254,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Update { check, force } => update_cmd(&dir, check, force, json)?,
         Cmd::Install => install(&dir)?,
-        Cmd::Uninstall => uninstall()?,
+        Cmd::Uninstall => uninstall(&dir)?,
     }
     Ok(0)
 }
@@ -1350,6 +1358,10 @@ fn enable_ssh_logins(cfg: &Config) {
     if cfg.ssh_allow_all.is_empty() && cfg.ssh_allow.is_empty() {
         return;
     }
+    if config::rootless() {
+        println!("note: password-less SSH logins into this node need meshvpn installed as root (sshd).\n");
+        return;
+    }
     match sshd::enable() {
         Ok(_) => println!(
             "Password-less SSH logins from mesh nodes are enabled ({}).\n",
@@ -1385,20 +1397,43 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
     println!();
     if std::os::unix::net::UnixStream::connect(control::socket_path(dir)).is_ok() {
         println!("meshvpn is still running with the previous configuration. Restart it:");
-        println!("  sudo systemctl restart meshvpn   # if installed as a service");
+        println!(
+            "{}",
+            config::hint("  sudo systemctl restart meshvpn   # if installed as a service")
+        );
         println!("  (or stop `meshvpn up` with Ctrl+C and start it again)");
         println!();
     }
     println!("Next steps:");
-    println!("  sudo meshvpn up          # run now, in the foreground");
-    println!("  sudo meshvpn install     # or: run in the background, also after reboot");
-    println!("  meshvpn status           # see who is connected");
+    println!("  {:<22} # run now, in the foreground", config::hint("sudo meshvpn up"));
+    println!(
+        "  {:<22} # or: run in the background, also after reboot",
+        config::hint("sudo meshvpn install")
+    );
+    println!("  {:<22} # see who is connected", "meshvpn status");
+    if config::rootless() {
+        println!();
+        println!("Rootless install (config in {}):", dir.display());
+        println!("  - mesh nodes reach the services listening on this machine");
+        println!("  - ssh user@<node>.mesh works directly (via ~/.ssh/config)");
+        println!(
+            "  - other programs reach the mesh through socks5h://{}",
+            cfg.socks_listen
+        );
+        println!(
+            "    e.g. ALL_PROXY=socks5h://{} curl http://<node>.mesh:8080",
+            cfg.socks_listen
+        );
+    }
     if let Some(t) = &cfg.ssh_tunnel {
         println!();
         println!("SSH tunnel notes:");
         println!(
-            "  - `sudo ssh -p {} {}` must work without a password (as root, or pass --ssh-identity).",
-            t.port, t.server
+            "  - `{}ssh -p {} {}` must work without a password (as {}, or pass --ssh-identity).",
+            if config::rootless() { "" } else { "sudo " },
+            t.port,
+            t.server,
+            if config::rootless() { "this user" } else { "root" }
         );
         if t.remote_port != 0 {
             println!("  - For other nodes to connect in, the SSH server needs `GatewayPorts clientspecified`");
@@ -1706,7 +1741,10 @@ fn print_status(st: &node::Status) {
         st.network
     );
     if let Some(v) = &st.update_available {
-        println!("  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - run: sudo meshvpn update");
+        println!(
+            "  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - run: {}",
+            config::hint("sudo meshvpn update")
+        );
     }
     if !st.banned.is_empty() {
         println!("  banned:       {}", st.banned.join(", "));
@@ -1792,9 +1830,20 @@ const BIN_PATH: &str = "/usr/local/bin/meshvpn";
 
 fn require_root() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
+        if config::rootless() {
+            bail!("this needs root (it changes the system, which a rootless install can't) - try again with sudo");
+        }
         bail!("this needs root - try again with sudo");
     }
     Ok(())
+}
+
+/// Root, or the user owning a rootless install.
+fn require_owner() -> Result<()> {
+    if config::rootless() {
+        return Ok(());
+    }
+    require_root()
 }
 
 fn systemctl(args: &[&str]) -> Result<()> {
@@ -1809,6 +1858,9 @@ fn systemctl(args: &[&str]) -> Result<()> {
 }
 
 fn install(dir: &Path) -> Result<()> {
+    if config::rootless() {
+        return install_user(dir);
+    }
     require_root()?;
     Config::load(dir)?; // fail early with a helpful message
     // Installed by a package manager or install.sh: use it where it is. Otherwise (e.g. run
@@ -1884,7 +1936,9 @@ fn stop_other_daemons() -> Vec<(i32, String)> {
         if !is_daemon_cmdline(&args) {
             continue;
         }
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            continue; // another user's (rootless) meshvpn
+        }
         for _ in 0..50 {
             if !Path::new(&format!("/proc/{pid}")).exists() {
                 break;
@@ -1900,13 +1954,215 @@ fn stop_other_daemons() -> Vec<(i32, String)> {
     stopped
 }
 
-fn uninstall() -> Result<()> {
+fn uninstall(dir: &Path) -> Result<()> {
+    if config::rootless() {
+        return uninstall_user(dir);
+    }
     require_root()?;
     let _ = systemctl(&["disable", "--now", "meshvpn"]);
     sshd::disable();
     std::fs::remove_file(UNIT_PATH).ok();
     let _ = systemctl(&["daemon-reload"]);
     println!("meshvpn service removed (configuration kept).");
+    Ok(())
+}
+
+const CRON_MARK: &str = "# meshvpn rootless";
+
+fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))
+}
+
+fn user_unit_path() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(x) => PathBuf::from(x),
+        None => home()?.join(".config"),
+    };
+    Ok(base.join("systemd/user/meshvpn.service"))
+}
+
+/// A systemd user manager this process can talk to (not in most containers).
+fn user_systemd() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn crontab_lines() -> Option<Vec<String>> {
+    let out = std::process::Command::new("crontab").arg("-l").output().ok()?;
+    // "no crontab for user" is an empty one; a missing crontab binary is None.
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.contains(CRON_MARK))
+            .map(String::from)
+            .collect(),
+    )
+}
+
+fn set_crontab(lines: &[String]) -> Result<()> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("crontab")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("running crontab")?;
+    let mut text = lines.join("\n");
+    text.push('\n');
+    child.stdin.take().unwrap().write_all(text.as_bytes())?;
+    if !child.wait()?.success() {
+        bail!("crontab failed");
+    }
+    Ok(())
+}
+
+/// `meshvpn install` without root: a systemd user service, or where there is none (containers)
+/// a background daemon plus an @reboot crontab entry.
+fn install_user(dir: &Path) -> Result<()> {
+    Config::load(dir)?;
+    let home = home()?;
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let permanent = [
+        Path::new("/usr"),
+        Path::new("/opt"),
+        &home.join(".local/bin"),
+        &home.join("bin"),
+    ];
+    let bin = if permanent.iter().any(|p| exe.starts_with(p)) {
+        exe
+    } else {
+        let bin = home.join(".local/bin/meshvpn");
+        std::fs::create_dir_all(bin.parent().unwrap())?;
+        std::fs::copy(&exe, &bin).with_context(|| format!("copying binary to {}", bin.display()))?;
+        bin
+    };
+    let dir = std::path::absolute(dir)?;
+    for (pid, cmd) in stop_other_daemons() {
+        println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
+    }
+    if user_systemd() {
+        let unit_path = user_unit_path()?;
+        std::fs::create_dir_all(unit_path.parent().unwrap())?;
+        let unit = format!(
+            "[Unit]\nDescription=meshvpn decentralized mesh VPN (rootless)\n\n\
+             [Service]\nExecStart={} --dir {} up\nRestart=always\nRestartSec=3\n\n\
+             [Install]\nWantedBy=default.target\n",
+            bin.display(),
+            dir.display()
+        );
+        std::fs::write(&unit_path, unit)?;
+        systemctl(&["--user", "daemon-reload"])?;
+        systemctl(&["--user", "enable", "meshvpn"])?;
+        systemctl(&["--user", "restart", "meshvpn"])?;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let active = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", "meshvpn"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !active {
+            bail!("the meshvpn user service did not start - see: journalctl --user -u meshvpn -n 20");
+        }
+        // Without lingering, user services only run while the user is logged in.
+        let user = agent::Remote::default_user();
+        let linger = std::process::Command::new("loginctl")
+            .args(["show-user", &user, "-p", "Linger", "--value"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+            || std::process::Command::new("loginctl")
+                .args(["--no-ask-password", "enable-linger", &user])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        println!("meshvpn is running as a user service (no root needed).");
+        if linger {
+            println!("  It starts at boot, also when you are not logged in.");
+        } else {
+            println!("  It runs while you are logged in. To start it at boot, an admin can run:");
+            println!("    sudo loginctl enable-linger {user}");
+        }
+        println!("  status: meshvpn status   logs: journalctl --user -u meshvpn -f");
+        return Ok(());
+    }
+    // No systemd for this user: start it in the background and again after reboot via cron.
+    let log = dir.join("meshvpn.log");
+    let cmd = format!("{} --dir {} up", bin.display(), dir.display());
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+    let mut c = std::process::Command::new(&bin);
+    c.arg("--dir")
+        .arg(&dir)
+        .arg("up")
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    c.spawn().context("starting meshvpn")?;
+    let mut running = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if control::is_running(&dir) {
+            running = true;
+            break;
+        }
+    }
+    if !running {
+        bail!("meshvpn did not start - see {}", log.display());
+    }
+    println!(
+        "meshvpn is running in the background (no root needed). Log: {}",
+        log.display()
+    );
+    let cron = crontab_lines().map(|mut lines| {
+        lines.push(format!("@reboot {cmd} >> {} 2>&1 {CRON_MARK}", log.display()));
+        set_crontab(&lines)
+    });
+    match cron {
+        Some(Ok(())) => println!("  It starts again at boot (crontab @reboot)."),
+        _ => println!(
+            "  It does not start by itself after a reboot (no systemd or cron here): run `meshvpn install` again."
+        ),
+    }
+    println!("  status: meshvpn status   stop: meshvpn uninstall");
+    Ok(())
+}
+
+fn uninstall_user(dir: &Path) -> Result<()> {
+    if let Ok(unit) = user_unit_path()
+        && unit.exists()
+    {
+        let _ = systemctl(&["--user", "disable", "--now", "meshvpn"]);
+        std::fs::remove_file(&unit).ok();
+        let _ = systemctl(&["--user", "daemon-reload"]);
+    }
+    if let Some(lines) = crontab_lines() {
+        let before = std::process::Command::new("crontab")
+            .arg("-l")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(CRON_MARK))
+            .unwrap_or(false);
+        if before {
+            let _ = set_crontab(&lines);
+        }
+    }
+    for (pid, cmd) in stop_other_daemons() {
+        println!("Stopped meshvpn (pid {pid}: {cmd}).");
+    }
+    node::user_ssh_config(dir, false);
+    println!(
+        "meshvpn stopped and removed from autostart (configuration kept in {}).",
+        dir.display()
+    );
     Ok(())
 }
 

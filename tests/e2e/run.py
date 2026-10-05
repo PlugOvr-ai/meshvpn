@@ -641,6 +641,60 @@ def test_install_proxy(lab):
     check(client.sh("cat /etc/meshvpn/proxy.env").count(proxy.c) == 2, "proxy not saved for meshvpn")
 
 
+@test
+def test_rootless(lab):
+    """install.sh --user as a normal user: no root anywhere, background daemon, mesh in and out."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    box = lab.node("box", [net], caps=False, install=False)
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    with tempfile.TemporaryDirectory() as d:
+        run(["cp", BINARY, f"{d}/meshvpn"])
+        name = "meshvpn-x86_64-unknown-linux-musl.tar.gz"
+        run(["tar", "-czf", f"{d}/{name}", "-C", d, "./meshvpn"])
+        digest = hashlib.sha256(open(f"{d}/{name}", "rb").read()).hexdigest()
+        open(f"{d}/{name}.sha256", "w").write(f"{digest}  {name}\n")
+        box.sh("mkdir -p /tmp/rel")
+        for f in (name, f"{name}.sha256"):
+            run(["docker", "cp", f"{d}/{f}", f"{box.c}:/tmp/rel/{f}"])
+    run(["docker", "cp", INSTALL_SH, f"{box.c}:/tmp/install.sh"])
+    box.sh("chmod -R a+rX /tmp/rel /tmp/install.sh")
+    out = box.sh(f"MESHVPN_DOWNLOAD_URL=file:///tmp/rel sh /tmp/install.sh --user join {invite(hub)} --name box",
+                 user="agent")
+    check("Rootless install" in out and "running in the background" in out, out)
+    check(box.sh("test -e /etc/meshvpn -o -e /usr/local/bin/meshvpn && echo root || echo clean").strip() == "clean",
+          "a rootless install must not touch system paths")
+    mv = "/home/agent/.local/bin/meshvpn"
+    check(box.sh(f"{mv} status", user="agent", ok=False).returncode == 0, "status as the user")
+    wait(lambda: hub.online("box"), "box online at hub")
+    st = json.loads(box.sh(f"{mv} --json status", user="agent"))
+    check(st.get("socks"), "rootless node should run in userspace mode")
+    # mesh -> services of the user, user -> mesh via SOCKS and ssh
+    box.sh("mkdir -p ~/srv && echo hello-rootless > ~/srv/index.html && "
+           "(cd ~/srv && python3 -m http.server 8080 >/dev/null 2>&1 &)", user="agent")
+    hub.sh("mkdir -p /srv && echo hello-hub > /srv/index.html && (cd /srv && python3 -m http.server 8000 >/dev/null 2>&1 &)")
+    wait(lambda: "hello-rootless" in hub.sh("curl -s -m5 http://box.mesh:8080/", ok=False).stdout,
+         "http into the rootless node", 20)
+    check("hello-hub" in box.sh("curl -s -m5 -x socks5h://127.0.0.1:1055 http://hub.mesh:8000/", user="agent"),
+          "SOCKS out of the rootless node")
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+    p = box.sh(f"ssh {o} nobody@hub.mesh true", user="agent", ok=False)
+    check("Permission denied" in p.stderr, f"ssh to hub.mesh should reach its sshd: {p.stderr}")
+    # the owner may do what used to need root; system changes still need root
+    box.sh(f"{mv} rename box2", user="agent")
+    wait(lambda: hub.online("box2"), "rename seen by hub", 30)
+    p = box.sh(f"{mv} ssh allow everyone --as agent", user="agent", ok=False)
+    check(p.returncode != 0 and "root" in p.stderr, f"ssh allow should need root: {p.stderr}")
+    doc = box.sh(f"{mv} doctor", user="agent", ok=False).stdout
+    check("rootless install" in doc and "sudo" not in doc, doc)
+    box.sh(f"{mv} uninstall", user="agent")
+    check(box.sh(f"{mv} status", user="agent", ok=False).returncode == 3, "uninstall should stop it")
+    check("meshvpn" not in box.sh("cat ~/.ssh/config 2>/dev/null; true", user="agent"), "ssh config block removed")
+    box.sh(f"{mv} install", user="agent")
+    wait(lambda: hub.online("box2"), "back after install", 30)
+
+
 # =============================================================================================
 
 
