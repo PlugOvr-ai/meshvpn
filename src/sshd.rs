@@ -64,6 +64,15 @@ fn reload() {
 
 /// Installs the drop-in (once) and makes sure sshd actually uses it. Returns true if it
 /// had to be set up now.
+/// Sets up sshd where there is one to set up; without an sshd (or rootless) the built-in SSH
+/// server applies the rules by itself. Returns true if sshd was changed.
+pub fn enable_if_installed() -> Result<bool> {
+    if crate::config::rootless() || !crate::sshserver::sshd_installed() {
+        return Ok(false);
+    }
+    enable()
+}
+
 pub fn enable() -> Result<bool> {
     let sshd = sshd_binary()?;
     let exe = trusted_exe()?;

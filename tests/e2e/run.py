@@ -141,7 +141,7 @@ class Lab:
         self.networks.append(full)
         return full
 
-    def node(self, name, networks, caps=True, sysctls=(), ip=None, install=True, net_admin=False):
+    def node(self, name, networks, caps=True, sysctls=(), ip=None, install=True, net_admin=False, cmd=None):
         c = f"{self.prefix}-{name}"
         args = ["docker", "run", "-d", "--name", c, "--hostname", name, "--network", networks[0]]
         if ip:
@@ -152,7 +152,7 @@ class Lab:
             args += ["--cap-add", "NET_ADMIN"]
         for s in sysctls:
             args += ["--sysctl", s]
-        run(args + [IMAGE])
+        run(args + [IMAGE] + (cmd or []))
         self.containers.append(c)
         for n in networks[1:]:
             run(["docker", "network", "connect", n, c])
@@ -642,11 +642,81 @@ def test_install_proxy(lab):
 
 
 @test
+def test_builtin_ssh(lab):
+    """No sshd in the container: meshvpn's own SSH server - logins, pty, exit codes, sftp/scp, -L, exec/cp."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    # userspace mode without any sshd process (and without OpenSSH's sftp-server: ours is used)
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])
+    box.sh("rm -f /usr/lib/openssh/sftp-server")
+    # kernel mode, sshd not even installed
+    kbox = lab.node("kbox", [net], cmd=["sleep", "infinity"])
+    kbox.sh("rm -f /usr/sbin/sshd")
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    for n in (box, kbox):
+        n.mv(f"join {invite(hub)} --name {n.name} --ssh-allow-all agent")
+        n.up()
+        wait(lambda n=n: n.status().get("ssh_server") == "built-in", f"{n.name}: built-in ssh server active")
+        wait(lambda n=n: "agent@hub" in n.mv("ssh-authorized-keys agent", ok=False).stdout or n.peer("hub")
+             and n.peer("hub")["online"], f"{n.name} knows hub", 60)
+    for n in ("box", "kbox"):
+        wait(lambda n=n: f"{n}.mesh" in hub.sh("cat /var/lib/meshvpn/known_hosts 2>/dev/null; true"),
+             f"hub learns {n}'s host key", 60)
+    # StrictHostKeyChecking=yes: only works because the host keys came with the records
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8"
+
+    def ssh(target, cmd, user="agent", ok=False, input=None):
+        return hub.sh(f"ssh {o} {target} {cmd}", user=user, ok=ok, input=input)
+
+    for n in ("box", "kbox"):
+        p = ssh(f"agent@{n}.mesh", "whoami")
+        check(p.returncode == 0 and p.stdout.strip() == "agent", f"login to {n}: {p.stdout} {p.stderr}")
+    p = ssh("root@box.mesh", "whoami")
+    check(p.returncode != 0 and "root" not in p.stdout, "root must not be allowed")
+    check(ssh("agent@box.mesh", "'exit 7'").returncode == 7, "exit code")
+    check(ssh("agent@box.mesh", "cat", input="through stdin\n").stdout == "through stdin\n", "stdin")
+    p = ssh("agent@box.mesh", "'echo out; echo err >&2'")
+    check(p.stdout.strip() == "out" and p.stderr.strip() == "err", f"stdout/stderr: {p.stdout!r} {p.stderr!r}")
+    env = ssh("agent@box.mesh", "'echo $HOME $USER; echo $SSH_CONNECTION'").stdout.split("\n")
+    check(env[0] == "/home/agent agent" and env[1].startswith(hub.ip()), f"environment: {env}")
+    p = ssh("-tt agent@box.mesh", "'tty; stty size'")
+    check("/dev/pts/" in p.stdout, f"pty: {p.stdout!r} {p.stderr!r}")
+    # scp (sftp protocol) both ways, sftp batch
+    hub.sh("head -c 5000000 /dev/urandom > ~/blob", user="agent")
+    want = hub.sh("sha256sum ~/blob | cut -c1-16", user="agent").strip()
+    hub.sh(f"scp {o} ~/blob agent@box.mesh:/home/agent/up.bin", user="agent")
+    check(box.sh("sha256sum /home/agent/up.bin | cut -c1-16").strip() == want, "scp upload corrupted")
+    check(box.sh("stat -c %U /home/agent/up.bin").strip() == "agent", "uploaded file must belong to agent")
+    hub.sh(f"scp {o} agent@box.mesh:/home/agent/up.bin ~/down.bin", user="agent")
+    check(hub.sh("sha256sum ~/down.bin | cut -c1-16", user="agent").strip() == want, "scp download corrupted")
+    out = hub.sh(f"sftp {o} -b - agent@box.mesh", user="agent",
+                 input="mkdir d1\nrename up.bin d1/x.bin\nls d1\nrm d1/x.bin\nrmdir d1\n")
+    check("d1/x.bin" in out, f"sftp: {out}")
+    # -L forwarding to a service that only listens on the box's loopback
+    box.sh("mkdir -p /srv && echo via-forward > /srv/index.html && "
+           "(cd /srv && python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &)")
+    time.sleep(1)
+    hub.sh(f"ssh {o} -f -N -L 9090:127.0.0.1:8080 agent@box.mesh", user="agent")
+    wait(lambda: "via-forward" in hub.sh("curl -s -m5 http://127.0.0.1:9090/", ok=False).stdout, "-L forward", 15)
+    hub.sh("pkill -f '^ssh .*-L 9090' ; true")
+    # meshvpn exec and cp ride on it
+    r = hub.mvj("exec box kbox -- hostname", user="agent")
+    check(r["ok"] and sorted(x["stdout"].strip() for x in r["results"]) == ["box", "kbox"], f"exec: {r}")
+    hub.sh("mkdir -p proj && head -c 2000000 /dev/urandom > proj/w.bin", user="agent")
+    hub.mv("cp ./proj kbox:/home/agent/runs/", user="agent")
+    check(sha(kbox, "/home/agent/runs/proj") == sha(hub, "proj", user="agent"), "cp over the built-in server")
+    doc = box.mv("doctor", ok=False).stdout
+    check("built-in SSH server" in doc, doc)
+
+
+@test
 def test_rootless(lab):
     """install.sh --user as a normal user: no root anywhere, background daemon, mesh in and out."""
     net = lab.network("net")
     hub = lab.node("hub", [net])
-    box = lab.node("box", [net], caps=False, install=False)
+    box = lab.node("box", [net], caps=False, install=False, cmd=["sleep", "infinity"])  # no sshd at all
     hub.mv(f"init --name hub --endpoint {hub.c}:7870")
     hub.up()
     with tempfile.TemporaryDirectory() as d:
@@ -684,8 +754,15 @@ def test_rootless(lab):
     # the owner may do what used to need root; system changes still need root
     box.sh(f"{mv} rename box2", user="agent")
     wait(lambda: hub.online("box2"), "rename seen by hub", 30)
-    p = box.sh(f"{mv} ssh allow everyone --as agent", user="agent", ok=False)
-    check(p.returncode != 0 and "root" in p.stderr, f"ssh allow should need root: {p.stderr}")
+    # password-less logins without root: the built-in SSH server, as this user only
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    box.sh(f"{mv} ssh allow agent@hub --as agent", user="agent")
+    box.sh(f"{mv} ssh allow agent@hub --as root", user="agent")
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8"
+    wait(lambda: hub.sh(f"ssh {o} agent@box2.mesh whoami", user="agent", ok=False).stdout.strip() == "agent",
+         "login to the rootless node", 60)
+    check(hub.sh(f"ssh {o} root@box2.mesh whoami", user="agent", ok=False).stdout.strip() != "root",
+          "a rootless node must not log anyone in as root")
     doc = box.sh(f"{mv} doctor", user="agent", ok=False).stdout
     check("rootless install" in doc and "sudo" not in doc, doc)
     box.sh(f"{mv} uninstall", user="agent")

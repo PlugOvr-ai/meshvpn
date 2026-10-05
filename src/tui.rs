@@ -204,7 +204,7 @@ impl App {
         let rules = self.rules();
         let allow_all = self.allow_all();
         if !rules.is_empty() || !allow_all.is_empty() {
-            crate::sshd::enable()?;
+            crate::sshd::enable_if_installed()?;
         }
         rt.block_on(control::request(dir, &Request::SshSetRules { rules, allow_all }))?;
         self.saved = self.checked.clone();

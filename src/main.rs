@@ -15,6 +15,7 @@ mod proto;
 mod share;
 mod ssh;
 mod sshd;
+mod sshserver;
 mod tui;
 mod update;
 mod userspace;
@@ -228,6 +229,9 @@ enum Cmd {
     },
     /// Connect stdin/stdout to HOST:PORT in the mesh (for ssh's ProxyCommand in userspace mode).
     Nc { host: String, port: u16 },
+    /// SFTP on stdin/stdout (started by the built-in SSH server as the logged-in user).
+    #[command(hide = true)]
+    SftpServer,
     /// Used by sshd (AuthorizedKeysCommand): prints the keys that may log in as USER.
     #[command(hide = true)]
     SshAuthorizedKeys { user: String },
@@ -1147,14 +1151,14 @@ fn real_main(cli: Cli) -> Result<i32> {
             println!("Check with: meshvpn status");
         }
         Cmd::Ssh { cmd: None } if unsafe { libc::isatty(1) } == 1 => {
-            require_root()?;
+            require_owner()?;
             tui::run(&dir)?;
         }
         Cmd::Ssh { cmd } => {
             let req = match cmd.unwrap_or(SshCmd::List) {
                 SshCmd::Allow { who, users } => {
-                    require_root()?;
-                    if sshd::enable()? {
+                    require_owner()?;
+                    if sshd::enable_if_installed()? {
                         println!(
                             "Enabled password-less logins from mesh nodes in sshd ({}).",
                             sshd::DROPIN
@@ -1163,7 +1167,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     control::Request::SshAllow { who, users }
                 }
                 SshCmd::Deny { who, users } => {
-                    require_root()?;
+                    require_owner()?;
                     control::Request::SshDeny { who, users }
                 }
                 SshCmd::List => control::Request::SshList,
@@ -1174,6 +1178,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 println!("{}", text.trim_end());
             }
         }
+        Cmd::SftpServer => sshserver::sftp_server()?,
         Cmd::Nc { host, port } => {
             let rt = tokio::runtime::Runtime::new()?;
             // Through the userspace stack if meshvpn runs in that mode, directly otherwise.
@@ -1358,11 +1363,11 @@ fn enable_ssh_logins(cfg: &Config) {
     if cfg.ssh_allow_all.is_empty() && cfg.ssh_allow.is_empty() {
         return;
     }
-    if config::rootless() {
-        println!("note: password-less SSH logins into this node need meshvpn installed as root (sshd).\n");
-        return;
-    }
-    match sshd::enable() {
+    match sshd::enable_if_installed() {
+        Ok(false) if config::rootless() || !sshserver::sshd_installed() => println!(
+            "Password-less SSH logins from mesh nodes go to meshvpn's built-in SSH server{}.\n",
+            if config::rootless() { " (as this user only)" } else { "" }
+        ),
         Ok(_) => println!(
             "Password-less SSH logins from mesh nodes are enabled ({}).\n",
             sshd::DROPIN
@@ -1761,6 +1766,12 @@ fn print_status(st: &node::Status) {
     if let Some(s) = &st.socks {
         println!("  mode:         userspace (no TUN device) - programs reach the mesh via socks5h://{s}");
     }
+    if st.ssh_server.as_deref() == Some("built-in") {
+        println!(
+            "  ssh server:   built-in (ssh <user>@{}.mesh, logins: meshvpn ssh list)",
+            st.name
+        );
+    }
     if let Some(o) = &st.outbound_via {
         println!("  outgoing via: {o}");
     }
@@ -1961,6 +1972,7 @@ fn uninstall(dir: &Path) -> Result<()> {
     require_root()?;
     let _ = systemctl(&["disable", "--now", "meshvpn"]);
     sshd::disable();
+    node::remove_ssh_client_config();
     std::fs::remove_file(UNIT_PATH).ok();
     let _ = systemctl(&["daemon-reload"]);
     println!("meshvpn service removed (configuration kept).");

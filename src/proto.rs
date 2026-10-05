@@ -149,6 +149,10 @@ pub struct NodeInfo {
     /// GPU reservations on this node (granted by this node, so they can't collide).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leases: Vec<Lease>,
+    /// Host key of the SSH server answering on port 22 here (`ssh-ed25519 AAAA...`), so other
+    /// nodes can trust it without asking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_host_key: Option<String>,
 }
 
 /// GPUs of a node reserved for someone until `expires` (ms since epoch).
@@ -475,6 +479,7 @@ mod tests {
             measured: 0,
             objects: vec![],
             leases: vec![],
+            ssh_host_key: None,
             version: String::new(),
         }
     }

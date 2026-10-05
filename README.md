@@ -147,9 +147,10 @@ marked `Host *.mesh` block in `~/.ssh/config`). It runs in userspace mode (above
 reach your services, you reach the mesh through `ssh user@node.mesh` or the SOCKS proxy. `meshvpn install` starts it as a
 **systemd user service** (to keep it running when you are logged out an admin can run `sudo loginctl enable-linger
 <user>`), or, where there is no systemd (containers), in the background with a `@reboot` crontab entry. `meshvpn status`,
-`rename`, `tags`, `share`, `invite`, `update` (auto-updates too) and `uninstall` work without sudo. What a rootless install
-can't do: write `/etc/hosts` (names work through ssh and the proxy only) and set up sshd for password-less logins *into*
-this machine. Only one rootless install per machine can use the default ports.
+`rename`, `tags`, `share`, `invite`, `ssh allow`, `update` (auto-updates too) and `uninstall` work without sudo.
+Password-less logins *into* the machine go to meshvpn's built-in SSH server (below), as your own user only. What a
+rootless install can't do: write `/etc/hosts` (names work through ssh and the proxy only). Only one rootless install per
+machine can use the default ports.
 
 ## Password-less SSH between nodes
 
@@ -197,6 +198,25 @@ OpenSSH server ask meshvpn for additional keys at each login. meshvpn answers on
 to `from="<that node's mesh IP>"`, which meshvpn guarantees can't be spoofed. Rules are bound to the node's identity,
 not its name. Your other SSH settings and existing logins stay as they are. Needs OpenSSH with `sshd_config.d` support
 (Debian/Ubuntu/Fedora); a user without a key creates one with `ssh-keygen`.
+
+### Machines without an SSH server (built-in SSH server)
+
+Most Docker images have no sshd. meshvpn then answers `ssh user@node.mesh` itself, with the same rules as above
+(`meshvpn ssh allow`, `--ssh-allow-all`): nothing to install in the image. It supports interactive shells with a
+terminal, commands (exit codes, stdin/stdout/stderr), `scp`/`sftp`, `-L` port forwarding, and therefore `meshvpn
+exec`/`cp`/`launch`. Sessions get the container's environment (PATH, CUDA, conda... from the image). `meshvpn status`
+shows `ssh server: built-in` when it is active.
+
+* It is only reachable through the mesh, and only keys you allowed get in, each only from its own node.
+* As root it logs users in as themselves; a rootless install can only log in its own user.
+* **When:** `ssh_server = "auto"` (default) uses it where no sshd serves port 22: in userspace mode when nothing
+  listens on port 22, in kernel mode when no sshd is installed (so an sshd starting later never finds its port taken).
+  `"always"` / `"never"` in the config force it on or off.
+* **No host key prompts:** every node publishes the host key of whatever answers SSH there (the built-in server's key is
+  derived from the node identity; for sshd its ed25519 host key), and meshvpn keeps them in
+  `/var/lib/meshvpn/known_hosts`, which ssh reads through `/etc/ssh/ssh_config.d/meshvpn.conf`. `ssh` to a mesh node
+  doesn't ask "are you sure?" and works with `StrictHostKeyChecking=yes`.
+* Not supported: agent and X11 forwarding, `-R` remote forwarding.
 
 ## AI agents and multi-node work
 

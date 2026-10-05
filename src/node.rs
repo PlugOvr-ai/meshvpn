@@ -141,6 +141,9 @@ struct State {
     my_signed: Option<SignedInfo>,
     my_endpoints: Vec<String>,
     hosts_written: String,
+    known_hosts_written: String,
+    /// Host key of whatever answers SSH here (published in our record).
+    my_ssh_host_key: Option<String>,
     update_available: Option<String>,
     forgotten: HashMap<NodeId, Forget>,
     /// Network keys by version; `key_version` is the current one.
@@ -194,6 +197,10 @@ pub struct Node {
     pub shares: crate::share::Store,
     /// Direct UDP paths (None: disabled, or no way out over UDP).
     udp: Option<Arc<tokio::net::UdpSocket>>,
+    /// The built-in SSH server (see sshserver.rs).
+    ssh_cfg: Arc<russh::server::Config>,
+    /// Kernel mode: the built-in SSH server listens on the mesh address.
+    ssh_listening: std::sync::atomic::AtomicBool,
 }
 
 /// A link that finished the handshake and hello exchange and is registered.
@@ -245,6 +252,9 @@ pub struct Status {
     /// Userspace mode: the SOCKS proxy programs use to reach the mesh.
     #[serde(default)]
     pub socks: Option<String>,
+    /// Who answers `ssh user@<this node>.mesh`: "built-in", "sshd" or none.
+    #[serde(default)]
+    pub ssh_server: Option<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -324,6 +334,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
 
     let socks = cfg.effective_socks();
     let udp = udp::bind(&cfg).await;
+    let ident_for_ssh = Identity::from_config(&cfg)?;
     let node = Arc::new(Node {
         dir: dir.clone(),
         ident,
@@ -336,6 +347,8 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         socks,
         shares: crate::share::Store::load(&dir),
         udp,
+        ssh_cfg: crate::sshserver::config(&ident_for_ssh),
+        ssh_listening: std::sync::atomic::AtomicBool::new(false),
         cfg,
     });
 
@@ -388,7 +401,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     );
 
     if !node.cfg.ssh_allow.is_empty() || !node.cfg.ssh_allow_all.is_empty() {
-        match crate::sshd::enable() {
+        match crate::sshd::enable_if_installed() {
             Ok(true) => info!(
                 "enabled password-less SSH logins from mesh nodes in sshd ({})",
                 crate::sshd::DROPIN
@@ -452,6 +465,10 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
             ssh_client_config(false);
         }
     }
+    if node.cfg.ssh_server != crate::config::SshServer::Never && matches!(node.io, PacketIo::Tun(_)) {
+        tokio::spawn(node.clone().ssh_listen_loop());
+    }
+    node.ssh_check();
     tokio::spawn(node.clone().tick_loop());
     tokio::spawn(node.clone().update_loop());
     tokio::spawn(node.clone().inventory_loop());
@@ -545,6 +562,7 @@ impl Node {
             objects: st.objects_ad.clone(),
             udp: st.my_udp.clone(),
             leases: st.leases.clone(),
+            ssh_host_key: st.my_ssh_host_key.clone(),
             measured: st.measured,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
@@ -672,6 +690,115 @@ impl Node {
     }
 
     // ----------------------------------------------------------------------------- ssh logins
+
+    /// Settings of the built-in SSH server.
+    pub fn ssh_config(&self) -> Arc<russh::server::Config> {
+        self.ssh_cfg.clone()
+    }
+
+    /// Userspace mode: whether the built-in SSH server takes connections to port 22 (decided
+    /// per connection: an sshd that starts later takes over).
+    pub fn ssh_builtin_userspace(&self) -> bool {
+        use crate::config::SshServer;
+        match self.cfg.ssh_server {
+            SshServer::Always => true,
+            SshServer::Auto => !crate::userspace::listening_locally(22),
+            SshServer::Never => false,
+        }
+    }
+
+    /// Who answers port 22 here, published with our record (host key) - checked regularly.
+    fn ssh_check(&self) {
+        let builtin = match self.io {
+            PacketIo::Userspace(_) => self.ssh_builtin_userspace(),
+            PacketIo::Tun(_) => self.ssh_listening.load(Ordering::Relaxed),
+        };
+        let key = if builtin {
+            Some(crate::sshserver::host_key_line(&self.ident))
+        } else if crate::userspace::listening_locally(22) {
+            crate::sshserver::sshd_host_key()
+        } else {
+            None
+        };
+        let mut st = self.state.lock().unwrap();
+        if st.my_ssh_host_key != key {
+            if builtin && st.my_ssh_host_key.is_none() {
+                info!(
+                    "built-in SSH server active: ssh <user>@{}.mesh (logins as set with meshvpn ssh allow)",
+                    st.my_name
+                );
+            }
+            st.my_ssh_host_key = key;
+            if st.my_signed.is_some() {
+                self.announce(&mut st);
+            }
+        }
+    }
+
+    /// Kernel mode: listen on the mesh address, port 22, if there is no sshd to do it (auto)
+    /// or always (if the port is free). Retried, e.g. until the interface has its address.
+    async fn ssh_listen_loop(self: Arc<Self>) {
+        use crate::config::SshServer;
+        let mut warned = false;
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let wanted = match self.cfg.ssh_server {
+                SshServer::Always => true,
+                // An sshd starting after us would fail to bind 0.0.0.0:22: never take the port
+                // where one is installed.
+                _ => !crate::sshserver::sshd_installed() && !crate::userspace::listening_locally(22),
+            };
+            if wanted {
+                match tokio::net::TcpListener::bind((self.my_ip, 22)).await {
+                    Ok(l) => {
+                        self.ssh_listening.store(true, Ordering::Relaxed);
+                        self.ssh_check();
+                        crate::sshserver::listen(self.clone(), l).await;
+                    }
+                    Err(e) if !warned => {
+                        let msg = format!("built-in SSH server: cannot listen on {}:22: {e} (retrying)", self.my_ip);
+                        if self.cfg.ssh_server == SshServer::Always {
+                            warn!("{msg}");
+                        } else {
+                            info!("{msg}");
+                        }
+                        warned = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let pause = if attempts < 12 { 5 } else { 30 };
+            tokio::time::sleep(Duration::from_secs(pause)).await;
+        }
+    }
+
+    /// May the key `key` log in as `user`, coming from mesh address `ip`? Same rules as for
+    /// sshd (authorized_keys below). Returns `user@node` of the matching key.
+    pub fn ssh_login_allowed(&self, user: &str, ip: Ipv4Addr, key: &russh::keys::PublicKey) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        let everyone = st.ssh_allow_all.iter().any(|u| u == user);
+        let rec = st.records.values().find(|r| overlay_ip(&r.info.id) == ip)?;
+        if st.banned.contains_key(&rec.info.id) {
+            return None;
+        }
+        let rules: Vec<_> = st
+            .ssh_allow
+            .iter()
+            .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
+            .collect();
+        for k in &rec.info.ssh_keys {
+            if !(everyone || rules.iter().any(|r| r.from_user.as_ref().is_none_or(|u| *u == k.user))) {
+                continue;
+            }
+            if let Ok(pk) = russh::keys::PublicKey::from_openssh(&k.key)
+                && pk.key_data() == key.key_data()
+            {
+                return Some(format!("{}@{}", k.user, rec.info.name));
+            }
+        }
+        None
+    }
 
     /// What sshd asks (AuthorizedKeysCommand): keys that may log in as local `user`, each
     /// pinned to its node's mesh IP (which meshvpn guarantees can't be spoofed).
@@ -1872,6 +1999,9 @@ impl Node {
             for (key, addrs, boot) in dials {
                 tokio::spawn(self.clone().dial(key, addrs, boot));
             }
+            if ticks.is_multiple_of(6) {
+                self.ssh_check();
+            }
             self.update_hosts();
             if ticks.is_multiple_of(6) {
                 self.save_state();
@@ -1898,7 +2028,66 @@ impl Node {
         }
     }
 
+    /// Host keys of the nodes (as they publish them) for ssh clients, under the same names as
+    /// in /etc/hosts.
+    fn update_known_hosts(&self) {
+        let mut st = self.state.lock().unwrap();
+        let mut recs: Vec<_> = st.records.values().collect();
+        recs.sort_by_key(|r| {
+            (
+                !self.is_online(&st, &r.info.id),
+                std::cmp::Reverse(r.info.seq),
+                r.info.id,
+            )
+        });
+        let mut used = HashSet::from([st.my_name.clone()]);
+        let mut entries = vec![(st.my_name.clone(), self.my_ip, st.my_ssh_host_key.clone())];
+        for r in recs {
+            let name = if used.insert(r.info.name.clone()) {
+                r.info.name.clone()
+            } else {
+                format!("{}-{}", r.info.name, r.info.id.short())
+            };
+            entries.push((name, overlay_ip(&r.info.id), r.info.ssh_host_key.clone()));
+        }
+        let mut text = String::new();
+        for (name, ip, key) in entries {
+            let Some(key) = key.filter(|k| k.starts_with("ssh-") && !k.contains('\n')) else {
+                continue;
+            };
+            // Plain names only where /etc/hosts maps them to the mesh (else they may be LAN hosts).
+            let plain = if self.cfg.manage_hosts {
+                format!(",{name}")
+            } else {
+                String::new()
+            };
+            text.push_str(&format!("{name}.mesh,{ip}{plain} {key}\n"));
+        }
+        if text == st.known_hosts_written {
+            return;
+        }
+        let path = known_hosts_path(&self.dir);
+        let write = || -> std::io::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &text)?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+            std::fs::rename(&tmp, &path)
+        };
+        match write() {
+            Ok(()) => st.known_hosts_written = text,
+            Err(e) => {
+                debug!("writing {}: {e}", path.display());
+                st.known_hosts_written = text;
+            }
+        }
+    }
+
     fn update_hosts(&self) {
+        self.update_known_hosts();
         if !self.cfg.manage_hosts {
             return;
         }
@@ -1993,6 +2182,13 @@ impl Node {
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
             socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
+            ssh_server: st.my_ssh_host_key.as_ref().map(|k| {
+                if *k == crate::sshserver::host_key_line(&self.ident) {
+                    "built-in".to_string()
+                } else {
+                    "sshd".to_string()
+                }
+            }),
             tags: st.my_tags.clone(),
             inventory: st.inventory.clone(),
             lan: crate::net::local_lans()
@@ -2435,27 +2631,46 @@ fn tun_error(cfg: &Config, msg: &str) -> anyhow::Error {
     }
 }
 
-/// In userspace mode, `ssh user@host.mesh` has to go through meshvpn: an ssh client drop-in
-/// does that transparently. In kernel mode it is removed again.
-fn ssh_client_config(userspace: bool) {
-    const FILE: &str = "/etc/ssh/ssh_config.d/meshvpn.conf";
-    if !userspace {
-        if std::fs::read_to_string(FILE).is_ok_and(|t| t.contains("Managed by meshvpn")) {
-            let _ = std::fs::remove_file(FILE);
-        }
-        return;
+const SSH_CLIENT_DROPIN: &str = "/etc/ssh/ssh_config.d/meshvpn.conf";
+
+/// Where the host keys of the mesh nodes are kept for ssh clients.
+fn known_hosts_path(dir: &std::path::Path) -> PathBuf {
+    if crate::config::rootless() {
+        dir.join("known_hosts")
+    } else {
+        PathBuf::from("/var/lib/meshvpn/known_hosts")
     }
+}
+
+/// An ssh client drop-in: mesh host keys are known (no "are you sure" prompts), and in
+/// userspace mode `ssh user@host.mesh` goes through meshvpn.
+fn ssh_client_config(userspace: bool) {
     if !std::path::Path::new("/etc/ssh/ssh_config.d").is_dir() {
         return;
     }
-    let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/meshvpn"));
-    let text = format!(
-        "# Managed by meshvpn (userspace mode): ssh to *.mesh hosts goes through meshvpn.\n\
-         Host *.mesh\n    ProxyCommand {} nc %h %p\n",
-        exe.display()
+    let mut text = String::from(
+        "# Managed by meshvpn: host keys of the mesh nodes are known.\n\
+         Host *\n    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2 /var/lib/meshvpn/known_hosts\n",
     );
-    if let Err(e) = std::fs::write(FILE, text) {
-        debug!("writing {FILE}: {e}");
+    if userspace {
+        let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/meshvpn"));
+        text.push_str(&format!(
+            "# Userspace mode: ssh to *.mesh hosts goes through meshvpn.\nHost *.mesh\n    ProxyCommand {} nc %h %p\n",
+            crate::agent::sh_quote(&exe.to_string_lossy())
+        ));
+    }
+    if std::fs::read_to_string(SSH_CLIENT_DROPIN).is_ok_and(|t| t == text) {
+        return;
+    }
+    if let Err(e) = std::fs::write(SSH_CLIENT_DROPIN, text) {
+        debug!("writing {SSH_CLIENT_DROPIN}: {e}");
+    }
+}
+
+/// `meshvpn uninstall`: remove the ssh client drop-in again.
+pub fn remove_ssh_client_config() {
+    if std::fs::read_to_string(SSH_CLIENT_DROPIN).is_ok_and(|t| t.contains("Managed by meshvpn")) {
+        let _ = std::fs::remove_file(SSH_CLIENT_DROPIN);
     }
 }
 
@@ -2473,9 +2688,10 @@ pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
     let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("meshvpn"));
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let block = format!(
-        "{BEGIN}\nHost *.mesh\n    ProxyCommand {} --dir {} nc %h %p\n{END}\n",
+        "{BEGIN}\nHost *.mesh\n    ProxyCommand {} --dir {} nc %h %p\n    UserKnownHostsFile ~/.ssh/known_hosts {}\n{END}\n",
         crate::agent::sh_quote(&exe.to_string_lossy()),
-        crate::agent::sh_quote(&dir.to_string_lossy())
+        crate::agent::sh_quote(&dir.to_string_lossy()),
+        crate::agent::sh_quote(&known_hosts_path(&dir).to_string_lossy())
     );
     let old = std::fs::read_to_string(&file).unwrap_or_default();
     let block = if enable { block } else { String::new() };

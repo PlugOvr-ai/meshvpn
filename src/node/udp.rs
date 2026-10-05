@@ -374,6 +374,7 @@ mod tests {
             measured: 0,
             objects: vec![],
             leases: vec![],
+            ssh_host_key: None,
         };
         let c: Vec<String> = Node::peer_candidates(&info).iter().map(|a| a.to_string()).collect();
         assert!(c.contains(&"192.168.10.3:7870".to_string()));

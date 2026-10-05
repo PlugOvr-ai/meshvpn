@@ -43,9 +43,13 @@ pub enum Cmd {
     LocalReady {
         handle: SocketHandle,
         id: u64,
-        stream: Option<TcpStream>,
+        stream: Option<Box<dyn LocalStream>>,
     },
 }
+
+/// The local end of a connection: a socket to a local service, or the built-in SSH server.
+pub trait LocalStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> LocalStream for T {}
 
 pub type StackTx = mpsc::UnboundedSender<Cmd>;
 
@@ -136,8 +140,8 @@ impl Conn {
 }
 
 /// Copies between a local socket and the stack; `wake` tells the stack there is work.
-fn bridge(stream: TcpStream, wake: Arc<Notify>) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
-    let (mut r, mut w) = stream.into_split();
+fn bridge(stream: Box<dyn LocalStream>, wake: Arc<Notify>) -> (mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+    let (mut r, mut w) = tokio::io::split(stream);
     let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
     let wake_r = wake.clone();
@@ -182,7 +186,7 @@ fn new_socket() -> tcp::Socket<'static> {
 
 /// Is a service listening on `port` here (on all addresses or loopback)? Otherwise the stack
 /// answers the SYN with a reset, so the other side sees "connection refused" right away.
-fn listening_locally(port: u16) -> bool {
+pub fn listening_locally(port: u16) -> bool {
     let want = format!(":{port:04X}");
     ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|f| {
         std::fs::read_to_string(f).unwrap_or_default().lines().skip(1).any(|l| {
@@ -249,7 +253,7 @@ impl Stack {
             Cmd::Packet(p) => {
                 if let Some(key @ (_, _, port)) = syn(&p)
                     && !self.seen_syns.contains_key(&key)
-                    && listening_locally(port)
+                    && (listening_locally(port) || (port == 22 && self.node.ssh_builtin_userspace()))
                 {
                     // Accept on any port: open a listener just in time for this connection.
                     let mut s = new_socket();
@@ -328,7 +332,11 @@ impl Stack {
                         let (tx, id, wake) = (self.tx.clone(), conn.id, self.wake.clone());
                         // Answer the SOCKS client first, then bridge.
                         tokio::spawn(async move {
-                            let stream = client.write_all(&SOCKS_OK).await.ok().map(|_| client);
+                            let stream = client
+                                .write_all(&SOCKS_OK)
+                                .await
+                                .ok()
+                                .map(|_| Box::new(client) as Box<dyn LocalStream>);
                             let _ = tx.send(Cmd::LocalReady { handle: h, id, stream });
                             wake.notify_one();
                         });
@@ -348,8 +356,30 @@ impl Stack {
                         }
                     }
                     let (tx, id, wake) = (self.tx.clone(), conn.id, self.wake.clone());
+                    if port == 22 && self.node.ssh_builtin_userspace() {
+                        // The built-in SSH server, through an in-memory pipe.
+                        let peer = match sock.remote_endpoint() {
+                            Some(ep) => match ep.addr {
+                                IpAddress::Ipv4(ip) => std::net::SocketAddr::from((ip, ep.port)),
+                            },
+                            None => std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                        };
+                        let (ours, theirs) = tokio::io::duplex(256 * 1024);
+                        let local = std::net::SocketAddr::from((self.my_ip, 22));
+                        tokio::spawn(crate::sshserver::serve(self.node.clone(), theirs, peer, local));
+                        let _ = tx.send(Cmd::LocalReady {
+                            handle: h,
+                            id,
+                            stream: Some(Box::new(ours)),
+                        });
+                        wake.notify_one();
+                        continue;
+                    }
                     tokio::spawn(async move {
-                        let local = TcpStream::connect(("127.0.0.1", port)).await.ok();
+                        let local = TcpStream::connect(("127.0.0.1", port))
+                            .await
+                            .ok()
+                            .map(|s| Box::new(s) as Box<dyn LocalStream>);
                         if local.is_none() {
                             debug!("nothing listens on local port {port}; refusing the connection");
                         }

@@ -153,6 +153,18 @@ pub enum Userspace {
     Never,
 }
 
+/// The built-in SSH server (`ssh user@node.mesh` without an sshd on this machine).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SshServer {
+    /// When no sshd serves port 22 here: in userspace mode if nothing listens on port 22,
+    /// in kernel mode if no sshd is installed.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 fn default_socks_listen() -> String {
     "127.0.0.1:1055".into()
 }
@@ -202,6 +214,9 @@ pub struct Config {
     pub publish_ssh_keys: bool,
     #[serde(default)]
     pub userspace: Userspace,
+    /// Built-in SSH server: "auto" (where there is no sshd), "always" or "never".
+    #[serde(default)]
+    pub ssh_server: SshServer,
     /// Direct UDP paths between nodes, also through NATs (falls back to TCP/relays).
     #[serde(default = "default_true")]
     pub udp: bool,
@@ -260,6 +275,7 @@ impl Config {
             auto_update: true,
             publish_ssh_keys: true,
             userspace: if rootless() { Userspace::Always } else { Userspace::Auto },
+            ssh_server: SshServer::Auto,
             udp: true,
             tags: vec![],
             socks_listen: default_socks_listen(),

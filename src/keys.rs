@@ -158,6 +158,11 @@ pub fn network_tag(network_key: &[u8; 32]) -> String {
 
 pub const OVERLAY_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 192, 0, 0);
 
+/// An address of the mesh (100.64.0.0/10).
+pub fn in_overlay(ip: Ipv4Addr) -> bool {
+    u32::from(ip) & u32::from(OVERLAY_NETMASK) == 0x6440_0000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -358,12 +358,23 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     // --- SSH logins
     if let Some(cfg) = &cfg {
         let has_rules = !cfg.ssh_allow.is_empty() || !cfg.ssh_allow_all.is_empty();
-        if has_rules && crate::config::rootless() {
+        if st.ssh_server.as_deref() == Some("built-in") {
+            c.push(check(
+                "ssh logins",
+                if has_rules { Level::Ok } else { Level::Info },
+                if has_rules {
+                    "meshvpn's built-in SSH server answers ssh to this node".to_string()
+                } else {
+                    "meshvpn's built-in SSH server answers ssh to this node, but nobody may log in yet".to_string()
+                },
+                (!has_rules).then_some("allow logins: sudo meshvpn ssh allow <user>@<node> --as <local user>"),
+            ));
+        } else if has_rules && (crate::config::rootless() || !crate::sshserver::sshd_installed()) {
             c.push(check(
                 "ssh logins",
                 Level::Warn,
-                "password-less logins are configured, but a rootless install can't set up sshd",
-                Some("install meshvpn as root on this machine for password-less logins"),
+                "password-less logins are configured, but nothing answers ssh here",
+                Some("set ssh_server = \"auto\" (or \"always\") in the config and restart meshvpn"),
             ));
         } else if has_rules {
             let effective = run("sshd", &["-T"])
