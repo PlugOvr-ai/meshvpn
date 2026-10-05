@@ -2863,7 +2863,7 @@ fn gossip_frames(records: &[SignedInfo]) -> Vec<Vec<u8>> {
 }
 
 /// `meshvpn ssh allow everyone ...`
-fn is_everyone(who: &str) -> bool {
+pub fn is_everyone(who: &str) -> bool {
     matches!(who.trim(), "*" | "everyone" | "all" | "everybody")
 }
 

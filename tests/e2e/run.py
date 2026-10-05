@@ -665,8 +665,13 @@ def test_builtin_ssh(lab):
     hub.mv(f"init --name hub --endpoint {hub.c}:7870")
     hub.up()
     hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    box.mv(f"join {invite(hub)} --name box --ssh-allow-all agent")
+    # the same rule set before meshvpn ever ran
+    kbox.mv(f"join {invite(hub)} --name kbox")
+    p = kbox.mv("ssh allow alice@hub --as agent", ok=False)
+    check(p.returncode != 0 and "doesn't know a node" in p.stderr, f"unknown node before the first start: {p.stderr}")
+    check("takes effect" in kbox.mv("ssh allow everyone --as agent"), "ssh allow before up")
     for n in (box, kbox):
-        n.mv(f"join {invite(hub)} --name {n.name} --ssh-allow-all agent")
         n.up()
         wait(lambda n=n: n.status().get("ssh_server") == "built-in", f"{n.name}: built-in ssh server active")
         wait(lambda n=n: "agent@hub" in n.mv("ssh-authorized-keys agent", ok=False).stdout or n.peer("hub")

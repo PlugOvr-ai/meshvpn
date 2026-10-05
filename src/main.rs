@@ -1157,6 +1157,20 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Ssh { cmd } => {
             let req = match cmd.unwrap_or(SshCmd::List) {
+                SshCmd::Allow { who, users } if !control::is_running(&dir) => {
+                    require_owner()?;
+                    let msg = ssh_rules_offline(&dir, &who, users, true)?;
+                    if let Err(e) = sshd::enable_if_installed() {
+                        println!("note: sshd is not set up yet ({e:#}); meshvpn retries when it starts");
+                    }
+                    say(json, &msg);
+                    return Ok(0);
+                }
+                SshCmd::Deny { who, users } if !control::is_running(&dir) => {
+                    require_owner()?;
+                    say(json, &ssh_rules_offline(&dir, &who, users, false)?);
+                    return Ok(0);
+                }
                 SshCmd::Allow { who, users } => {
                     require_owner()?;
                     if sshd::enable_if_installed()? {
@@ -1683,6 +1697,119 @@ fn invite_ticket(
         issuer: ident.id,
     };
     Ok((Some(proto::SignedDoc::sign(&ticket, &ident)), roster.admins))
+}
+
+/// `meshvpn ssh allow/deny` while meshvpn is not running (e.g. in a Dockerfile before the first
+/// start): edits the rules in the config; nodes are looked up among the ones known from the
+/// last run.
+fn ssh_rules_offline(dir: &Path, who: &str, users: Vec<String>, allow: bool) -> Result<String> {
+    if let Some(u) = users.iter().find(|u| !proto::valid_user(u)) {
+        bail!("invalid user name {u:?}");
+    }
+    let mut cfg = Config::load(dir)?;
+    if node::is_everyone(who) {
+        if allow {
+            if users.is_empty() {
+                bail!("say which account: --as <user>");
+            }
+            for u in &users {
+                if !cfg.ssh_allow_all.contains(u) {
+                    cfg.ssh_allow_all.push(u.clone());
+                }
+            }
+        } else if users.is_empty() {
+            cfg.ssh_allow_all.clear();
+        } else {
+            cfg.ssh_allow_all.retain(|u| !users.contains(u));
+        }
+        cfg.save(dir)?;
+        return Ok(if allow {
+            format!(
+                "every node of the network may log in here as {} without a password (takes effect when meshvpn starts)",
+                users.join(", ")
+            )
+        } else {
+            "updated password-less logins for everyone (takes effect when meshvpn starts)".into()
+        });
+    }
+    let (from_user, node) = match who.split_once('@') {
+        Some((u, n)) => (Some(u.to_string()), n.trim().to_lowercase()),
+        None => (None, who.trim().to_lowercase()),
+    };
+    if let Some(u) = &from_user
+        && !proto::valid_user(u)
+    {
+        bail!("invalid user name {u:?}");
+    }
+    if !allow {
+        let before = cfg.ssh_allow.clone();
+        for r in cfg
+            .ssh_allow
+            .iter_mut()
+            .filter(|r| (r.name == node || r.node.hex().starts_with(&node)) && r.from_user == from_user)
+        {
+            if users.is_empty() {
+                r.users.clear();
+            } else {
+                r.users.retain(|u| !users.contains(u));
+            }
+        }
+        cfg.ssh_allow.retain(|r| !r.users.is_empty());
+        if cfg.ssh_allow == before {
+            bail!("no rule for {who} (see meshvpn ssh list)");
+        }
+        cfg.save(dir)?;
+        return Ok(format!(
+            "updated the rules for {who} (takes effect when meshvpn starts)"
+        ));
+    }
+    if users.is_empty() {
+        bail!("say which account: --as <user>");
+    }
+    // Nodes known from the last run, newest record first for duplicate names.
+    let net = cfg.network_id();
+    let mut known: Vec<proto::NodeInfo> = SavedState::load(dir)
+        .peers
+        .iter()
+        .filter_map(|p| p.verify(&net).ok())
+        .filter(|i| i.name == node || (node.len() >= 4 && i.id.hex().starts_with(&node)))
+        .collect();
+    known.sort_by_key(|i| std::cmp::Reverse(i.seq));
+    let Some(info) = known.first() else {
+        bail!(
+            "meshvpn doesn't know a node named {node:?} yet - it learns the other nodes once it runs. Start it \
+             first (meshvpn up / install), or allow every node: meshvpn ssh allow everyone --as {}",
+            users.join(",")
+        );
+    };
+    match cfg
+        .ssh_allow
+        .iter_mut()
+        .find(|r| r.node == info.id && r.from_user == from_user)
+    {
+        Some(rule) => {
+            for u in &users {
+                if !rule.users.contains(u) {
+                    rule.users.push(u.clone());
+                }
+            }
+            rule.name = info.name.clone();
+        }
+        None => cfg.ssh_allow.push(config::SshAllow {
+            node: info.id,
+            name: info.name.clone(),
+            from_user: from_user.clone(),
+            users: users.clone(),
+        }),
+    }
+    cfg.save(dir)?;
+    let src = from_user
+        .map(|u| format!("{u}@{}", info.name))
+        .unwrap_or_else(|| format!("any user on {}", info.name));
+    Ok(format!(
+        "{src} may log in here as {} without a password (takes effect when meshvpn starts)",
+        users.join(", ")
+    ))
 }
 
 /// An expired invite is refused right away instead of producing a node that can't connect.
