@@ -520,7 +520,10 @@ def test_share_fetch(lab):
     check(r["bytes"] <= 4300000 and sha(c, "/srv/ds") == want, f"repair should refetch one chunk: {r['bytes']}")
     p = c.sh(f"""python3 -c "
 import socket,json; s=socket.create_connection(('{a.net_ip(net)}',7871),3); s.recv(32); s.sendall(b'\\0'*32)
-s.sendall(json.dumps({{'manifest':{{'id':'{oid}'}}}}).encode()+b'\\n'); print(len(s.recv(100)))" """, ok=False)
+s.sendall(json.dumps({{'manifest':{{'id':'{oid}'}}}}).encode()+b'\\n')
+# refused: closed (b'') or reset (unread data left) - either way no data
+try: print(len(s.recv(100)))
+except ConnectionResetError: print(0)" """, ok=False)
     check(p.stdout.strip() == "0", f"a non-member got data: {p.stdout}{p.stderr}")
 
 
