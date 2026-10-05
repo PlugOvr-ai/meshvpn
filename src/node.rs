@@ -757,7 +757,10 @@ impl Node {
                         crate::sshserver::listen(self.clone(), l).await;
                     }
                     Err(e) if !warned => {
-                        let msg = format!("built-in SSH server: cannot listen on {}:22: {e} (retrying)", self.my_ip);
+                        let msg = format!(
+                            "built-in SSH server: cannot listen on {}:22: {e} (retrying)",
+                            self.my_ip
+                        );
                         if self.cfg.ssh_server == SshServer::Always {
                             warn!("{msg}");
                         } else {
