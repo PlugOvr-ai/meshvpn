@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ - meshvpn desktop</title>
+<style>
+  :root { color-scheme: dark; --bar: #1d2026; --fg: #d8dde6; --dim: #8a93a3; --acc: #4f8cff; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #2b2f36; color: var(--fg);
+    font: 13px system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #bar { height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    background: var(--bar); border-bottom: 1px solid #000; user-select: none; }
+  #bar button { background: #2c313a; color: var(--fg); border: 1px solid #3a404b; border-radius: 5px;
+    padding: 3px 9px; font: inherit; cursor: pointer; white-space: nowrap; }
+  #bar button:hover { border-color: var(--acc); }
+  #title { color: var(--dim); margin-right: 6px; white-space: nowrap; }
+  #tabs { display: flex; gap: 4px; overflow-x: auto; flex: 1; min-width: 0; }
+  #tabs .tab { display: flex; align-items: center; gap: 6px; max-width: 220px; }
+  #tabs .tab span { overflow: hidden; text-overflow: ellipsis; }
+  #tabs .tab.active { border-color: var(--acc); background: #263450; }
+  #tabs .tab b { color: var(--dim); font-weight: normal; }
+  #tabs .tab b:hover { color: #ff6b6b; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #c33; flex: none; }
+  #dot.on { background: #3c6; }
+  #area { position: absolute; top: 35px; left: 0; right: 0; bottom: 0; display: flex;
+    align-items: center; justify-content: center; }
+  canvas { background: #2b2f36; outline: none; image-rendering: auto; max-width: 100%; max-height: 100%; }
+  .menu { position: absolute; top: 36px; background: var(--bar); border: 1px solid #3a404b; border-radius: 6px;
+    padding: 6px; z-index: 10; box-shadow: 0 6px 24px #0008; }
+  #apps { left: 8px; width: 300px; max-height: 70vh; overflow-y: auto; }
+  #apps div.item { padding: 5px 8px; border-radius: 4px; cursor: pointer; }
+  #apps div.item:hover { background: #263450; }
+  #apps input, #clip textarea { width: 100%; background: #14161a; color: var(--fg); border: 1px solid #3a404b;
+    border-radius: 4px; padding: 5px; font: inherit; }
+  #apps .hint, #clip .hint { color: var(--dim); padding: 4px 2px; font-size: 12px; }
+  #clip { right: 8px; width: 360px; }
+  #clip textarea { height: 120px; resize: vertical; font-family: ui-monospace, monospace; }
+  #notice { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); background: #3a2f12;
+    border: 1px solid #806523; color: #f3dfa4; padding: 8px 14px; border-radius: 6px; z-index: 20;
+    max-width: 80vw; white-space: pre-wrap; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="dot" title="connection"></span>
+  <span id="title">__TITLE__</span>
+  <button id="appsBtn">Apps ▾</button>
+  <div id="tabs"></div>
+  <button id="clipBtn" title="Clipboard">Clipboard</button>
+  <button id="fullBtn" title="Fullscreen (keyboard shortcuts like Ctrl+W go to the desktop)">⛶</button>
+</div>
+<div id="area"><canvas id="screen" tabindex="0" width="1280" height="800"></canvas></div>
+<div id="apps" class="menu" hidden>
+  <input id="run" placeholder="Run a command, e.g. xterm, firefox, rviz2 …" autocomplete="off">
+  <div class="hint">Enter starts it on the desktop.</div>
+  <div id="appList"></div>
+</div>
+<div id="clip" class="menu" hidden>
+  <textarea id="clipText" placeholder="Text copied on the desktop appears here; edit and send to paste it there."></textarea>
+  <div style="display:flex;gap:6px;margin-top:6px"><button id="clipSend">Send to desktop</button></div>
+  <div class="hint">Ctrl+V on the desktop also pastes from this computer's clipboard (the browser may ask once).</div>
+</div>
+<div id="notice" hidden></div>
+<script>
+"use strict";
+const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8;
+const C_POINTER=101,C_WHEEL=102,C_KEY=103,C_CLIPBOARD=104,C_ACTIVATE=105,C_CLOSE=106,C_LAUNCH=107,C_ACK=108,C_REFRESH=109,C_RESIZE=110;
+const $ = id => document.getElementById(id);
+const canvas = $("screen"), ctx = canvas.getContext("2d"), area = $("area");
+const token = location.hash.slice(1);
+let ws = null, drawQ = Promise.resolve(), buttons = 0, pressed = new Map();
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+function msg(kind, payload) {
+  const p = payload || new Uint8Array(0);
+  const b = new Uint8Array(5 + p.length);
+  b[0] = kind; new DataView(b.buffer).setUint32(1, p.length, true); b.set(p, 5);
+  return b;
+}
+function send(kind, payload) { if (ws && ws.readyState === 1) ws.send(msg(kind, payload)); }
+function u16s(...v) { const b = new Uint8Array(v.length * 2); const d = new DataView(b.buffer); v.forEach((x, i) => d.setUint16(i * 2, Math.max(0, Math.min(65535, x | 0)), true)); return b; }
+function notice(text, ms) { const n = $("notice"); n.textContent = text; n.hidden = false; clearTimeout(notice.t); if (ms) notice.t = setTimeout(() => n.hidden = true, ms); }
+
+function wantedSize() { return [Math.floor(area.clientWidth), Math.floor(area.clientHeight)]; }
+let resizeTimer = null;
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => send(C_RESIZE, u16s(...wantedSize())), 250); });
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${token}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { $("dot").classList.add("on"); send(C_RESIZE, u16s(...wantedSize())); canvas.focus(); };
+  ws.onclose = () => { $("dot").classList.remove("on"); notice("Disconnected. Click here to reconnect."); $("notice").onclick = () => { $("notice").hidden = true; $("notice").onclick = null; connect(); }; };
+  ws.onmessage = ev => handle(new Uint8Array(ev.data));
+}
+
+function handle(m) {
+  const kind = m[0], p = m.subarray(5), d = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  switch (kind) {
+    case S_INIT: {
+      const w = d.getUint16(0, true), h = d.getUint16(2, true);
+      drawQ = drawQ.then(() => { if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; } });
+      break;
+    }
+    case S_TILE: {
+      const x = d.getUint16(0, true), y = d.getUint16(2, true), fmt = p[8];
+      const blob = new Blob([p.subarray(9)], { type: fmt === 1 ? "image/png" : "image/jpeg" });
+      const img = createImageBitmap(blob);
+      drawQ = drawQ.then(() => img).then(b => { ctx.drawImage(b, x, y); b.close(); }).catch(() => {});
+      break;
+    }
+    case S_FRAME_END: drawQ = drawQ.then(() => send(C_ACK)); break;
+    case S_WINDOWS: tabs(JSON.parse(dec.decode(p))); break;
+    case S_CLIPBOARD: {
+      const text = dec.decode(p);
+      $("clipText").value = text;
+      if (navigator.clipboard && document.hasFocus()) navigator.clipboard.writeText(text).catch(() => {});
+      break;
+    }
+    case S_CURSOR: {
+      const xh = d.getUint16(0, true), yh = d.getUint16(2, true);
+      const url = URL.createObjectURL(new Blob([p.subarray(4)], { type: "image/png" }));
+      canvas.style.cursor = `url(${url}) ${xh} ${yh}, default`;
+      break;
+    }
+    case S_APPS: apps(JSON.parse(dec.decode(p))); break;
+    case S_NOTICE: notice(dec.decode(p), 8000); break;
+  }
+}
+
+function tabs(list) {
+  const t = $("tabs"); t.textContent = "";
+  for (const w of list) {
+    const b = document.createElement("button");
+    b.className = "tab" + (w.active ? " active" : "");
+    const s = document.createElement("span"); s.textContent = w.title; b.title = w.title;
+    const x = document.createElement("b"); x.textContent = "✕"; x.title = "Close";
+    x.onclick = e => { e.stopPropagation(); send(C_CLOSE, u32(w.id)); };
+    b.append(s, x);
+    b.onclick = () => { send(C_ACTIVATE, u32(w.id)); canvas.focus(); };
+    b.onauxclick = e => { if (e.button === 1) send(C_CLOSE, u32(w.id)); };
+    t.append(b);
+  }
+}
+function u32(v) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0, true); return b; }
+
+function apps(list) {
+  const l = $("appList"); l.textContent = "";
+  if (!list.length) { const h = document.createElement("div"); h.className = "hint"; h.textContent = "No graphical applications are installed in this system (none with a .desktop entry)."; l.append(h); }
+  for (const a of list) {
+    const i = document.createElement("div"); i.className = "item"; i.textContent = a.name; i.title = a.exec;
+    i.onclick = () => { send(C_LAUNCH, enc.encode(a.exec)); $("apps").hidden = true; canvas.focus(); };
+    l.append(i);
+  }
+}
+$("appsBtn").onclick = () => { $("apps").hidden = !$("apps").hidden; $("clip").hidden = true; if (!$("apps").hidden) $("run").focus(); };
+$("run").onkeydown = e => { if (e.key === "Enter" && e.target.value.trim()) { send(C_LAUNCH, enc.encode(e.target.value.trim())); e.target.value = ""; $("apps").hidden = true; canvas.focus(); } if (e.key === "Escape") { $("apps").hidden = true; canvas.focus(); } };
+$("clipBtn").onclick = () => { $("clip").hidden = !$("clip").hidden; $("apps").hidden = true; };
+$("clipSend").onclick = () => { send(C_CLIPBOARD, enc.encode($("clipText").value)); $("clip").hidden = true; canvas.focus(); };
+$("fullBtn").onclick = async () => {
+  if (document.fullscreenElement) { await document.exitFullscreen(); return; }
+  await document.documentElement.requestFullscreen().catch(() => {});
+  if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+  canvas.focus();
+};
+
+// ---- pointer
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [Math.floor((e.clientX - r.left) * canvas.width / r.width), Math.floor((e.clientY - r.top) * canvas.height / r.height)];
+}
+let lastX = 0, lastY = 0;
+function pointer(e) { const [x, y] = pos(e); lastX = x; lastY = y; const b = new Uint8Array(5); b.set(u16s(x, y)); b[4] = buttons; send(C_POINTER, b); }
+canvas.addEventListener("mousemove", e => { buttons = e.buttons & 7; pointer(e); });
+canvas.addEventListener("mousedown", e => { canvas.focus(); buttons = e.buttons & 7; pointer(e); e.preventDefault(); });
+canvas.addEventListener("mouseup", e => { buttons = e.buttons & 7; pointer(e); e.preventDefault(); });
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+let wheelX = 0, wheelY = 0;
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const k = e.deltaMode === 1 ? 1 / 3 : e.deltaMode === 2 ? 3 : 1 / 100;
+  wheelX += e.deltaX * k; wheelY += e.deltaY * k;
+  const sx = Math.trunc(wheelX), sy = Math.trunc(wheelY);
+  if (sx || sy) { wheelX -= sx; wheelY -= sy; send(C_WHEEL, new Uint8Array([sx & 255, sy & 255])); }
+}, { passive: false });
+
+// ---- keyboard: characters as typed (any layout), special keys by name
+const SPECIAL = { Enter: 0xff0d, Backspace: 0xff08, Tab: 0xff09, Escape: 0xff1b, Delete: 0xffff, Home: 0xff50,
+  ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54, PageUp: 0xff55, PageDown: 0xff56,
+  End: 0xff57, Insert: 0xff63, ContextMenu: 0xff67, PrintScreen: 0xff61, Pause: 0xff13,
+  ShiftLeft: 0xffe1, ShiftRight: 0xffe2, ControlLeft: 0xffe3, ControlRight: 0xffe4,
+  AltLeft: 0xffe9, MetaLeft: 0xffeb, MetaRight: 0xffec, OSLeft: 0xffeb, OSRight: 0xffec };
+for (let i = 1; i <= 12; i++) SPECIAL["F" + i] = 0xffbd + i;
+function keysym(e) {
+  if (SPECIAL[e.code] && (e.code.startsWith("Shift") || e.code.startsWith("Control") || e.code.startsWith("Alt") || e.code.startsWith("Meta") || e.code.startsWith("OS"))) return [SPECIAL[e.code], 0];
+  if (e.key && [...e.key].length === 1) {
+    const cp = e.key.codePointAt(0);
+    return [(cp >= 0x20 && cp <= 0x7e) || (cp >= 0xa0 && cp <= 0xff) ? cp : 0x1000000 + cp, 1];
+  }
+  if (SPECIAL[e.key]) return [SPECIAL[e.key], 0];
+  if (SPECIAL[e.code]) return [SPECIAL[e.code], 0];
+  return null;
+}
+function key(down, ks, isChar) { const b = new Uint8Array(6); b[0] = down ? 1 : 0; b[1] = isChar; new DataView(b.buffer).setUint32(2, ks, true); send(C_KEY, b); }
+canvas.addEventListener("keydown", async e => {
+  if (e.key === "AltGraph" || e.key === "Dead" || e.isComposing) return;
+  const k = keysym(e); if (!k) return;
+  e.preventDefault();
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && navigator.clipboard && navigator.clipboard.readText) {
+    try { const t = await navigator.clipboard.readText(); if (t) send(C_CLIPBOARD, enc.encode(t)); } catch (_) {}
+  }
+  pressed.set(e.code, k); key(true, k[0], k[1]);
+});
+canvas.addEventListener("keyup", e => {
+  const k = pressed.get(e.code) || keysym(e); if (!k) return;
+  e.preventDefault(); pressed.delete(e.code); key(false, k[0], k[1]);
+});
+canvas.addEventListener("blur", () => {
+  for (const k of pressed.values()) key(false, k[0], k[1]);
+  pressed.clear();
+  if (buttons) { buttons = 0; const b = new Uint8Array(5); b.set(u16s(lastX, lastY)); send(C_POINTER, b); }
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) send(C_REFRESH); });
+
+if (!token) notice("Open this page with the link meshvpn printed (it contains the access token).");
+else connect();
+</script>
+</body>
+</html>

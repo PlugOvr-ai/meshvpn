@@ -69,12 +69,30 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
 
+  desktop:
+    # The desktop bundle (static Xvfb etc., see desktop/build-bundle.sh), natively per arch.
+    name: desktop bundle ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/desktop-out:/out" alpine:3.22 sh /build/build-bundle.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-desktop-${{ matrix.arch }}
+          path: desktop-out/*.tar.gz
+
   e2e:
     uses: ./.github/workflows/e2e.yml
 
   release:
     # Published only when every end-to-end test passed.
-    needs: [build, e2e]
+    needs: [build, desktop, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

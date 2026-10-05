@@ -185,7 +185,11 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
                     "daemon",
                     Level::Fail,
                     "meshvpn is not running",
-                    Some("start it: sudo systemctl start meshvpn (or sudo meshvpn install / sudo meshvpn up)"),
+                    Some(if crate::systemd_running() {
+                        "start it: sudo systemctl start meshvpn (or sudo meshvpn install / sudo meshvpn up)"
+                    } else {
+                        "start it: sudo meshvpn install (no systemd here: runs it in the background) or sudo meshvpn up"
+                    }),
                 ));
             }
         }

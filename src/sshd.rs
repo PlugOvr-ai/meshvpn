@@ -48,7 +48,9 @@ fn effective_command(sshd: &Path) -> Option<String> {
 }
 
 fn reload() {
-    for unit in ["ssh", "sshd"] {
+    // `systemctl reload` "succeeds" without a running systemd (containers) but does nothing.
+    let systemd = Path::new("/run/systemd/system").is_dir();
+    for unit in ["ssh", "sshd"].into_iter().filter(|_| systemd) {
         let quiet = Command::new("systemctl")
             .args(["reload", unit])
             .stdout(std::process::Stdio::null())

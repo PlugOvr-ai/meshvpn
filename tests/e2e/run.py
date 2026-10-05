@@ -28,6 +28,7 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE = "meshvpn-e2e"
 BINARY = None
+DESKTOP_BUNDLE = None
 DEPLOY_SH = os.path.join(HERE, "..", "..", "deploy.sh")
 INSTALL_SH = os.path.join(HERE, "..", "..", "install.sh")
 TESTS = {}
@@ -737,6 +738,62 @@ def test_builtin_ssh(lab):
 
 
 @test
+def test_desktop(lab):
+    """meshvpn desktop: a container without any X server, through SSH - frames, apps, typing, clipboard, windows."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])  # no sshd: the built-in server
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    box.mv(f"join {invite(hub)} --name box --ssh-allow-all agent")
+    box.up()
+    wait(lambda: hub.online("box") and box.status().get("ssh_server") == "built-in", "box online with ssh")
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    check("installed" in box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent"), "desktop setup")
+    wait(lambda: box.mv("ssh-authorized-keys agent", ok=False).returncode == 0 and
+         hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
+         "ssh from hub to box", 60)
+    hub.sh("cd /home/agent && (meshvpn desktop box --no-browser --port 18080 > /tmp/desktop.out 2>&1 &)", user="agent")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py 18080 {token}", user="agent", ok=False, timeout=240)
+    check(p.returncode == 0, f"desktop session: {p.stdout}{p.stderr}")
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+    check(r["first_frame_tiles"].get("1", 0) + r["first_frame_tiles"].get("2", 0) >= 160, f"a full first frame: {r}")
+    check(r["cursor"] and r["size"] == [800, 500], f"cursor and resize: {r}")
+    check("XTerm" in r["apps"], f"installed apps should be listed: {r['apps']}")
+    typed = box.sh("od -An -c /tmp/typed | tr -s ' '", ok=False).stdout
+    check(box.sh("cat /tmp/typed", ok=False).stdout == "Hello Wörld €!\n", f"typed text: {typed}")
+    # The session runs as the user who logged in, and its clipboard got the browser's text.
+    xvfb = box.sh("ps -o user=,args= -C Xvfb", ok=False).stdout
+    check(xvfb.startswith("agent "), f"Xvfb should run as agent: {xvfb}")
+    clip = box.sh("cat /tmp/clip_in", ok=False).stdout
+    check(clip == "from the browser ✓", f"clipboard from the browser: {clip!r}")
+    check("ended" in box.mv("desktop stop", user="agent"), "desktop stop")
+    wait(lambda: box.sh("pgrep -x Xvfb", ok=False).returncode != 0, "Xvfb gone after stop", 10)
+
+
+@test
+def test_container_install(lab):
+    """meshvpn install in a container whose systemctl only says "Running in chroot, ignoring command"."""
+    net, (hub,) = mesh(lab, ["hub"])
+    box = lab.node("box", [net])
+    box.sh("printf '#!/bin/sh\\necho \"Running in chroot, ignoring command \\047$1\\047\"\\n' > /usr/bin/systemctl && chmod 755 /usr/bin/systemctl")
+    box.mv(f"join {invite(hub)} --name box")
+    out = box.mv("install")
+    check("in the background" in out and "entrypoint" in out, out)
+    wait(lambda: hub.online("box"), "box online after install")
+    out = box.mv("install")  # again: restarts it
+    check("Stopped a meshvpn" in out, out)
+    wait(lambda: hub.online("box"), "box online after reinstall")
+    box.mv("uninstall")
+    check(box.mv("status", ok=False).returncode == 3, "uninstall should stop it")
+
+
+@test
 def test_rootless(lab):
     """install.sh --user as a normal user: no root anywhere, background daemon, mesh in and out."""
     net = lab.network("net")
@@ -826,9 +883,10 @@ def run_test(name, keep):
 
 
 def main():
-    global BINARY
+    global BINARY, DESKTOP_BUNDLE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--binary", required=True, help="static meshvpn binary to test")
+    ap.add_argument("--desktop-bundle", help="meshvpn-desktop-<arch>.tar.gz (desktop/build-bundle.sh) for the desktop test")
     ap.add_argument("-j", "--jobs", type=int, default=3, help="tests in parallel")
     ap.add_argument("--keep", action="store_true", help="keep containers of failed tests for debugging")
     ap.add_argument("--list", action="store_true")
@@ -839,6 +897,7 @@ def main():
             print(f"{n:18} {f.__doc__.strip()}")
         return 0
     BINARY = os.path.abspath(a.binary)
+    DESKTOP_BUNDLE = a.desktop_bundle and os.path.abspath(a.desktop_bundle)
     names = a.tests or list(TESTS)
     unknown = [n for n in names if n not in TESTS]
     if unknown:

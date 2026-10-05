@@ -190,11 +190,8 @@ if [ $# -gt 0 ]; then
     $SUDO "$BIN_DIR/meshvpn" "$@"
     case "$1" in
         init | join)
-            if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-                $SUDO "$BIN_DIR/meshvpn" install
-            else
-                say "No systemd found - start meshvpn with: sudo meshvpn up"
-            fi
+            # With systemd a service; without (containers) in the background.
+            $SUDO "$BIN_DIR/meshvpn" install
             ;;
     esac
 elif [ -f /etc/systemd/system/meshvpn.service ] && $SUDO test -f /etc/meshvpn/config.toml; then

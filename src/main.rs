@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod control;
+mod desktop;
 mod doctor;
 mod gpu;
 mod hosts;
@@ -227,6 +228,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<SshCmd>,
     },
+    /// A node's graphical desktop in your browser, e.g. `meshvpn desktop gpu-box` (also in
+    /// containers without X: meshvpn brings its own). Logins as with `meshvpn ssh`.
+    #[command(args_conflicts_with_subcommands = true)]
+    Desktop {
+        #[command(subcommand)]
+        cmd: Option<DesktopCmd>,
+        /// The node whose desktop to open.
+        node: Option<String>,
+        /// Account on the node (default: you).
+        #[arg(short, long)]
+        user: Option<String>,
+        /// Local port for the viewer (default: any free one).
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Only print the link, don't open a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Connect stdin/stdout to HOST:PORT in the mesh (for ssh's ProxyCommand in userspace mode).
     Nc { host: String, port: u16 },
     /// SFTP on stdin/stdout (started by the built-in SSH server as the logged-in user).
@@ -351,6 +370,25 @@ enum GpuCmd {
         #[arg(long)]
         ttl_ms: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum DesktopCmd {
+    /// Install the desktop components on this machine (a static X server, keyboard layouts,
+    /// fonts; about 5 MB). Happens by itself on first use if the machine has internet.
+    Setup {
+        /// Install from a downloaded meshvpn-desktop-<arch>.tar.gz (machines without internet).
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
+    /// End your desktop session on this machine (closes its applications).
+    Stop,
+    /// Connect stdin/stdout to your desktop session (used through SSH by `meshvpn desktop <node>`).
+    #[command(hide = true)]
+    Attach,
+    /// Run the desktop session (started by attach).
+    #[command(hide = true)]
+    Session,
 }
 
 #[derive(Subcommand)]
@@ -1194,6 +1232,50 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::SftpServer => sshserver::sftp_server()?,
+        Cmd::Desktop {
+            cmd,
+            node,
+            user,
+            port,
+            no_browser,
+        } => match cmd {
+            Some(DesktopCmd::Setup { from }) => {
+                let b = desktop::bundle::setup(from.as_deref())?;
+                say(json, &format!("desktop components installed in {}", b.dir.display()));
+            }
+            Some(DesktopCmd::Stop) => {
+                if desktop::session::stop()? {
+                    say(json, "desktop session ended");
+                } else {
+                    say(json, "no desktop session is running");
+                }
+            }
+            Some(DesktopCmd::Attach) => desktop::session::attach()?,
+            Some(DesktopCmd::Session) => {
+                init_logging();
+                desktop::session::run()?;
+            }
+            None => {
+                let Some(node) = node else {
+                    bail!("which node? e.g. meshvpn desktop <node> (see meshvpn nodes)");
+                };
+                if std::env::var_os("MESHVPN_DESKTOP_BRIDGE").is_some() {
+                    let target = desktop::client::Target::test(&node, user.as_deref());
+                    desktop::client::run(target, port, !no_browser)?;
+                    return Ok(0);
+                }
+                let st = agent::status(&dir)?;
+                let targets = agent::select(&agent::nodes(&st), &[node])?;
+                let [node] = <[agent::NodeView; 1]>::try_from(targets)
+                    .map_err(|_| anyhow::anyhow!("select exactly one node"))?;
+                let remote = agent::Remote {
+                    user: user.unwrap_or_else(agent::Remote::default_user),
+                    socks: st.socks.is_some(),
+                    timeout: std::time::Duration::from_secs(30),
+                };
+                desktop::client::run(desktop::client::Target { node, remote }, port, !no_browser)?;
+            }
+        },
         Cmd::Nc { host, port } => {
             let rt = tokio::runtime::Runtime::new()?;
             // Through the userspace stack if meshvpn runs in that mode, directly otherwise.
@@ -1419,7 +1501,7 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
         println!("meshvpn is still running with the previous configuration. Restart it:");
         println!(
             "{}",
-            config::hint("  sudo systemctl restart meshvpn   # if installed as a service")
+            config::hint("  sudo meshvpn install   # restarts the service (or the background daemon)")
         );
         println!("  (or stop `meshvpn up` with Ctrl+C and start it again)");
         println!();
@@ -2044,6 +2126,12 @@ fn install(dir: &Path) -> Result<()> {
         PathBuf::from(BIN_PATH)
     };
     let dir = std::path::absolute(dir)?;
+    if !systemd_running() {
+        for (pid, cmd) in stop_other_daemons() {
+            println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
+        }
+        return install_background(&dir, &bin, Path::new("/var/log/meshvpn.log"));
+    }
     let unit = format!(
         "[Unit]\nDescription=meshvpn decentralized mesh VPN\nWants=network-online.target\nAfter=network-online.target\n\n\
          [Service]\nExecStart={} --dir {} up\nRestart=always\nRestartSec=3\n\n\
@@ -2130,7 +2218,14 @@ fn uninstall(dir: &Path) -> Result<()> {
         return uninstall_user(dir);
     }
     require_root()?;
-    let _ = systemctl(&["disable", "--now", "meshvpn"]);
+    if systemd_running() {
+        let _ = systemctl(&["disable", "--now", "meshvpn"]);
+    } else {
+        remove_cron_entry();
+        for (pid, cmd) in stop_other_daemons() {
+            println!("Stopped meshvpn (pid {pid}: {cmd}).");
+        }
+    }
     sshd::disable();
     node::remove_ssh_client_config();
     std::fs::remove_file(UNIT_PATH).ok();
@@ -2158,12 +2253,26 @@ fn user_unit_path() -> Result<PathBuf> {
 
 /// A systemd user manager this process can talk to (not in most containers).
 fn user_systemd() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    systemd_running()
+        && std::process::Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+}
+
+fn remove_cron_entry() {
+    if let Some(lines) = crontab_lines() {
+        let before = std::process::Command::new("crontab")
+            .arg("-l")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(CRON_MARK))
+            .unwrap_or(false);
+        if before {
+            let _ = set_crontab(&lines);
+        }
+    }
 }
 
 fn crontab_lines() -> Option<Vec<String>> {
@@ -2262,12 +2371,22 @@ fn install_user(dir: &Path) -> Result<()> {
         return Ok(());
     }
     // No systemd for this user: start it in the background and again after reboot via cron.
-    let log = dir.join("meshvpn.log");
+    install_background(&dir, &bin, &dir.join("meshvpn.log"))
+}
+
+/// systemd is running here (not just installed: in containers `systemctl` exists but only
+/// prints "Running in chroot, ignoring command").
+pub fn systemd_running() -> bool {
+    Path::new("/run/systemd/system").is_dir()
+}
+
+/// Without systemd: start the daemon in the background now and, where cron exists, at boot.
+fn install_background(dir: &Path, bin: &Path, log: &Path) -> Result<()> {
     let cmd = format!("{} --dir {} up", bin.display(), dir.display());
-    let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-    let mut c = std::process::Command::new(&bin);
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+    let mut c = std::process::Command::new(bin);
     c.arg("--dir")
-        .arg(&dir)
+        .arg(dir)
         .arg("up")
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
@@ -2283,7 +2402,7 @@ fn install_user(dir: &Path) -> Result<()> {
     let mut running = false;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        if control::is_running(&dir) {
+        if control::is_running(dir) {
             running = true;
             break;
         }
@@ -2292,15 +2411,20 @@ fn install_user(dir: &Path) -> Result<()> {
         bail!("meshvpn did not start - see {}", log.display());
     }
     println!(
-        "meshvpn is running in the background (no root needed). Log: {}",
+        "meshvpn is running in the background (no systemd here). Log: {}",
         log.display()
     );
-    let cron = crontab_lines().map(|mut lines| {
+    let in_container = userspace::in_container();
+    let cron = crontab_lines().filter(|_| !in_container).map(|mut lines| {
         lines.push(format!("@reboot {cmd} >> {} 2>&1 {CRON_MARK}", log.display()));
         set_crontab(&lines)
     });
     match cron {
         Some(Ok(())) => println!("  It starts again at boot (crontab @reboot)."),
+        _ if in_container => {
+            println!("  In a container, start it together with the container: add this to its entrypoint");
+            println!("    {cmd} &");
+        }
         _ => println!(
             "  It does not start by itself after a reboot (no systemd or cron here): run `meshvpn install` again."
         ),
@@ -2317,16 +2441,7 @@ fn uninstall_user(dir: &Path) -> Result<()> {
         std::fs::remove_file(&unit).ok();
         let _ = systemctl(&["--user", "daemon-reload"]);
     }
-    if let Some(lines) = crontab_lines() {
-        let before = std::process::Command::new("crontab")
-            .arg("-l")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(CRON_MARK))
-            .unwrap_or(false);
-        if before {
-            let _ = set_crontab(&lines);
-        }
-    }
+    remove_cron_entry();
     for (pid, cmd) in stop_other_daemons() {
         println!("Stopped meshvpn (pid {pid}: {cmd}).");
     }

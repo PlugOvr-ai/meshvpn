@@ -218,6 +218,31 @@ shows `ssh server: built-in` when it is active.
   doesn't ask "are you sure?" and works with `StrictHostKeyChecking=yes`.
 * Not supported: agent and X11 forwarding, `-R` remote forwarding.
 
+## Remote desktop in the browser
+
+```sh
+meshvpn desktop gpu-box            # opens the desktop of gpu-box in your browser
+meshvpn desktop gpu-box -u ubuntu  # as another account
+```
+
+Works on machines **without any X server or desktop**, typically containers: meshvpn brings a small, fully static
+X server (its *desktop bundle*, about 5 MB, built in our CI and published with each release) and does everything else
+itself: window manager, screen transfer (only what changed: sharp PNG for text and UI, JPEG for photos and video), mouse,
+keyboard in any layout, clipboard both ways and the mouse cursor. Nothing needs to be installed in the image except the
+applications you want to run.
+
+* **Same logins as SSH:** the desktop is opened through `ssh <user>@<node>.mesh` (sshd or meshvpn's built-in server), so
+  whoever may log in as `ubuntu` may open `ubuntu`'s desktop, and nobody else. It runs as that user.
+* **The viewer** is served by meshvpn on `127.0.0.1` of your machine (with a secret token in the link) and needs no
+  plugin. The bar on top lists the windows (click to switch, ✕ to close), **Apps** starts installed applications or any
+  command, **Clipboard** shows what was copied on the desktop, ⛶ goes fullscreen (then Ctrl+W & co. go to the desktop).
+  The desktop always matches the size of the browser window.
+* **Sessions keep running** when you close the tab; open it again to continue. `meshvpn desktop stop` (on the node)
+  ends the session and its applications.
+* **First use** downloads the bundle by itself; on machines without internet copy `meshvpn-desktop-<arch>.tar.gz` from
+  the release and run `meshvpn desktop setup --from <file>` (also handy in a Dockerfile).
+* Apps get a UTF-8 locale and the bundled DejaVu fonts if the image has none. Not yet: OpenGL/GPU acceleration, sound.
+
 ## AI agents and multi-node work
 
 meshvpn is built so that people and AI agents can work with many machines at once, including training models across

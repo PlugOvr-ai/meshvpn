@@ -60,6 +60,34 @@ pub fn current_exe() -> Result<PathBuf> {
     Ok(PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s)))
 }
 
+/// Downloads file `name` of release `tag` and checks it against the published `<name>.sha256`.
+pub async fn download_verified(client: &reqwest::Client, tag: &str, name: &str) -> Result<Vec<u8>> {
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let get = |url: String| async move {
+        let r = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("downloading {url}"))?;
+        if !r.status().is_success() {
+            bail!("downloading {url}: HTTP {}", r.status());
+        }
+        Ok::<_, anyhow::Error>(r.bytes().await?)
+    };
+    let data = get(format!("{base}/{name}")).await?;
+    let sums = get(format!("{base}/{name}.sha256")).await?;
+    let expected = String::from_utf8_lossy(&sums)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let actual: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+    if expected != actual {
+        bail!("checksum mismatch for {name} - not installing");
+    }
+    Ok(data.to_vec())
+}
+
 /// Downloads the meshvpn binary of release `tag` for `target` and verifies its checksum.
 pub async fn download_binary(client: &reqwest::Client, tag: &str, target: &str) -> Result<Vec<u8>> {
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");

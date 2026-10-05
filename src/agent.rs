@@ -42,6 +42,26 @@ pub struct NodeView {
 }
 
 impl NodeView {
+    /// A placeholder for a node known only by name (tests).
+    pub fn named(name: &str) -> Self {
+        NodeView {
+            name: name.into(),
+            id: String::new(),
+            ip: Ipv4Addr::UNSPECIFIED,
+            online: true,
+            is_self: false,
+            tags: vec![],
+            path: String::new(),
+            rtt_ms: None,
+            inventory: None,
+            objects: vec![],
+            lan: vec![],
+            perf: vec![],
+            measured: 0,
+            leases: vec![],
+        }
+    }
+
     /// GPUs that are idle and not reserved.
     pub fn free_gpus(&self) -> usize {
         let reserved: Vec<u32> = self.leases.iter().flat_map(|l| l.gpus.iter().copied()).collect();

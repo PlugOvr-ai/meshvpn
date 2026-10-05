@@ -23,7 +23,18 @@ jobs:
           tool: cross
       - name: Build the static binary
         run: cross build --release --target x86_64-unknown-linux-musl
+      - name: Desktop bundle (cached until desktop/build-bundle.sh changes)
+        id: bundle
+        uses: actions/cache@v6
+        with:
+          path: desktop-out
+          key: desktop-bundle-x86_64-${{ hashFiles('desktop/build-bundle.sh') }}
+      - name: Build the desktop bundle
+        if: steps.bundle.outputs.cache-hit != 'true'
+        run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/desktop-out:/out" alpine:3.22 sh /build/build-bundle.sh
       - name: Make sure the TUN module is loaded
         run: sudo modprobe tun || true
       - name: End-to-end tests
-        run: python3 tests/e2e/run.py --binary target/x86_64-unknown-linux-musl/release/meshvpn -j 4
+        run: >
+          python3 tests/e2e/run.py --binary target/x86_64-unknown-linux-musl/release/meshvpn
+          --desktop-bundle desktop-out/meshvpn-desktop-x86_64.tar.gz -j 4
