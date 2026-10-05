@@ -71,6 +71,7 @@ pub async fn serve<S>(node: Arc<Node>, stream: S, peer: SocketAddr, local: Socke
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let attempts = Arc::new(Mutex::new(Attempts::default()));
     let handler = Conn {
         node: node.clone(),
         peer,
@@ -79,6 +80,7 @@ where
         who: String::new(),
         channels: HashMap::new(),
         ptys: Arc::new(Mutex::new(HashMap::new())),
+        attempts: attempts.clone(),
     };
     match russh::server::run_stream(node.ssh_config(), stream, handler).await {
         Ok(session) => {
@@ -87,6 +89,37 @@ where
             }
         }
         Err(e) => debug!("ssh from {peer}: {e:#}"),
+    }
+    // A login that never succeeded: say why, once per connection (clients try several keys).
+    let a = attempts.lock().unwrap();
+    if !a.ok && !a.users.is_empty() {
+        let text = format!(
+            "login as {} from {}: {}",
+            a.users.join("/"),
+            peer.ip(),
+            a.reasons.join("; ")
+        );
+        info!("ssh: refused {text}");
+        node.ssh_refused(text);
+    }
+}
+
+/// What happened during authentication, for a useful message if it fails.
+#[derive(Default)]
+struct Attempts {
+    ok: bool,
+    users: Vec<String>,
+    reasons: Vec<String>,
+}
+
+impl Attempts {
+    fn note(&mut self, user: &str, reason: String) {
+        if !self.users.iter().any(|u| u == user) {
+            self.users.push(user.to_string());
+        }
+        if !self.reasons.contains(&reason) && self.reasons.len() < 6 {
+            self.reasons.push(reason);
+        }
     }
 }
 
@@ -200,6 +233,7 @@ struct Conn {
     channels: HashMap<ChannelId, Chan>,
     /// PTY masters by channel, for window size changes.
     ptys: Arc<Mutex<HashMap<ChannelId, Arc<OwnedFd>>>>,
+    attempts: Arc<Mutex<Attempts>>,
 }
 
 enum What {
@@ -217,7 +251,20 @@ impl Conn {
     }
 
     fn allowed(&self, user: &str, key: &PublicKey) -> Option<String> {
-        self.node.ssh_login_allowed(user, self.peer_ip()?, key)
+        let Some(ip) = self.peer_ip() else {
+            self.attempts
+                .lock()
+                .unwrap()
+                .note(user, format!("{} is not a mesh address", self.peer.ip()));
+            return None;
+        };
+        match self.node.ssh_login_check(user, ip, key) {
+            Ok(who) => Some(who),
+            Err(why) => {
+                self.attempts.lock().unwrap().note(user, why);
+                None
+            }
+        }
     }
 
     fn start(&mut self, id: ChannelId, what: What, session: &mut Session) -> Result<()> {
@@ -280,13 +327,15 @@ impl russh::server::Handler for Conn {
             return Ok(Auth::reject());
         };
         let Some(acct) = account_for(user) else {
-            if lookup(user).is_some() {
-                info!("ssh: {who} may log in as {user}, but a rootless meshvpn can only log in its own user");
+            let why = if lookup(user).is_some() {
+                format!("{who} may log in as {user}, but a rootless meshvpn can only log in its own user")
             } else {
-                info!("ssh: {who} may log in as {user}, but there is no such user here");
-            }
+                format!("{who} may log in as {user}, but there is no user {user} here")
+            };
+            self.attempts.lock().unwrap().note(user, why);
             return Ok(Auth::reject());
         };
+        self.attempts.lock().unwrap().ok = true;
         info!("ssh: {who} logged in as {user}");
         self.who = who;
         self.account = Some(acct);

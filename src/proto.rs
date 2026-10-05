@@ -22,6 +22,8 @@ pub const T_MEASURE: u8 = 12;
 /// The admin roster (managed networks), and admissions of new nodes (flooded).
 pub const T_ROSTER: u8 = 13;
 pub const T_CLAIM: u8 = 14;
+/// Why a node was turned away (sent to it right before the connection is closed).
+pub const T_REJECT: u8 = 15;
 
 /// A JSON document signed by a node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

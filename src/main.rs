@@ -555,6 +555,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Join { invite, node } => {
             let inv = Invite::decode(&invite)?;
+            check_invite_expiry(&inv)?;
             let key = keys::unb64_32(&inv.key)?;
             let mut cfg = create(&dir, node, inv.network, key, inv.bootstrap)?;
             cfg.network_id = inv.id;
@@ -1684,6 +1685,35 @@ fn invite_ticket(
     Ok((Some(proto::SignedDoc::sign(&ticket, &ident)), roster.admins))
 }
 
+/// An expired invite is refused right away instead of producing a node that can't connect.
+fn check_invite_expiry(inv: &Invite) -> Result<()> {
+    let Some(ticket) = &inv.ticket else {
+        return Ok(()); // open network: invites don't expire
+    };
+    let ticket = ticket
+        .open::<proto::Ticket>(|t| t.issuer)
+        .context("the invite is damaged (its admission ticket doesn't verify)")?;
+    let now = now_ms();
+    if now > ticket.expires {
+        bail!(
+            "this invite expired {} ago - ask an admin for a new one (meshvpn invite on an admin node; \
+             --expires 7d for a longer one). If that seems wrong, check this machine's clock.",
+            ago(now - ticket.expires)
+        );
+    }
+    Ok(())
+}
+
+fn ago(ms: u64) -> String {
+    let m = ms / 60_000;
+    match m {
+        0 => "less than a minute".into(),
+        1..120 => format!("{m} min"),
+        120..2880 => format!("{} h", m / 60),
+        _ => format!("{} days", m / 1440),
+    }
+}
+
 fn print_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64, json: bool) -> Result<()> {
     let inv = make_invite(dir, cfg, uses, valid_ms)?;
     if json {
@@ -1771,6 +1801,9 @@ fn print_status(st: &node::Status) {
             "  ssh server:   built-in (ssh <user>@{}.mesh, logins: meshvpn ssh list)",
             st.name
         );
+    }
+    if let Some(t) = &st.turned_away {
+        println!("  \x1b[1;31mnot admitted:\x1b[0m {t}");
     }
     if let Some(o) = &st.outbound_via {
         println!("  outgoing via: {o}");

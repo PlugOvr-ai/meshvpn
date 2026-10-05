@@ -179,6 +179,10 @@ struct State {
     claims: HashMap<NodeId, admin::Admitted>,
     trusted_admins: Vec<NodeId>,
     my_claim: Option<ClaimMsg>,
+    /// Why another node turned us away (name of that node, reason), until we are admitted.
+    rejected: Option<(String, String)>,
+    /// Refused logins to the built-in SSH server, for doctor/status.
+    ssh_refused: VecDeque<(u64, String)>,
     leases: Vec<Lease>,
 }
 
@@ -255,6 +259,12 @@ pub struct Status {
     /// Who answers `ssh user@<this node>.mesh`: "built-in", "sshd" or none.
     #[serde(default)]
     pub ssh_server: Option<String>,
+    /// Not connected because another node turned this one away: "<node>: <reason>".
+    #[serde(default)]
+    pub turned_away: Option<String>,
+    /// Recently refused logins to the built-in SSH server (newest last).
+    #[serde(default)]
+    pub ssh_refused: Vec<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -779,30 +789,71 @@ impl Node {
     }
 
     /// May the key `key` log in as `user`, coming from mesh address `ip`? Same rules as for
-    /// sshd (authorized_keys below). Returns `user@node` of the matching key.
-    pub fn ssh_login_allowed(&self, user: &str, ip: Ipv4Addr, key: &russh::keys::PublicKey) -> Option<String> {
+    /// sshd (authorized_keys below). Returns `user@node` of the matching key, or why not.
+    pub fn ssh_login_check(
+        &self,
+        user: &str,
+        ip: Ipv4Addr,
+        key: &russh::keys::PublicKey,
+    ) -> std::result::Result<String, String> {
         let st = self.state.lock().unwrap();
         let everyone = st.ssh_allow_all.iter().any(|u| u == user);
-        let rec = st.records.values().find(|r| overlay_ip(&r.info.id) == ip)?;
+        let Some(rec) = st.records.values().find(|r| overlay_ip(&r.info.id) == ip) else {
+            return Err(format!("{ip} is not a known mesh node"));
+        };
+        let node = &rec.info.name;
         if st.banned.contains_key(&rec.info.id) {
-            return None;
+            return Err(format!("{node} is banned"));
         }
         let rules: Vec<_> = st
             .ssh_allow
             .iter()
             .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
             .collect();
-        for k in &rec.info.ssh_keys {
-            if !(everyone || rules.iter().any(|r| r.from_user.as_ref().is_none_or(|u| *u == k.user))) {
-                continue;
-            }
+        if !everyone && rules.is_empty() {
+            return Err(format!(
+                "no rule lets {node} log in as {user} (allow it: meshvpn ssh allow {node} --as {user})"
+            ));
+        }
+        let allowed: Vec<&crate::proto::SshKey> = rec
+            .info
+            .ssh_keys
+            .iter()
+            .filter(|k| everyone || rules.iter().any(|r| r.from_user.as_ref().is_none_or(|u| *u == k.user)))
+            .collect();
+        for k in &allowed {
             if let Ok(pk) = russh::keys::PublicKey::from_openssh(&k.key)
                 && pk.key_data() == key.key_data()
             {
-                return Some(format!("{}@{}", k.user, rec.info.name));
+                return Ok(format!("{}@{}", k.user, rec.info.name));
             }
         }
-        None
+        let fp = key.fingerprint(russh::keys::HashAlg::Sha256);
+        if rec.info.ssh_keys.is_empty() {
+            return Err(format!(
+                "{node} publishes no SSH keys (meshvpn older than 0.5 there, publish_ssh_keys = false, or no \
+                 ~/.ssh/id_* keys of local users)"
+            ));
+        }
+        if allowed.is_empty() {
+            return Err(format!("the rules only allow users of {node} that publish no SSH key"));
+        }
+        let mut users: Vec<&str> = allowed.iter().map(|k| k.user.as_str()).collect();
+        users.dedup();
+        Err(format!(
+            "{node} does not publish the offered key {fp} (it publishes keys of {}; only ~/.ssh/id_ed25519, \
+             id_ecdsa and id_rsa of local users are published)",
+            users.join(", ")
+        ))
+    }
+
+    /// A refused login to the built-in SSH server, for doctor and `meshvpn ssh list`.
+    pub fn ssh_refused(&self, text: String) {
+        let mut st = self.state.lock().unwrap();
+        st.ssh_refused.push_back((now_ms(), text));
+        while st.ssh_refused.len() > 10 {
+            st.ssh_refused.pop_front();
+        }
     }
 
     /// What sshd asks (AuthorizedKeysCommand): keys that may log in as local `user`, each
@@ -1009,7 +1060,23 @@ impl Node {
             out.push_str("  (none)\n");
         }
         for k in keys {
-            out.push_str(&format!("  {:<16} {}\n", k.user, k.key.split(' ').next().unwrap_or("")));
+            let fp = russh::keys::PublicKey::from_openssh(&k.key)
+                .map(|p| p.fingerprint(russh::keys::HashAlg::Sha256).to_string())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  {:<16} {:<12} {fp}\n",
+                k.user,
+                k.key.split(' ').next().unwrap_or("")
+            ));
+        }
+        if !st.ssh_refused.is_empty() {
+            out.push_str("\nRecently refused logins (built-in SSH server):\n");
+            for (at, text) in &st.ssh_refused {
+                out.push_str(&format!(
+                    "  {} min ago: {text}\n",
+                    now_ms().saturating_sub(*at) / 60_000
+                ));
+            }
         }
         out
     }
@@ -1669,40 +1736,67 @@ impl Node {
         if peer == self.ident.id {
             bail!("connected to myself");
         }
-        {
+        // Membership checks: (our log message, what the turned-away node is told).
+        let refusal: Option<(String, String)> = {
             let mut st = self.state.lock().unwrap();
             if st.banned.contains_key(&peer) {
-                bail!("{} ({peer}) is banned", info.name);
-            }
-            // Managed network: the network key is not enough, the node needs an admission.
-            if !Self::admitted(&st, &peer) {
-                let Some(c) = hello.claim.clone() else {
-                    bail!(
-                        "{} ({peer}) is not admitted to this managed network (it needs an invite from an \
-                         admin: meshvpn invite on an admin node)",
-                        info.name
-                    );
-                };
-                match self.accept_claim(&mut st, c) {
-                    Ok(Some(m)) => self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None),
-                    Ok(None) => {}
-                    Err(e) => bail!("{} ({peer}) is not admitted: {e:#}", info.name),
+                Some((
+                    format!("{} ({peer}) is banned", info.name),
+                    "this node is banned from the network".into(),
+                ))
+            } else if !Self::admitted(&st, &peer) {
+                // Managed network: the network key is not enough, the node needs an admission.
+                match hello.claim.clone() {
+                    None => Some((
+                        format!(
+                            "{} ({peer}) is not admitted to this managed network (it needs an invite from an \
+                             admin: meshvpn invite on an admin node)",
+                            info.name
+                        ),
+                        "this network is managed: joining needs an invite from an admin (meshvpn invite on \
+                         an admin node)"
+                            .into(),
+                    )),
+                    Some(c) => match self.accept_claim(&mut st, c) {
+                        Ok(Some(m)) => {
+                            self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None);
+                            None
+                        }
+                        Ok(None) => None,
+                        Err(e) => Some((
+                            format!("{} ({peer}) is not admitted: {e:#}", info.name),
+                            format!("{e:#}"),
+                        )),
+                    },
                 }
+            } else {
+                None
             }
-            // An old network key is only good for members that got the new one sealed for
-            // them; they receive it right after connecting.
-            if version < st.key_version
-                && !st
-                    .rotation
-                    .as_ref()
-                    .is_some_and(|(_, r)| r.envelopes.iter().any(|e| e.to == peer))
-            {
-                bail!(
-                    "{} ({peer}) uses an outdated network key and was not a member when it changed \
-                     (banned, or it joined with an old invite - give it a new one)",
-                    info.name
-                );
-            }
+            .or_else(|| {
+                // An old network key is only good for members that got the new one sealed for
+                // them; they receive it right after connecting.
+                (version < st.key_version
+                    && !st
+                        .rotation
+                        .as_ref()
+                        .is_some_and(|(_, r)| r.envelopes.iter().any(|e| e.to == peer)))
+                .then(|| {
+                    (
+                        format!(
+                            "{} ({peer}) uses an outdated network key and was not a member when it changed \
+                             (banned, or it joined with an old invite - give it a new one)",
+                            info.name
+                        ),
+                        "the invite is from before the network key changed (a node was banned) - ask an \
+                         admin for a new one"
+                            .into(),
+                    )
+                })
+            })
+        };
+        if let Some((log, told)) = refusal {
+            let _ = timeout(Duration::from_secs(2), writer.send(&frame(T_REJECT, told.as_bytes()))).await;
+            bail!("{log}");
         }
 
         let (tx, rx) = mpsc::channel(1024);
@@ -1795,6 +1889,18 @@ impl Node {
                 T_MEASURE => self.handle_measure(peer, payload),
                 T_ROSTER | T_CLAIM => {
                     self.dispatch_admin(kind, peer, payload);
+                }
+                T_REJECT => {
+                    let why: String = String::from_utf8_lossy(payload).chars().take(300).collect();
+                    let mut st = self.state.lock().unwrap();
+                    let by = st
+                        .records
+                        .get(&peer)
+                        .map(|r| r.info.name.clone())
+                        .unwrap_or(peer.short());
+                    warn!("{by} turned this node away: {why}");
+                    st.rejected = Some((by, why.clone()));
+                    break format!("turned away: {why}");
                 }
                 T_BENCH_START => {
                     if let Ok(m) = serde_json::from_slice::<BenchMsg>(payload) {
@@ -2187,6 +2293,16 @@ impl Node {
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
             socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
+            turned_away: st
+                .rejected
+                .as_ref()
+                .filter(|_| st.links.is_empty())
+                .map(|(by, why)| format!("{by}: {why}")),
+            ssh_refused: st
+                .ssh_refused
+                .iter()
+                .map(|(at, text)| format!("{} min ago: {text}", now_ms().saturating_sub(*at) / 60_000))
+                .collect(),
             ssh_server: st.my_ssh_host_key.as_ref().map(|k| {
                 if *k == crate::sshserver::host_key_line(&self.ident) {
                     "built-in".to_string()

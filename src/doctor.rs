@@ -203,6 +203,14 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
         ));
     }
     let Some(st) = st else { return c };
+    if let Some(t) = &st.turned_away {
+        c.push(check(
+            "membership",
+            Level::Fail,
+            format!("the network turned this node away ({t})"),
+            Some("ask an admin for a new invite: meshvpn invite (on an admin node), then: sudo meshvpn join --force <invite>"),
+        ));
+    }
     let older = crate::update::is_newer(env!("CARGO_PKG_VERSION"), &st.version);
     if older {
         c.push(check(
@@ -356,6 +364,14 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     }
 
     // --- SSH logins
+    if let Some(last) = st.ssh_refused.last() {
+        c.push(check(
+            "ssh logins",
+            Level::Warn,
+            format!("refused recently ({last})"),
+            Some("all recent ones: meshvpn ssh list"),
+        ));
+    }
     if let Some(cfg) = &cfg {
         let has_rules = !cfg.ssh_allow.is_empty() || !cfg.ssh_allow_all.is_empty();
         if st.ssh_server.as_deref() == Some("built-in") {

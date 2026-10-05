@@ -235,6 +235,8 @@ def test_admin_invites(lab):
     c.up()
     time.sleep(8)
     check(not hub.online("c"), "a second node got in with a single-use invite")
+    wait(lambda: "already been used" in (c.status().get("turned_away") or ""), "c is told why", 20)
+    check("membership" in c.mv("doctor", ok=False).stdout, "doctor should show why c is not admitted")
     # network key only
     raw = json.loads(base64.urlsafe_b64decode(invite(hub)[6:] + "=="))
     raw.pop("ticket"), raw.pop("admins")
@@ -245,14 +247,14 @@ def test_admin_invites(lab):
     time.sleep(8)
     check(not hub.online("d"), "a node with only the network key got in")
     check("not admitted" in hub.log(), "refused attempts should be logged at the admin")
-    # expired
+    wait(lambda: "needs an invite" in (d.status().get("turned_away") or ""), "d is told why", 20)
+    # expired: refused right away, the existing setup stays
     expired = invite(hub, "--expires 2s")
     time.sleep(4)
-    c.stop()
-    c.mv(f"join --force {expired} --name c")
-    c.up()
-    time.sleep(8)
-    check(not hub.online("c"), "a node got in with an expired invite")
+    before = c.sh("cat /etc/meshvpn/config.toml")
+    p = c.mv(f"join --force {expired} --name c2", ok=False)
+    check(p.returncode != 0 and "expired" in p.stderr, f"joining with an expired invite should fail: {p.stderr}")
+    check(c.sh("cat /etc/meshvpn/config.toml") == before, "a refused join must not change the config")
     # admin-only actions
     check(a.mv("invite", ok=False).returncode != 0, "a member could invite")
     check(a.mv("ban b", ok=False).returncode != 0, "a member could ban")
@@ -297,6 +299,7 @@ def test_ban(lab):
     bad.up()
     time.sleep(10)
     check(not hub.online("sneaky"), "a banned machine got back in with an invite from before the ban")
+    wait(lambda: "key changed" in (bad.status().get("turned_away") or ""), "sneaky is told why", 20)
     # A fresh invite from the admin works (that is the admin's decision).
     bad.stop()
     bad.mv(f"join --force {invite(hub)} --name newcomer")
@@ -679,6 +682,16 @@ def test_builtin_ssh(lab):
         check(p.returncode == 0 and p.stdout.strip() == "agent", f"login to {n}: {p.stdout} {p.stderr}")
     p = ssh("root@box.mesh", "whoami")
     check(p.returncode != 0 and "root" not in p.stdout, "root must not be allowed")
+    # refused logins say why (meshvpn ssh list, doctor)
+    box.mv("ssh allow everyone --as ghost")
+    check(ssh("ghost@box.mesh", "true").returncode != 0, "ghost does not exist")
+    hub.sh("ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/other", user="agent")
+    check(ssh("-i ~/.ssh/other -o IdentitiesOnly=yes agent@box.mesh", "true").returncode != 0, "unpublished key")
+    refused = wait(lambda: (lambda t: t if t.count("min ago") >= 3 else None)(box.mv("ssh list")),
+                   "refusals listed", 10)
+    for why in ("no rule lets hub log in as root", "no user ghost here", "does not publish the offered key"):
+        check(why in refused, f"missing reason {why!r}:\n{refused}")
+    check("refused recently" in box.mv("doctor", ok=False).stdout, "doctor should mention refused logins")
     check(ssh("agent@box.mesh", "'exit 7'").returncode == 7, "exit code")
     check(ssh("agent@box.mesh", "cat", input="through stdin\n").stdout == "through stdin\n", "stdin")
     p = ssh("agent@box.mesh", "'echo out; echo err >&2'")
