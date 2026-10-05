@@ -52,6 +52,9 @@ pub struct Job {
     /// running, succeeded, failed, stopped
     pub state: String,
     pub started: u64,
+    /// The same in milliseconds, to order jobs started within one second.
+    #[serde(default)]
+    pub started_ms: u64,
     #[serde(default)]
     pub finished: Option<u64>,
     pub pid: u32,
@@ -115,7 +118,7 @@ impl Job {
             .flatten()
             .filter_map(|e| Job::load(&e.file_name().to_string_lossy()).ok())
             .collect();
-        jobs.sort_by_key(|j| std::cmp::Reverse(j.started));
+        jobs.sort_by_key(|j| std::cmp::Reverse((j.started, j.started_ms)));
         jobs
     }
 }
@@ -296,6 +299,10 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
         master: master.name.clone(),
         state: "running".into(),
         started: now_s(),
+        started_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
         finished: None,
         pid: std::process::id(),
         dir: dir_path.display().to_string(),

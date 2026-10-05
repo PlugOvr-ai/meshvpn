@@ -709,6 +709,9 @@ impl Node {
 
     /// Who answers port 22 here, published with our record (host key) - checked regularly.
     fn ssh_check(&self) {
+        // Decided under the lock: a check that started before the listener came up must not
+        // overwrite the result of one that started after.
+        let mut st = self.state.lock().unwrap();
         let builtin = match self.io {
             PacketIo::Userspace(_) => self.ssh_builtin_userspace(),
             PacketIo::Tun(_) => self.ssh_listening.load(Ordering::Relaxed),
@@ -720,7 +723,6 @@ impl Node {
         } else {
             None
         };
-        let mut st = self.state.lock().unwrap();
         if st.my_ssh_host_key != key {
             if builtin && st.my_ssh_host_key.is_none() {
                 info!(

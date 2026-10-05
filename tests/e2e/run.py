@@ -288,7 +288,9 @@ def test_ban(lab):
     wait(lambda: not hub.online("bad"), "bad dropped")
     a.up()
     wait(lambda: a.online("hub"), "a reconnects after the key change", timeout=60)
-    check(a.sh("grep -c '^key_version = 1' /etc/meshvpn/config.toml").strip() == "1", "a didn't get the new key")
+    # The new key is saved right after the reconnect, not necessarily before.
+    wait(lambda: a.sh("grep -c '^key_version = 1' /etc/meshvpn/config.toml", ok=False).stdout.strip() == "1",
+         "a saves the new key", 15)
     # An unused invite from before the ban carries the old key: worthless now, even with a new identity.
     bad.stop()
     bad.mv(f"join --force {pre_ban} --name sneaky")
@@ -451,7 +453,9 @@ def test_launch(lab):
     wait(lambda: leftover() == 2, "detached job running", 20)
     ctl.sh(f"kill -9 {job['pid']}")
     wait(lambda: leftover() == 0, "kill -9 of the launcher leaves nothing", 30)
-    check(ctl.mvj("jobs list", user="agent")[0]["state"] == "lost", "job should be 'lost'")
+    jobs = ctl.mvj("jobs list", user="agent")
+    check(jobs[0]["id"] == job["id"], f"newest job first: {[j['id'] for j in jobs]}")
+    check(jobs[0]["state"] == "lost", f"job should be 'lost': {jobs[0]}")
 
 
 @test
