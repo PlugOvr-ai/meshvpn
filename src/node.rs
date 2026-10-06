@@ -168,6 +168,8 @@ struct State {
     measured: u64,
     udp_paths: HashMap<NodeId, udp::UdpPath>,
     udp_probing: HashMap<NodeId, udp::Probing>,
+    /// Datagrams split because a path can't carry full-size ones, being put back together.
+    udp_frags: HashMap<([u8; 8], u32), udp::Reassembly>,
     /// Our public UDP address(es) as other nodes see them.
     udp_reflexive: Vec<SocketAddr>,
     udp_keys: HashMap<NodeId, [u8; 32]>,
@@ -2240,7 +2242,11 @@ impl Node {
                 let id = r.info.id;
                 let udp = st.udp_paths.get(&id).filter(|p| p.usable());
                 let path = if let Some(p) = udp {
-                    format!("direct UDP {}", p.addr)
+                    format!(
+                        "direct UDP {}{}",
+                        p.addr,
+                        if p.splitting() { " (small MTU: splitting)" } else { "" }
+                    )
                 } else if let Some(l) = st.links.get(&id) {
                     format!("direct {}", l.addr)
                 } else if let Some(hop) = st.routes.get(&id) {

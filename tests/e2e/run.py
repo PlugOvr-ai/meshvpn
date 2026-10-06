@@ -804,6 +804,28 @@ def test_console(lab):
 
 
 @test
+def test_small_mtu(lab):
+    """A path that drops big UDP datagrams (VPN, WSL2): detected, packets split, TCP and ssh still work."""
+    net, (hub, a, b) = mesh(lab, ["hub", "a", "b"], join_args="--ssh-allow-all agent")
+    # b's network drops UDP datagrams of 1300 bytes and more; small probes still pass.
+    for chain, port in (("INPUT", "--dport"), ("OUTPUT", "--sport")):
+        b.sh(f"iptables -A {chain} -p udp {port} 7870 -m length --length 1300:65535 -j DROP")
+    wait(lambda: "direct UDP" in (a.peer("b") or {}).get("path", ""), "direct UDP path a-b")
+    wait(lambda: "splitting" in a.peer("b")["path"], "a notices the small path to b", 30)
+    b.sh("mkdir -p /srv && head -c 5000000 /dev/urandom > /srv/blob && (cd /srv && python3 -m http.server 8080 >/dev/null 2>&1 &)")
+    time.sleep(1)
+    want = b.sh("sha256sum /srv/blob | cut -c1-16").strip()
+    got = a.sh("curl -s -m 60 http://b.mesh:8080/blob | sha256sum | cut -c1-16", ok=False).stdout.strip()
+    check(got == want, f"5 MB over the small path: {got!r} != {want!r}")
+    check("direct UDP" in a.peer("b")["path"], f"should still go direct: {a.peer('b')['path']}")
+    a.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    wait(lambda: a.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=8 agent@b.mesh echo ok'", ok=False).stdout.strip() == "ok",
+         "ssh (big key exchange) over the small path", 60)
+    # A normal path is not split.
+    check("splitting" not in a.peer("hub")["path"], f"a-hub should carry full size: {a.peer('hub')['path']}")
+
+
+@test
 def test_container_install(lab):
     """meshvpn install in a container whose systemctl only says "Running in chroot, ignoring command"."""
     net, (hub,) = mesh(lab, ["hub"])

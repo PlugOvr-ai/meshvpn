@@ -11,6 +11,13 @@
 //!   probe  A1 | src id 32 | dst id 32 | timestamp 8 | nonce 8 | mac 16
 //!   ack    A2 | src id 32 | dst id 32 | timestamp 8 | nonce 8 | seen-as ip 4 + port 2 | mac 16
 //!   data   A3 | src id prefix 8 | nonce 24 | XChaCha20-Poly1305(packet)   (49 bytes overhead)
+//!   frag   A4 | src id prefix 8 | message 4 | index 1 | count 1 | part of a data datagram
+//!
+//! Path MTU: a full-size packet makes a datagram of about 1450 bytes, more than some paths
+//! carry (VPNs, mobile networks, WSL2's NAT, which also drops IP fragments). Small probes get
+//! through there, but big packets vanish - TCP connections hang. So each path is tested with
+//! a probe padded to full size; until that is answered, data datagrams over 1200 bytes are
+//! split into parts that fit any path (only towards nodes that can put them together).
 
 use super::*;
 use std::net::SocketAddrV4;
@@ -19,6 +26,13 @@ use tokio::net::UdpSocket;
 const PROBE: u8 = 0xA1;
 const ACK: u8 = 0xA2;
 const DATA: u8 = 0xA3;
+const FRAG: u8 = 0xA4;
+/// Datagram size that fits every path that carries 1280-byte IP packets.
+const SAFE_DATAGRAM: usize = 1200;
+/// Nodes from this version on understand padded probes and fragments.
+const FRAG_VERSION: &str = "0.12.2";
+/// How often a path's full-size capacity is checked again.
+const BIG_RECHECK: Duration = Duration::from_secs(300);
 /// A path without anything heard for this long is dropped.
 pub(super) const PATH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
@@ -32,13 +46,31 @@ pub(super) struct UdpPath {
     /// Liveness checks while sending: probes sent since the peer was last heard.
     last_probe: Instant,
     unanswered: u32,
+    /// Full-size datagrams get through (answered padded probe); None: not known yet.
+    big: Option<bool>,
+    /// The peer can reassemble split datagrams.
+    frags: bool,
+    /// The padded probe in flight (its nonce) and when the next check is due.
+    big_probe: Option<(u64, Instant)>,
+    big_next: Instant,
 }
 
 impl UdpPath {
+    /// Large datagrams are split on this path.
+    pub fn splitting(&self) -> bool {
+        self.frags && self.big != Some(true)
+    }
+
     /// Good for data: heard recently, and not ignoring our checks.
     pub fn usable(&self) -> bool {
         self.last_rx.elapsed() < Duration::from_secs(15) && self.unanswered < 4
     }
+}
+
+/// A split datagram being put back together.
+pub(super) struct Reassembly {
+    started: Instant,
+    parts: Vec<Option<Vec<u8>>>,
 }
 
 /// Probing state per peer without a path.
@@ -121,7 +153,22 @@ impl Node {
         seen: Option<SocketAddrV4>,
         key: &[u8; 32],
     ) -> Vec<u8> {
-        let mut d = Vec::with_capacity(103);
+        self.padded_datagram(kind, dst, ts, nonce, seen, key, 0)
+    }
+
+    /// A probe padded to `size` bytes (0: no padding), to test what a path carries.
+    #[allow(clippy::too_many_arguments)]
+    fn padded_datagram(
+        &self,
+        kind: u8,
+        dst: &NodeId,
+        ts: u64,
+        nonce: u64,
+        seen: Option<SocketAddrV4>,
+        key: &[u8; 32],
+        size: usize,
+    ) -> Vec<u8> {
+        let mut d = Vec::with_capacity(size.max(103));
         d.push(kind);
         d.extend_from_slice(&self.ident.id.0);
         d.extend_from_slice(&dst.0);
@@ -130,6 +177,9 @@ impl Node {
         if let Some(s) = seen {
             d.extend_from_slice(&s.ip().octets());
             d.extend_from_slice(&s.port().to_be_bytes());
+        }
+        if size > d.len() + 16 {
+            d.resize(size - 16, 0);
         }
         let m = mac(key, &d);
         d.extend_from_slice(&m);
@@ -153,6 +203,28 @@ impl Node {
             let Some(key) = self.probe_key(&mut st, &peer) else {
                 continue;
             };
+            // Full-size check of a path (towards nodes that understand padded probes).
+            if let Some(p) = st.udp_paths.get_mut(&peer)
+                && p.frags
+            {
+                if let Some((_, sent)) = p.big_probe
+                    && sent.elapsed() > Duration::from_secs(3)
+                {
+                    p.big_probe = None;
+                    if p.big != Some(false) {
+                        debug!("udp: full-size datagrams don't reach {peer}: splitting them");
+                    }
+                    p.big = Some(false);
+                }
+                if p.big_probe.is_none() && p.big_next <= now {
+                    let nonce = rand::rngs::OsRng.next_u64();
+                    p.big_probe = Some((nonce, now));
+                    p.big_next = now + BIG_RECHECK;
+                    let size = self.cfg.mtu as usize + 49;
+                    let d = self.padded_datagram(PROBE, &peer, now_ms(), nonce, None, &key, size);
+                    let _ = sock.try_send_to(&d, p.addr);
+                }
+            }
             let targets: Vec<SocketAddr> = match st.udp_paths.get(&peer) {
                 Some(p) if p.last_rx.elapsed() < KEEPALIVE => continue,
                 Some(p) => vec![p.addr],
@@ -204,8 +276,9 @@ impl Node {
                 let probe = self.probe_datagram(PROBE, dst, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
                 let _ = sock.try_send_to(&probe, addr);
             }
-            p.addr
+            (p.addr, p.splitting())
         };
+        let (addr, split) = addr;
         let mut nonce = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let Ok(ct) = cipher.encrypt(&XNonce::from(nonce), pkt) else {
@@ -217,8 +290,58 @@ impl Node {
         d.extend_from_slice(&nonce);
         d.extend_from_slice(&ct);
         // A full socket buffer drops the packet, like a congested link would.
-        let _ = sock.try_send_to(&d, addr);
+        if split && d.len() > SAFE_DATAGRAM {
+            let id = rand::rngs::OsRng.next_u32();
+            let chunk = SAFE_DATAGRAM - 15;
+            let count = d.len().div_ceil(chunk);
+            for (i, part) in d.chunks(chunk).enumerate() {
+                let mut f = Vec::with_capacity(15 + part.len());
+                f.push(FRAG);
+                f.extend_from_slice(&self.ident.id.0[..8]);
+                f.extend_from_slice(&id.to_be_bytes());
+                f.push(i as u8);
+                f.push(count as u8);
+                f.extend_from_slice(part);
+                let _ = sock.try_send_to(&f, addr);
+            }
+        } else {
+            let _ = sock.try_send_to(&d, addr);
+        }
         true
+    }
+
+    /// A part of a split datagram; the whole datagram once all parts are there.
+    fn udp_frag(&self, d: &[u8]) -> Option<Vec<u8>> {
+        if d.len() < 16 {
+            return None;
+        }
+        let prefix: [u8; 8] = d[1..9].try_into().ok()?;
+        let id = u32::from_be_bytes(d[9..13].try_into().ok()?);
+        let (index, count) = (d[13] as usize, d[14] as usize);
+        if !(2..=8).contains(&count) || index >= count {
+            return None;
+        }
+        let mut st = self.state.lock().unwrap();
+        st.id_prefix.get(&prefix)?; // only known nodes (the data is authenticated as a whole)
+        if st.udp_frags.len() > 256 {
+            st.udp_frags.retain(|_, r| r.started.elapsed() < Duration::from_secs(2));
+            if st.udp_frags.len() > 256 {
+                return None;
+            }
+        }
+        let r = st.udp_frags.entry((prefix, id)).or_insert_with(|| Reassembly {
+            started: Instant::now(),
+            parts: vec![None; count],
+        });
+        if r.parts.len() != count {
+            return None;
+        }
+        r.parts[index] = Some(d[15..].to_vec());
+        if r.parts.iter().any(|p| p.is_none()) {
+            return None;
+        }
+        let r = st.udp_frags.remove(&(prefix, id))?;
+        Some(r.parts.into_iter().flatten().flatten().collect())
     }
 
     pub(super) async fn udp_loop(self: Arc<Self>) {
@@ -237,6 +360,14 @@ impl Node {
                         self.deliver(pkt).await;
                     }
                 }
+                Some(&FRAG) => {
+                    if let Some(whole) = self.udp_frag(d)
+                        && whole.first() == Some(&DATA)
+                        && let Some(pkt) = self.udp_data(&whole, from)
+                    {
+                        self.deliver(pkt).await;
+                    }
+                }
                 _ => {}
             }
         }
@@ -244,10 +375,12 @@ impl Node {
 
     fn udp_control(&self, sock: &UdpSocket, d: &[u8], from: SocketAddr) {
         let ack = d[0] == ACK;
+        // Probes may be padded (full-size checks); acks never are.
         let len = if ack { 103 } else { 97 };
-        if d.len() != len {
+        if d.len() < len || (ack && d.len() != len) || d.len() > 2048 {
             return;
         }
+        let len = d.len();
         let (Ok(src), Ok(dst)) = (NodeId::from_slice(&d[1..33]), NodeId::from_slice(&d[33..65])) else {
             return;
         };
@@ -280,12 +413,33 @@ impl Node {
             return;
         }
         // An answer to our probe: the path works in both directions.
+        if let Some(p) = st.udp_paths.get_mut(&src)
+            && p.big_probe.is_some_and(|(n, _)| n == nonce)
+        {
+            p.big_probe = None;
+            if p.big != Some(true) {
+                debug!("udp: full-size datagrams reach {src}");
+            }
+            p.big = Some(true);
+            p.last_rx = Instant::now();
+            return;
+        }
         let rtt = Duration::from_millis(now_ms().saturating_sub(ts));
         let seen = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(d[81], d[82], d[83], d[84])),
             u16::from_be_bytes([d[85], d[86]]),
         );
         let fresh = !st.udp_paths.contains_key(&src);
+        let frags = st
+            .records
+            .get(&src)
+            .is_some_and(|r| crate::update::at_least(&r.info.version, FRAG_VERSION));
+        let old = st.udp_paths.remove(&src);
+        // Same address: keep what is known about its capacity.
+        let (big, big_probe, big_next) = match old {
+            Some(o) if o.addr == from => (o.big, o.big_probe, o.big_next),
+            _ => (None, None, Instant::now()),
+        };
         st.udp_paths.insert(
             src,
             UdpPath {
@@ -294,6 +448,10 @@ impl Node {
                 rtt: Some(rtt),
                 last_probe: Instant::now(),
                 unanswered: 0,
+                big,
+                frags,
+                big_probe,
+                big_next,
             },
         );
         st.udp_probing.remove(&src);

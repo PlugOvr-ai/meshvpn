@@ -30,6 +30,11 @@ fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     Some((it.next()??, it.next()?.unwrap_or(0), it.next().flatten().unwrap_or(0)))
 }
 
+/// `version` is `min` or newer (unknown versions are not).
+pub fn at_least(version: &str, min: &str) -> bool {
+    matches!((parse_version(version), parse_version(min)), (Some(v), Some(m)) if v >= m)
+}
+
 pub fn is_newer(latest: &str, current: &str) -> bool {
     matches!((parse_version(latest), parse_version(current)), (Some(l), Some(c)) if l > c)
 }
