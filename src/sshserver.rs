@@ -553,11 +553,14 @@ fn command(
     term: Option<&str>,
     pty: bool,
 ) -> tokio::process::Command {
+    let shell = match what {
+        What::Shell => interactive_shell(&acct.shell),
+        _ => acct.shell.clone(),
+    };
     let mut cmd = match what {
         What::Shell => {
-            let mut c = tokio::process::Command::new(&acct.shell);
-            let base = acct
-                .shell
+            let mut c = tokio::process::Command::new(&shell);
+            let base = shell
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or("sh".into());
@@ -592,7 +595,7 @@ fn command(
     cmd.env("HOME", &acct.home)
         .env("USER", &acct.name)
         .env("LOGNAME", &acct.name)
-        .env("SHELL", &acct.shell)
+        .env("SHELL", &shell)
         .env("SSH_CONNECTION", conn_env);
     let mut parts = conn_env.split(' ');
     if let (Some(ip), Some(port), Some(_), Some(lport)) = (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -633,6 +636,25 @@ fn command(
     }
     cmd.kill_on_drop(false);
     cmd
+}
+
+/// The shell for an interactive login: the account's, unless that is a bare `sh` (accounts
+/// made with `useradd` in containers get dash: no history, no completion) and bash exists.
+/// Commands keep the account's shell.
+fn interactive_shell(account: &Path) -> PathBuf {
+    let real = std::fs::canonicalize(account).unwrap_or_else(|_| account.to_path_buf());
+    let bare = ["sh", "dash", "ash"]
+        .iter()
+        .any(|n| real.file_name().is_some_and(|f| f == *n));
+    if bare
+        && let Some(bash) = ["/bin/bash", "/usr/bin/bash"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.is_file())
+    {
+        return bash.to_path_buf();
+    }
+    account.to_path_buf()
 }
 
 fn exit_code(status: std::process::ExitStatus) -> u32 {

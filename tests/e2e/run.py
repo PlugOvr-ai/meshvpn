@@ -707,6 +707,13 @@ def test_builtin_ssh(lab):
     check(env[0] == "/home/agent agent" and env[1].startswith(hub.ip()), f"environment: {env}")
     p = ssh("-tt agent@box.mesh", "'tty; stty size'")
     check("/dev/pts/" in p.stdout, f"pty: {p.stdout!r} {p.stderr!r}")
+    # An account made with plain useradd has /bin/sh (dash): interactive logins get bash anyway
+    # (history, completion), commands keep the account's shell.
+    box.sh("useradd -m plain")
+    box.mv("ssh allow everyone --as plain")
+    p = hub.sh(f"ssh {o} -tt plain@box.mesh", user="agent", ok=False, input="echo SHELLIS-$BASH_VERSION-$SHELL\nexit\n")
+    check("SHELLIS-5" in p.stdout and "/bin/bash" in p.stdout, f"interactive login should be bash: {p.stdout[-300:]!r}")
+    check(ssh("plain@box.mesh", "'echo X${BASH_VERSION}X'").stdout.strip() == "XX", "commands keep /bin/sh")
     # scp (sftp protocol) both ways, sftp batch
     hub.sh("head -c 5000000 /dev/urandom > ~/blob", user="agent")
     want = hub.sh("sha256sum ~/blob | cut -c1-16", user="agent").strip()
