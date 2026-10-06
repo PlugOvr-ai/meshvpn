@@ -39,6 +39,7 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tun = { version = "0.8.14", features = ["async"] }
+vt100 = "0.16"
 x11rb = { version = "0.14.0", features = ["shm", "xtest", "damage", "xfixes", "randr"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 

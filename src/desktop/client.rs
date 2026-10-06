@@ -48,39 +48,101 @@ impl Target {
     }
 }
 
+/// A running viewer: its link (with the access token) and port.
+pub struct Viewer {
+    pub url: String,
+    pub port: u16,
+}
+
+/// Serves the viewer for `target` in the background and returns its link. In an SSH session
+/// (port 0) a fixed port from 7880 on, so the forwarding command stays the same.
+pub fn start(target: Target, port: u16) -> Result<Viewer> {
+    let listener = if port == 0 && ssh_session().is_some() {
+        (7880..7900)
+            .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())
+            .map(Ok)
+            .unwrap_or_else(|| std::net::TcpListener::bind(("127.0.0.1", 0)))
+    } else {
+        std::net::TcpListener::bind(("127.0.0.1", port))
+    }
+    .context("listening on 127.0.0.1")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let token: String = crate::keys::random32()[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let url = format!("http://127.0.0.1:{port}/#{token}");
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Runtime::new() else { return };
+        rt.block_on(async move {
+            let Ok(listener) = TcpListener::from_std(listener) else {
+                return;
+            };
+            let target = Arc::new(target);
+            let token = Arc::new(token);
+            while let Ok((stream, _)) = listener.accept().await {
+                let (target, token) = (target.clone(), token.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = handle(stream, &target, &token).await {
+                        tracing::debug!("viewer connection: {e:#}");
+                    }
+                });
+            }
+        });
+    });
+    Ok(Viewer { url, port })
+}
+
+/// `meshvpn desktop <node>`: print the link, open the browser, serve until Ctrl+C.
 pub fn run(target: Target, port: u16, open_browser: bool) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .context("listening on 127.0.0.1")?;
-        let addr = listener.local_addr()?;
-        let token = crate::keys::random32()[..12]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let url = format!("http://{addr}/#{token}");
-        println!("Desktop of {}: {url}", target.label());
-        if open_browser && !open_url(&url) {
-            println!(
-                "(open it in a browser on this machine; from elsewhere: ssh -L {}:127.0.0.1:{} ...)",
-                addr.port(),
-                addr.port()
-            );
+    let label = target.label();
+    let v = start(target, port)?;
+    println!("Desktop of {label}: {}", v.url);
+    match ssh_hint(v.port) {
+        Some(lines) => {
+            for l in lines {
+                println!("{l}");
+            }
         }
-        println!("Press Ctrl+C to stop.");
-        let target = Arc::new(target);
-        let token = Arc::new(token);
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let (target, token) = (target.clone(), token.clone());
-            tokio::spawn(async move {
-                if let Err(e) = handle(stream, &target, &token).await {
-                    tracing::debug!("viewer connection: {e:#}");
-                }
-            });
+        None => {
+            if open_browser && !open_url(&v.url) {
+                println!("(open it in a browser on this machine)");
+            }
         }
-    })
+    }
+    println!("Press Ctrl+C to stop.");
+    loop {
+        std::thread::park();
+    }
+}
+
+/// (server address, server port, user) when running inside an SSH login.
+pub fn ssh_session() -> Option<(String, u16, String)> {
+    let c = std::env::var("SSH_CONNECTION").ok()?;
+    let f: Vec<&str> = c.split_whitespace().collect();
+    let (ip, port) = (f.get(2)?.to_string(), f.get(3)?.parse().ok()?);
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| Remote::default_user());
+    Some((ip, port, user))
+}
+
+/// How to reach a viewer on this machine from the computer the SSH login came from.
+pub fn ssh_hint(port: u16) -> Option<Vec<String>> {
+    let (ip, sport, user) = ssh_session()?;
+    let host = if ip.contains(':') { format!("[{ip}]") } else { ip };
+    let p = if sport == 22 {
+        String::new()
+    } else {
+        format!(" -p {sport}")
+    };
+    Some(vec![
+        "You are logged in over SSH, so open it on the computer you came from:".into(),
+        format!("  ssh -L {port}:127.0.0.1:{port}{p} {user}@{host}"),
+        "  (or in this SSH session: press Enter, type ~C, then".into(),
+        format!("   -L {port}:127.0.0.1:{port} and Enter) - then open the link there."),
+    ])
 }
 
 fn open_url(url: &str) -> bool {

@@ -10,6 +10,6 @@ RUN apt-get update -qq \
  && mkdir -p /run/sshd && ssh-keygen -A \
  && useradd -m -s /bin/bash agent
 COPY fixtures/torchrun /usr/local/bin/torchrun
-COPY fixtures/desktop_client.py /usr/local/bin/desktop_client.py
-RUN chmod 755 /usr/local/bin/torchrun /usr/local/bin/desktop_client.py
+COPY fixtures/desktop_client.py fixtures/console_driver.py /usr/local/bin/
+RUN chmod 755 /usr/local/bin/torchrun /usr/local/bin/desktop_client.py /usr/local/bin/console_driver.py
 CMD ["/usr/sbin/sshd", "-D", "-e"]

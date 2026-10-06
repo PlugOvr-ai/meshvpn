@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod console;
 mod control;
 mod desktop;
 mod doctor;
@@ -43,7 +44,7 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -227,6 +228,12 @@ enum Cmd {
     Ssh {
         #[command(subcommand)]
         cmd: Option<SshCmd>,
+    },
+    /// The mesh in your terminal: all nodes, and shells on them as tabs (also plain `meshvpn`).
+    Console {
+        /// Account for the shells on other nodes (default: you).
+        #[arg(short, long)]
+        user: Option<String>,
     },
     /// A node's graphical desktop in your browser, e.g. `meshvpn desktop gpu-box` (also in
     /// containers without X: meshvpn brings its own). Logins as with `meshvpn ssh`.
@@ -566,7 +573,17 @@ fn real_main(cli: Cli) -> Result<i32> {
     config::set_rootless(&dir);
     let json = cli.json;
     load_proxy_env(&dir);
-    match cli.cmd {
+    // Plain `meshvpn` in a terminal of a set-up machine: the console.
+    let Some(cmd) = cli.cmd else {
+        if unsafe { libc::isatty(1) } == 1 && Config::path(&dir).exists() {
+            console::run(&dir, None)?;
+        } else {
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+        }
+        return Ok(0);
+    };
+    match cmd {
         Cmd::Init { network, open, node } => {
             let key = keys::random32();
             let cfg = create(&dir, node, config::sanitize_name(&network), key, vec![])?;
@@ -1232,6 +1249,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::SftpServer => sshserver::sftp_server()?,
+        Cmd::Console { user } => console::run(&dir, user)?,
         Cmd::Desktop {
             cmd,
             node,

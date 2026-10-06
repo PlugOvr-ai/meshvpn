@@ -507,7 +507,7 @@ impl russh::server::Handler for Conn {
 // ---------------------------------------------------------------------------------------------
 // Processes
 
-fn set_winsize(fd: libc::c_int, cols: u16, rows: u16) {
+pub(crate) fn set_winsize(fd: libc::c_int, cols: u16, rows: u16) {
     let ws = libc::winsize {
         ws_row: rows,
         ws_col: cols,
@@ -707,7 +707,7 @@ async fn run_pipes(
     Ok(())
 }
 
-fn openpty(cols: u16, rows: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn openpty(cols: u16, rows: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let (mut master, mut slave) = (0, 0);
     let ws = libc::winsize {
         ws_row: rows,

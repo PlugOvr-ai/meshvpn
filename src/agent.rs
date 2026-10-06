@@ -256,6 +256,30 @@ impl Remote {
         c.arg(format!("{}@{}.mesh", self.user, node.name)).arg(script);
         c
     }
+
+    /// An interactive login shell on `node` (for a terminal): ssh -t, prompts allowed.
+    pub(crate) fn shell(&self, node: &NodeView) -> Command {
+        if node.is_self {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let mut c = Command::new(shell);
+            c.arg("-l");
+            return c;
+        }
+        let mut c = Command::new("ssh");
+        c.args([
+            "-t",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+        ]);
+        if self.socks {
+            let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
+            c.args(["-o", &format!("ProxyCommand={} nc %h %p", exe.display())]);
+        }
+        c.arg(format!("{}@{}.mesh", self.user, node.name));
+        c
+    }
 }
 
 #[derive(Serialize)]

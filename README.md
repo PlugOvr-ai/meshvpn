@@ -242,6 +242,21 @@ applications you want to run.
 * **First use** downloads the bundle by itself; on machines without internet copy `meshvpn-desktop-<arch>.tar.gz` from
   the release and run `meshvpn desktop setup --from <file>` (also handy in a Dockerfile).
 * Apps get a UTF-8 locale and the bundled DejaVu fonts if the image has none. Not yet: OpenGL/GPU acceleration, sound.
+* **Logged in over SSH** (e.g. on your main node from outside the mesh)? `meshvpn desktop` notices and prints the
+  matching forward, e.g. `ssh -L 7880:127.0.0.1:7880 you@main-node` - run it on your computer (or add it to the open
+  session with Enter `~C`), then open the link in your local browser.
+
+## The console: the mesh in your terminal
+
+```sh
+meshvpn            # in a terminal, on a set-up machine (or: meshvpn console [-u user])
+```
+
+For when all you have is an SSH login: a full-screen terminal desktop. Tab **0** lists the nodes (status, path, RTT,
+GPUs, tags; details of the selected one below). **Enter** opens a shell on the selected node in a new tab (ssh, or a
+local shell for this machine), **u** as another user, **d** prints a desktop link (with the `ssh -L` hint).
+Switch with **Alt+0..9**, **Alt+←/→**, or **Ctrl+B** and then `0..9`, `n`, `p`, `w` (close), `d` - like tmux.
+**Shift+PgUp** scrolls back; text selection works as usual in your terminal.
 
 ## AI agents and multi-node work
 

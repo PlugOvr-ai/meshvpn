@@ -777,6 +777,33 @@ def test_desktop(lab):
 
 
 @test
+def test_console(lab):
+    """meshvpn console: node list, shells on nodes as tabs, desktop link with the ssh -L hint."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    box.mv(f"join {invite(hub)} --name box --ssh-allow-all agent")
+    box.up()
+    wait(lambda: hub.online("box") and box.status().get("ssh_server") == "built-in", "box online with ssh")
+    wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
+         "ssh from hub to box", 60)
+    steps = [
+        "expect:NODE", "expect:box",
+        "key:down", "key:enter", "expect:agent@box",
+        "send:echo MARK-$(hostname)\\r", "expect:MARK-box",
+        "send:\\x020", "expect:shells as agent",   # Ctrl+B 0: back to the node list
+        "send:\\x021", "send:exit\\r", "expect:session ended",
+        "key:enter", "send:d", "expect:ssh -L 7880:127.0.0.1:7880 -p 2222 agent@10.1.2.3",
+    ]
+    quoted = " ".join("'" + s + "'" for s in steps)
+    p = hub.sh(f"SSH_CONNECTION='10.9.9.9 50000 10.1.2.3 2222' console_driver.py {quoted}", user="agent", ok=False, timeout=120)
+    check(p.returncode == 0, f"console: {p.stdout[-3000:]}{p.stderr[-500:]}")
+
+
+@test
 def test_container_install(lab):
     """meshvpn install in a container whose systemctl only says "Running in chroot, ignoring command"."""
     net, (hub,) = mesh(lab, ["hub"])
