@@ -339,6 +339,7 @@ Every node gets `MASTER_ADDR`, `NODE_RANK`, `NCCL_SOCKET_IFNAME` and so on (the 
 one); torchrun gets `--nnodes`, `--node_rank` and the rendezvous added. If one node fails, the others are stopped.
 `--detach` runs it in the background; `meshvpn jobs list`, `meshvpn jobs logs <id>` and `meshvpn jobs stop <id>`
 follow up. For your own launcher: `eval $(meshvpn net env --master gpu1 tag:gpu)` on each node.
+The [distributed training tutorial](distributed-training.md) walks through all of it with a runnable example.
 
 **AI agents** (e.g. Claude Code) get all of this as tools: `claude mcp add meshvpn -- meshvpn mcp`.
 

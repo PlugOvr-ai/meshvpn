@@ -164,6 +164,8 @@ struct State {
     /// Throughput tests: being received (per peer), and waiting for their result.
     bench_rx: HashMap<NodeId, (u64, Instant, u64)>,
     bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
+    /// Throughput tests over the data path being received: id -> (first, bytes, last).
+    bench_ip_rx: HashMap<u64, (Instant, u64, Instant)>,
     measure_seen: HashSet<u64>,
     measured: u64,
     udp_paths: HashMap<NodeId, udp::UdpPath>,
@@ -207,6 +209,24 @@ pub struct Node {
     ssh_cfg: Arc<russh::server::Config>,
     /// Kernel mode: the built-in SSH server listens on the mesh address.
     ssh_listening: std::sync::atomic::AtomicBool,
+}
+
+/// Throughput tests over the data path: IP protocol 253 ("for experimentation", RFC 3692).
+const BENCH_PROTO: u8 = 253;
+const BENCH_MAGIC: &[u8; 4] = b"MVB1";
+const BENCH_START: u8 = 1;
+const BENCH_DATA: u8 = 2;
+const BENCH_END: u8 = 3;
+const BENCH_RESULT: u8 = 4;
+const BENCH_PING: u8 = 5;
+const BENCH_PONG: u8 = 6;
+/// Nodes from this version on take part in throughput tests over the data path.
+const IP_BENCH_VERSION: &str = "0.13.2";
+
+/// How an IP packet leaves this node.
+enum Outgoing {
+    Udp(SocketAddr, Vec<Vec<u8>>),
+    Link(mpsc::Sender<Vec<u8>>, Vec<u8>),
 }
 
 /// A link that finished the handshake and hello exchange and is registered.
@@ -1518,10 +1538,45 @@ impl Node {
 
     /// Encrypts an IP packet end-to-end for `dst` and hands it to the first hop.
     pub(crate) fn send_packet(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
-        // Straight over UDP if there is a direct path.
+        match self.outgoing(dst_ip, pkt) {
+            // Drop on congestion, like a real network.
+            Some(Outgoing::Udp(addr, datagrams)) => {
+                if let Some(sock) = &self.udp {
+                    for d in datagrams {
+                        let _ = sock.try_send_to(&d, addr);
+                    }
+                }
+            }
+            Some(Outgoing::Link(tx, f)) => {
+                let _ = tx.try_send(f);
+            }
+            None => {}
+        }
+    }
+
+    /// Like `send_packet`, but waits for room instead of dropping (throughput tests).
+    async fn send_packet_waiting(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
+        match self.outgoing(dst_ip, pkt) {
+            Some(Outgoing::Udp(addr, datagrams)) => {
+                if let Some(sock) = &self.udp {
+                    for d in datagrams {
+                        let _ = sock.send_to(&d, addr).await;
+                    }
+                }
+            }
+            Some(Outgoing::Link(tx, f)) => {
+                let _ = tx.send(f).await;
+            }
+            None => {}
+        }
+    }
+
+    /// What carries `pkt` to `dst_ip`: straight over UDP if there is a direct path, else the
+    /// first hop of the route (a direct link or a relay).
+    fn outgoing(&self, dst_ip: Ipv4Addr, pkt: &[u8]) -> Option<Outgoing> {
         let direct = {
             let mut st = self.state.lock().unwrap();
-            let Some(&dst) = st.ip_map.get(&dst_ip) else { return };
+            let dst = *st.ip_map.get(&dst_ip)?;
             st.udp_paths
                 .get(&dst)
                 .is_some_and(|p| p.usable())
@@ -1529,29 +1584,21 @@ impl Node {
                 .flatten()
         };
         if let Some((dst, cipher)) = direct
-            && self.udp_send(&dst, &cipher, pkt)
+            && let Some((addr, datagrams)) = self.udp_datagrams(&dst, &cipher, pkt)
         {
-            return;
+            return Some(Outgoing::Udp(addr, datagrams));
         }
         let (dst, tx, cipher) = {
             let mut st = self.state.lock().unwrap();
-            let Some(&dst) = st.ip_map.get(&dst_ip) else { return };
-            let Some(hop) = st.routes.get(&dst).copied() else {
-                return;
-            };
-            let Some(tx) = st.links.get(&hop).map(|l| l.tx.clone()) else {
-                return;
-            };
-            let Some(cipher) = self.cipher_for(&mut st, &dst) else {
-                return;
-            };
+            let dst = *st.ip_map.get(&dst_ip)?;
+            let hop = st.routes.get(&dst).copied()?;
+            let tx = st.links.get(&hop).map(|l| l.tx.clone())?;
+            let cipher = self.cipher_for(&mut st, &dst)?;
             (dst, tx, cipher)
         };
         let mut nonce = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let Ok(ct) = cipher.encrypt(&XNonce::from(nonce), pkt) else {
-            return;
-        };
+        let ct = cipher.encrypt(&XNonce::from(nonce), pkt).ok()?;
         let mut f = Vec::with_capacity(1 + DATA_HDR + ct.len());
         f.push(T_DATA);
         f.extend_from_slice(&dst.0);
@@ -1559,7 +1606,7 @@ impl Node {
         f.push(DEFAULT_TTL);
         f.extend_from_slice(&nonce);
         f.extend_from_slice(&ct);
-        let _ = tx.try_send(f); // drop on congestion, like a real network
+        Some(Outgoing::Link(tx, f))
     }
 
     /// Handles a data frame: returns the IP packet if it is for us, otherwise relays it.
@@ -1596,6 +1643,11 @@ impl Node {
 
     /// Hands an IP packet for this node to the kernel or the userspace stack.
     async fn deliver(&self, pkt: Vec<u8>) {
+        // Throughput tests end here instead of in the kernel.
+        if pkt.len() >= 20 + 21 && pkt[9] == BENCH_PROTO && pkt[20..24] == *BENCH_MAGIC {
+            self.handle_ip_bench(&pkt);
+            return;
+        }
         match &self.io {
             PacketIo::Tun(tun) => {
                 let _ = tun.send(&pkt).await;
@@ -2431,9 +2483,148 @@ impl Node {
 
     // ----------------------------------------------------------------------------- measuring
 
+    /// Throughput to `peer` over the path real traffic takes (UDP, a link or a relay); from
+    /// older nodes only over a direct link.
+    async fn bench(self: &Arc<Self>, peer: NodeId, bytes: u64) -> Option<f32> {
+        let over_data_path = {
+            let st = self.state.lock().unwrap();
+            st.records
+                .get(&peer)
+                .is_some_and(|r| crate::update::at_least(&r.info.version, IP_BENCH_VERSION))
+        };
+        if over_data_path {
+            return self.bench_ip(peer, bytes).await;
+        }
+        self.bench_link(peer, bytes).await
+    }
+
+    /// Test data as IP packets of protocol 253 (experiments) through the normal data path; the
+    /// peer counts them and reports the rate it received.
+    async fn bench_ip(self: &Arc<Self>, peer: NodeId, bytes: u64) -> Option<f32> {
+        let dst = overlay_ip(&peer);
+        let id = rand::rngs::OsRng.next_u64();
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        self.state.lock().unwrap().bench_wait.insert(id, otx);
+        let run = async {
+            for _ in 0..2 {
+                self.send_packet_waiting(dst, &self.bench_packet(dst, BENCH_START, id, 0, 64))
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let size = self.cfg.mtu as usize;
+            let data = self.bench_packet(dst, BENCH_DATA, id, 0, size);
+            let mut sent = 0u64;
+            let mut n = 0u32;
+            while sent < bytes {
+                self.send_packet_waiting(dst, &data).await;
+                sent += size as u64;
+                n += 1;
+                if n.is_multiple_of(32) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            // The end marker, a few times (UDP may lose one).
+            for _ in 0..3 {
+                self.send_packet_waiting(dst, &self.bench_packet(dst, BENCH_END, id, sent, 64))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            orx.await.ok()
+        };
+        let res = timeout(Duration::from_secs(90), run).await.ok().flatten();
+        self.state.lock().unwrap().bench_wait.remove(&id);
+        res
+    }
+
+    /// Round trip over the data path (for peers reached through relays), best of three.
+    async fn ping_ip(self: &Arc<Self>, peer: NodeId) -> Option<Duration> {
+        let dst = overlay_ip(&peer);
+        let mut best: Option<Duration> = None;
+        for _ in 0..3 {
+            let id = rand::rngs::OsRng.next_u64();
+            let (otx, orx) = tokio::sync::oneshot::channel();
+            self.state.lock().unwrap().bench_wait.insert(id, otx);
+            let t0 = Instant::now();
+            self.send_packet(dst, &self.bench_packet(dst, BENCH_PING, id, 0, 64));
+            if timeout(Duration::from_secs(2), orx).await.is_ok_and(|r| r.is_ok()) {
+                let rtt = t0.elapsed();
+                best = Some(best.map_or(rtt, |b| b.min(rtt)));
+            }
+            self.state.lock().unwrap().bench_wait.remove(&id);
+        }
+        best
+    }
+
+    /// An IPv4 packet of protocol 253 from us to `dst`, `size` bytes long:
+    /// payload `MVB1 | kind | id u64 | value u64`, zero padded.
+    fn bench_packet(&self, dst: Ipv4Addr, kind: u8, id: u64, value: u64, size: usize) -> Vec<u8> {
+        let size = size.max(20 + 21);
+        let mut p = vec![0u8; size];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(size as u16).to_be_bytes());
+        p[6] = 0x40; // don't fragment
+        p[8] = 64;
+        p[9] = BENCH_PROTO;
+        p[12..16].copy_from_slice(&self.my_ip.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        let sum = crate::net::ip_checksum(&p[..20]);
+        p[10..12].copy_from_slice(&sum.to_be_bytes());
+        p[20..24].copy_from_slice(BENCH_MAGIC);
+        p[24] = kind;
+        p[25..33].copy_from_slice(&id.to_be_bytes());
+        p[33..41].copy_from_slice(&value.to_be_bytes());
+        p
+    }
+
+    fn handle_ip_bench(&self, p: &[u8]) {
+        let src = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
+        let kind = p[24];
+        let id = u64::from_be_bytes(p[25..33].try_into().unwrap());
+        let value = u64::from_be_bytes(p[33..41].try_into().unwrap());
+        let mut st = self.state.lock().unwrap();
+        match kind {
+            BENCH_START => {
+                if st.bench_ip_rx.len() > 64 {
+                    st.bench_ip_rx.retain(|_, b| b.2.elapsed() < Duration::from_secs(120));
+                }
+                let now = Instant::now();
+                st.bench_ip_rx.entry(id).or_insert((now, 0, now));
+            }
+            BENCH_DATA => {
+                if let Some(b) = st.bench_ip_rx.get_mut(&id) {
+                    b.1 += p.len() as u64;
+                    b.2 = Instant::now();
+                }
+            }
+            BENCH_END => {
+                let Some((first, got, last)) = st.bench_ip_rx.remove(&id) else {
+                    return; // a repeated end marker
+                };
+                drop(st);
+                let secs = last.duration_since(first).as_secs_f64().max(1e-4);
+                let mbps = (got as f64 * 8.0 / secs / 1e6) as f32;
+                debug!("throughput test from {src}: {got} of {value} bytes, {mbps:.0} Mbit/s");
+                let reply = self.bench_packet(src, BENCH_RESULT, id, u64::from(mbps.to_bits()), 64);
+                for _ in 0..3 {
+                    self.send_packet(src, &reply);
+                }
+            }
+            BENCH_RESULT | BENCH_PONG => {
+                if let Some(w) = st.bench_wait.remove(&id) {
+                    let _ = w.send(f32::from_bits(value as u32));
+                }
+            }
+            BENCH_PING => {
+                drop(st);
+                self.send_packet(src, &self.bench_packet(src, BENCH_PONG, id, 0, 64));
+            }
+            _ => {}
+        }
+    }
+
     /// Throughput to a directly linked peer: sends `bytes` of test data, the peer reports
     /// how fast it arrived.
-    async fn bench(self: &Arc<Self>, peer: NodeId, bytes: u64) -> Option<f32> {
+    async fn bench_link(self: &Arc<Self>, peer: NodeId, bytes: u64) -> Option<f32> {
         let (tx, id, done) = {
             let mut st = self.state.lock().unwrap();
             let tx = st.links.get(&peer)?.tx.clone();
@@ -2526,7 +2717,20 @@ impl Node {
         // Round trips first: during throughput tests pings queue behind the test data.
         let mut rtts = HashMap::new();
         for info in &peers {
-            rtts.insert(info.id, self.ping(info.id).await);
+            let mut rtt = self.ping(info.id).await;
+            let (udp_rtt, newer) = {
+                let st = self.state.lock().unwrap();
+                (
+                    st.udp_paths.get(&info.id).and_then(|p| p.rtt),
+                    crate::update::at_least(&info.version, IP_BENCH_VERSION),
+                )
+            };
+            rtt = rtt.or(udp_rtt);
+            // Neither a link nor a UDP path: the peer is reached through relays.
+            if rtt.is_none() && newer {
+                rtt = self.ping_ip(info.id).await;
+            }
+            rtts.insert(info.id, rtt);
         }
         for info in peers {
             let rtt = rtts.remove(&info.id).flatten();
@@ -2539,6 +2743,7 @@ impl Node {
             let mut st = self.state.lock().unwrap();
             let rtt_us = rtt
                 .or_else(|| st.links.get(&info.id).and_then(|l| l.rtt))
+                .or_else(|| st.udp_paths.get(&info.id).and_then(|p| p.rtt))
                 .map(|d| d.as_micros() as u32);
             let old_mbps = st.perf.get(&info.id).and_then(|p| p.mesh_mbps);
             st.perf.insert(

@@ -549,6 +549,10 @@ def test_net_env(lab):
     pair = lambda a, b: next((e for e in edges if e["from"] == a and e["to"] == b), None)  # noqa: E731
     check(pair("g1", "g2") and pair("g1", "g2")["lan_ip"], f"g1-g2 share a LAN: {pair('g1', 'g2')}")
     check(not (pair("g1", "g3") or {}).get("lan_ip"), "g1-g3 share no LAN")
+    # Throughput for every pair, also those talking only over UDP or through a relay (g1-g3).
+    for x, y in (("g1", "g2"), ("g2", "g1"), ("g1", "g3"), ("g3", "g1")):
+        e = pair(x, y)
+        check(e and (e["mesh_mbps"] or 0) > 1 and e["rtt_ms"] is not None, f"{x} -> {y} measured: {e}")
     e12 = g2.mvj("net env --master g1 g1 g2")
     check(e12["NCCL_SOCKET_IFNAME"] == "eth0" and e12["NODE_RANK"] == "1", f"LAN env: {e12}")
     e13 = g3.mvj("net env --master g1 g1 g3")

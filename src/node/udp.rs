@@ -261,15 +261,18 @@ impl Node {
         }
     }
 
-    /// Sends `pkt` straight to `dst` if a UDP path is up. Returns false if not.
-    pub(super) fn udp_send(&self, dst: &NodeId, cipher: &XChaCha20Poly1305, pkt: &[u8]) -> bool {
-        let Some(sock) = &self.udp else { return false };
+    /// The datagram(s) carrying `pkt` to `dst` over its UDP path (split on small paths).
+    pub(super) fn udp_datagrams(
+        &self,
+        dst: &NodeId,
+        cipher: &XChaCha20Poly1305,
+        pkt: &[u8],
+    ) -> Option<(SocketAddr, Vec<Vec<u8>>)> {
+        let sock = self.udp.as_ref()?;
         let addr = {
             let mut st = self.state.lock().unwrap();
             let key = self.probe_key(&mut st, dst);
-            let Some(p) = st.udp_paths.get_mut(dst).filter(|p| p.usable()) else {
-                return false;
-            };
+            let p = st.udp_paths.get_mut(dst).filter(|p| p.usable())?;
             // Quiet for a while although we are sending: check the path along the way, so a
             // dead one is noticed in seconds rather than at the timeout.
             if p.last_rx.elapsed() > Duration::from_secs(3)
@@ -287,33 +290,34 @@ impl Node {
         let (addr, split) = addr;
         let mut nonce = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let Ok(ct) = cipher.encrypt(&XNonce::from(nonce), pkt) else {
-            return false;
-        };
+        let ct = cipher.encrypt(&XNonce::from(nonce), pkt).ok()?;
         let mut d = Vec::with_capacity(33 + ct.len());
         d.push(DATA);
         d.extend_from_slice(&self.ident.id.0[..8]);
         d.extend_from_slice(&nonce);
         d.extend_from_slice(&ct);
-        // A full socket buffer drops the packet, like a congested link would.
         if split && d.len() > SAFE_DATAGRAM {
             let id = rand::rngs::OsRng.next_u32();
             let chunk = SAFE_DATAGRAM - 15;
             let count = d.len().div_ceil(chunk);
-            for (i, part) in d.chunks(chunk).enumerate() {
-                let mut f = Vec::with_capacity(15 + part.len());
-                f.push(FRAG);
-                f.extend_from_slice(&self.ident.id.0[..8]);
-                f.extend_from_slice(&id.to_be_bytes());
-                f.push(i as u8);
-                f.push(count as u8);
-                f.extend_from_slice(part);
-                let _ = sock.try_send_to(&f, addr);
-            }
+            let parts = d
+                .chunks(chunk)
+                .enumerate()
+                .map(|(i, part)| {
+                    let mut f = Vec::with_capacity(15 + part.len());
+                    f.push(FRAG);
+                    f.extend_from_slice(&self.ident.id.0[..8]);
+                    f.extend_from_slice(&id.to_be_bytes());
+                    f.push(i as u8);
+                    f.push(count as u8);
+                    f.extend_from_slice(part);
+                    f
+                })
+                .collect();
+            Some((addr, parts))
         } else {
-            let _ = sock.try_send_to(&d, addr);
+            Some((addr, vec![d]))
         }
-        true
     }
 
     /// A part of a split datagram; the whole datagram once all parts are there.

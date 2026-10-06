@@ -15,7 +15,8 @@ laptop (behind NAT) ───► server (public IP) ◄─── ssh -R ──�
 ```
 
 **New here? The [tutorial](docs/tutorial.md) builds a complete network step by step**, from the first node to
-containers without root, SSH, the browser desktop and troubleshooting.
+containers without root, SSH, the browser desktop and troubleshooting. **Training across machines?** See
+[distributed training](docs/distributed-training.md), with a [small example](examples/distributed-training).
 
 ## Install
 

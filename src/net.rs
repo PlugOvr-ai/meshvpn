@@ -109,3 +109,28 @@ mod tests {
         assert!(virtual_interface("docker0") && virtual_interface("br-1a2b") && !virtual_interface("eth0"));
     }
 }
+
+/// The IPv4 header checksum of `header` (with its checksum field zero).
+pub fn ip_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = header
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+#[cfg(test)]
+mod checksum_tests {
+    #[test]
+    fn ipv4_header_checksum() {
+        // Example header from RFC 1071 style worked examples (checksum field zeroed).
+        let h = [
+            0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01, 0xc0, 0xa8,
+            0x00, 0xc7,
+        ];
+        assert_eq!(super::ip_checksum(&h), 0xb861);
+    }
+}
