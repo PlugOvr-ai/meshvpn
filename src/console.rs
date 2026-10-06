@@ -593,6 +593,7 @@ impl App {
                         .unwrap_or_default(),
                 ),
                 Cell::from(gpu),
+                Cell::from(n.version.clone()),
                 Cell::from(n.tags.join(",")),
             ])
             .style(if n.online || n.is_self {
@@ -609,10 +610,14 @@ impl App {
                 Constraint::Min(22),
                 Constraint::Length(8),
                 Constraint::Length(10),
+                Constraint::Length(8),
                 Constraint::Min(8),
             ],
         )
-        .header(Row::new(["NODE", "MESH IP", "PATH", "RTT", "GPUS", "TAGS"]).style(Style::new().bold().fg(Color::Cyan)))
+        .header(
+            Row::new(["NODE", "MESH IP", "PATH", "RTT", "GPUS", "VERSION", "TAGS"])
+                .style(Style::new().bold().fg(Color::Cyan)),
+        )
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .block(Block::bordered().title(format!(
             " {} nodes · shells as {} ",

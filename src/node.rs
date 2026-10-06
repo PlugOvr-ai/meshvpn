@@ -291,6 +291,9 @@ pub struct SshOverview {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PeerStatus {
     pub name: String,
+    /// meshvpn version the node runs (from its record; empty for very old nodes).
+    #[serde(default)]
+    pub version: String,
     pub id: String,
     pub ip: Ipv4Addr,
     pub online: bool,
@@ -2257,6 +2260,7 @@ impl Node {
                 };
                 PeerStatus {
                     name: r.info.name.clone(),
+                    version: r.info.version.clone(),
                     id: id.hex(),
                     ip: overlay_ip(&id),
                     online: self.is_online(&st, &id),

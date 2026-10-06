@@ -2033,12 +2033,13 @@ fn local_ip() -> Option<std::net::IpAddr> {
 
 fn print_status(st: &node::Status) {
     println!(
-        "● {}  {}  ({} on {}, network \"{}\")",
+        "● {}  {}  ({} on {}, network \"{}\", meshvpn {})",
         st.name,
         st.ip,
         &st.id[..8],
         st.interface,
-        st.network
+        st.network,
+        st.version
     );
     if let Some(v) = &st.update_available {
         println!(
@@ -2079,8 +2080,19 @@ fn print_status(st: &node::Status) {
         return;
     }
     let w = st.peers.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
-    println!("{:<w$}  {:<15}  {:<7}  {:>6}  PATH", "NAME", "IP", "STATUS", "RTT");
+    println!(
+        "{:<w$}  {:<15}  {:<7}  {:>6}  {:<8}  PATH",
+        "NAME", "IP", "STATUS", "RTT", "VERSION"
+    );
     for p in &st.peers {
+        // Older than this node: highlighted (meshvpn update there).
+        let version = if p.version.is_empty() {
+            format!("{:<8}", "?")
+        } else if update::is_newer(&st.version, &p.version) {
+            format!("\x1b[33m{:<8}\x1b[0m", p.version)
+        } else {
+            format!("{:<8}", p.version)
+        };
         let status = if p.online { "online" } else { "offline" };
         let rtt = p.rtt_ms.map(|r| format!("{r}ms")).unwrap_or_else(|| "-".into());
         let path = if p.online {
@@ -2091,7 +2103,10 @@ fn print_status(st: &node::Status) {
                 None => "not seen since restart".into(),
             }
         };
-        println!("{:<w$}  {:<15}  {:<7}  {:>6}  {}", p.name, p.ip, status, rtt, path);
+        println!(
+            "{:<w$}  {:<15}  {:<7}  {:>6}  {version}  {}",
+            p.name, p.ip, status, rtt, path
+        );
     }
 }
 

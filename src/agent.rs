@@ -19,6 +19,8 @@ use crate::proto::{Inventory, Lease, ObjectAd, Perf};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeView {
     pub name: String,
+    /// meshvpn version on the node.
+    pub version: String,
     pub id: String,
     pub ip: Ipv4Addr,
     pub online: bool,
@@ -46,6 +48,7 @@ impl NodeView {
     pub fn named(name: &str) -> Self {
         NodeView {
             name: name.into(),
+            version: String::new(),
             id: String::new(),
             ip: Ipv4Addr::UNSPECIFIED,
             online: true,
@@ -87,6 +90,7 @@ pub fn status(dir: &Path) -> Result<Status> {
 pub fn nodes(st: &Status) -> Vec<NodeView> {
     let mut out = vec![NodeView {
         name: st.name.clone(),
+        version: st.version.clone(),
         id: st.id.clone(),
         ip: st.ip,
         online: true,
@@ -103,6 +107,7 @@ pub fn nodes(st: &Status) -> Vec<NodeView> {
     }];
     out.extend(st.peers.iter().map(|p| NodeView {
         name: p.name.clone(),
+        version: p.version.clone(),
         id: p.id.clone(),
         ip: p.ip,
         online: p.online,
@@ -166,8 +171,8 @@ fn gpu_summary(inv: &Inventory) -> String {
 pub fn print_nodes(nodes: &[NodeView]) {
     let w = nodes.iter().map(|n| n.name.len()).max().unwrap_or(4).max(4);
     println!(
-        "{:<w$}  {:<15}  {:<7}  {:<18}  {:>5}  {:>13}  GPUS",
-        "NAME", "IP", "STATUS", "TAGS", "CPUS", "MEM FREE/ALL"
+        "{:<w$}  {:<15}  {:<7}  {:<8}  {:<18}  {:>5}  {:>13}  GPUS",
+        "NAME", "IP", "STATUS", "VERSION", "TAGS", "CPUS", "MEM FREE/ALL"
     );
     for n in nodes {
         let status = if n.is_self {
@@ -194,9 +199,10 @@ pub fn print_nodes(nodes: &[NodeView]) {
             ),
             None => ("-".into(), "-".into(), "-".into()),
         };
+        let version = if n.version.is_empty() { "?" } else { &n.version };
         println!(
-            "{:<w$}  {:<15}  {:<7}  {:<18}  {:>5}  {:>13}  {gpus}",
-            n.name, n.ip, status, tags, cpus, mem
+            "{:<w$}  {:<15}  {:<7}  {:<8}  {:<18}  {:>5}  {:>13}  {gpus}",
+            n.name, n.ip, status, version, tags, cpus, mem
         );
     }
 }
