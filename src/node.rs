@@ -2364,8 +2364,8 @@ impl Node {
     async fn update_loop(self: Arc<Self>) {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
-            let auto = self.cfg.auto_update && !crate::update::is_dev_build();
-            match self.update_now(!auto, false).await {
+            // Only checks: new releases are installed with `meshvpn update`, never by themselves.
+            match self.update_now(true, false).await {
                 Ok(msg) if msg.contains("available") => {
                     info!(
                         "{msg} - install it with: {}",

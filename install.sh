@@ -65,7 +65,7 @@ fi
 # --- Proxy -----------------------------------------------------------------------------------
 # `curl ... | sudo sh` loses the caller's environment (sudo resets it), so also look where proxies
 # are configured system-wide. The proxy found is used for the downloads below and saved for
-# meshvpn itself (auto-updates), which systemd starts without these variables.
+# meshvpn itself (update checks, meshvpn update), which systemd starts without these variables.
 PROXY="" PROXY_FROM="" NOPROXY=""
 proxy_in_file() { # $1 = variable name pattern, $2... = files
     pattern="$1"; shift

@@ -88,8 +88,6 @@ class Node:
         return json.loads(self.mv(f"--json {args}", user=user, timeout=timeout))
 
     def up(self, env=""):
-        # Never let a test node replace the binary under test with a GitHub release.
-        self.sh("sed -i 's/^auto_update = true/auto_update = false/' /etc/meshvpn/config.toml 2>/dev/null; true")
         run(["docker", "exec", "-d", self.c, "sh", "-c", f"{env} meshvpn up >> /var/log/meshvpn.log 2>&1"])
         wait(lambda: self.sh("meshvpn status >/dev/null 2>&1 && echo ok", ok=False).stdout.strip() == "ok",
              f"{self.name}: meshvpn running", timeout=30, interval=0.5)
@@ -778,7 +776,7 @@ def test_desktop(lab):
 
 @test
 def test_console(lab):
-    """meshvpn console: node list, shells on nodes as tabs, desktop link with the ssh -L hint."""
+    """meshvpn console: node list, shells on nodes as tabs (user as plain ssh picks it), desktop link with the ssh -L hint."""
     net = lab.network("net")
     hub = lab.node("hub", [net])
     box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])
@@ -788,18 +786,20 @@ def test_console(lab):
     box.mv(f"join {invite(hub)} --name box --ssh-allow-all agent")
     box.up()
     wait(lambda: hub.online("box") and box.status().get("ssh_server") == "built-in", "box online with ssh")
-    wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
-         "ssh from hub to box", 60)
+    # root on hub logs in to mesh hosts as agent (its ssh config says so), like `ssh box.mesh` does
+    hub.sh("ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519 && printf 'Host *.mesh\\n  User agent\\n' > /root/.ssh/config")
+    wait(lambda: hub.sh("ssh -o BatchMode=yes -o ConnectTimeout=5 box.mesh true", ok=False).returncode == 0,
+         "plain ssh from hub to box", 60)
     steps = [
         "expect:NODE", "expect:box",
         "key:down", "key:enter", "expect:agent@box",
         "send:echo MARK-$(hostname)\\r", "expect:MARK-box",
-        "send:\\x020", "expect:shells as agent",   # Ctrl+B 0: back to the node list
+        "send:\\x020", "expect:shells as",   # Ctrl+B 0: back to the node list
         "send:\\x021", "send:exit\\r", "expect:session ended",
-        "key:enter", "send:d", "expect:ssh -L 7880:127.0.0.1:7880 -p 2222 agent@10.1.2.3",
+        "key:enter", "send:d", "expect:ssh -L 7880:127.0.0.1:7880 -p 2222 root@10.1.2.3",
     ]
     quoted = " ".join("'" + s + "'" for s in steps)
-    p = hub.sh(f"SSH_CONNECTION='10.9.9.9 50000 10.1.2.3 2222' console_driver.py {quoted}", user="agent", ok=False, timeout=120)
+    p = hub.sh(f"cd /root && SSH_CONNECTION='10.9.9.9 50000 10.1.2.3 2222' console_driver.py {quoted}", ok=False, timeout=120)
     check(p.returncode == 0, f"console: {p.stdout[-3000:]}{p.stderr[-500:]}")
 
 

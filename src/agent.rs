@@ -253,7 +253,7 @@ impl Remote {
             let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
             c.args(["-o", &format!("ProxyCommand={} nc %h %p", exe.display())]);
         }
-        c.arg(format!("{}@{}.mesh", self.user, node.name)).arg(script);
+        c.arg(self.destination(node)).arg(script);
         c
     }
 
@@ -277,8 +277,33 @@ impl Remote {
             let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
             c.args(["-o", &format!("ProxyCommand={} nc %h %p", exe.display())]);
         }
-        c.arg(format!("{}@{}.mesh", self.user, node.name));
+        c.arg(self.destination(node));
         c
+    }
+
+    /// `user@node.mesh`, or just `node.mesh` without a user (ssh's own config decides).
+    fn destination(&self, node: &NodeView) -> String {
+        if self.user.is_empty() {
+            format!("{}.mesh", node.name)
+        } else {
+            format!("{}@{}.mesh", self.user, node.name)
+        }
+    }
+
+    /// The account ssh logs in with for `node` when no user is given (`ssh -G`: User lines
+    /// of ~/.ssh/config, else the local account).
+    pub fn ssh_config_user(node: &str) -> String {
+        std::process::Command::new("ssh")
+            .args(["-G", &format!("{node}.mesh")])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .find_map(|l| l.strip_prefix("user ").map(|u| u.trim().to_string()))
+            })
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(Self::default_user)
     }
 }
 

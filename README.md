@@ -147,7 +147,7 @@ marked `Host *.mesh` block in `~/.ssh/config`). It runs in userspace mode (above
 reach your services, you reach the mesh through `ssh user@node.mesh` or the SOCKS proxy. `meshvpn install` starts it as a
 **systemd user service** (to keep it running when you are logged out an admin can run `sudo loginctl enable-linger
 <user>`), or, where there is no systemd (containers), in the background with a `@reboot` crontab entry. `meshvpn status`,
-`rename`, `tags`, `share`, `invite`, `ssh allow`, `update` (auto-updates too) and `uninstall` work without sudo.
+`rename`, `tags`, `share`, `invite`, `ssh allow`, `update` and `uninstall` work without sudo.
 Password-less logins *into* the machine go to meshvpn's built-in SSH server (below), as your own user only. What a
 rootless install can't do: write `/etc/hosts` (names work through ssh and the proxy only). Only one rootless install per
 machine can use the default ports.
@@ -301,7 +301,7 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | `sudo meshvpn doctor` | Checks the setup (daemon, Tailscale conflicts, firewalls, peers, UDP paths, SSH logins, admins, updates) and says how to fix each problem |
 | `sudo meshvpn invite [--uses N] [--expires 24h]` | Print an invite code for a new machine (single-use and valid for 24 h by default) |
 | `meshvpn admin status` / `sudo meshvpn admin add\|rm <node>` | Who the admins are; change them |
-| `sudo meshvpn update` | Install the latest release now. Nodes also update themselves automatically: they check every ~6 hours; disable with `auto_update = false` |
+| `sudo meshvpn update` | Install the latest release. Nodes check for new releases every ~6 hours and show them in `meshvpn status` / `doctor`, but never install them by themselves |
 | `sudo meshvpn forget <name>` | Remove an offline node (e.g. an old identity of a re-installed machine) from all nodes. `--offline` forgets all offline nodes. If an offline node's name is taken by a newer online node, it's forgotten automatically after 10 minutes |
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
@@ -358,8 +358,8 @@ Set `RUST_LOG=meshvpn=debug` for verbose logs.
   Treat invite codes like passwords until they are used or expire. If two admins ban nodes at the same moment, run the
   ban again.
 * Updates are downloaded from this repository's GitHub releases and checked against the published SHA-256 checksums.
-  That protects against corrupted downloads, but not against a compromised GitHub account. Set `auto_update = false`
-  if you want to update manually.
+  That protects against corrupted downloads, but not against a compromised GitHub account. Nodes never install
+  updates by themselves: only `meshvpn update` does.
 * The end-to-end layer has no replay protection or forward secrecy (the hop-by-hop Noise links have both).
 * IPv4 only, Linux only (the TUN setup and systemd integration).
 * Direct UDP paths work through the common kinds of NAT (one public port per internal port, as most home routers do).

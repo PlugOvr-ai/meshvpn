@@ -205,9 +205,6 @@ pub struct Config {
     /// Maintain `<name>.mesh` entries in /etc/hosts.
     #[serde(default = "default_true")]
     pub manage_hosts: bool,
-    /// Install new releases from GitHub automatically (checked every 6 hours).
-    #[serde(default = "default_true")]
-    pub auto_update: bool,
     /// Publish the SSH public keys of this machine's users, so other nodes can allow them to
     /// log in without a password.
     #[serde(default = "default_true")]
@@ -272,7 +269,6 @@ impl Config {
             interface: default_iface(),
             mtu: default_mtu(),
             manage_hosts: !rootless(),
-            auto_update: true,
             publish_ssh_keys: true,
             userspace: if rootless() { Userspace::Always } else { Userspace::Auto },
             ssh_server: SshServer::Auto,

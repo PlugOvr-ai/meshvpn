@@ -117,7 +117,8 @@ impl Drop for Shell {
 
 struct App {
     dir: PathBuf,
-    user: String,
+    /// `-u`: the account for shells; None: what plain `ssh` uses.
+    user: Option<String>,
     socks: bool,
     nodes: Vec<NodeView>,
     network: String,
@@ -139,7 +140,7 @@ struct App {
 pub fn run(dir: &Path, user: Option<String>) -> Result<()> {
     let mut app = App {
         dir: dir.to_path_buf(),
-        user: user.unwrap_or_else(Remote::default_user),
+        user,
         socks: false,
         nodes: vec![],
         network: String::new(),
@@ -319,7 +320,12 @@ impl App {
                 }
             }
             KeyCode::Char('u') => {
-                self.prompt = Some(("Log in as user".into(), self.user.clone()));
+                let default = self
+                    .nodes
+                    .get(sel)
+                    .map(|n| self.login_user(&n.name))
+                    .unwrap_or_default();
+                self.prompt = Some(("Log in as user".into(), default));
             }
             KeyCode::Char('d') => {
                 if let Some(n) = self.nodes.get(sel).map(|n| n.name.clone()) {
@@ -347,7 +353,7 @@ impl App {
         } else if label.starts_with("Log in as") && crate::proto::valid_user(input) {
             let sel = self.table.selected().unwrap_or(0);
             if let Some(n) = self.nodes.get(sel).cloned() {
-                self.open_shell(&n, input.to_string());
+                self.open_shell(&n, Some(input.to_string()));
             }
         }
     }
@@ -389,9 +395,15 @@ impl App {
         Some(t.split('@').nth(1)?.split(' ').next()?.to_string())
     }
 
-    fn open_shell(&mut self, node: &NodeView, user: String) {
+    /// Who a shell on `node` logs in as.
+    fn login_user(&self, node: &str) -> String {
+        self.user.clone().unwrap_or_else(|| Remote::ssh_config_user(node))
+    }
+
+    fn open_shell(&mut self, node: &NodeView, user: Option<String>) {
         let remote = Remote {
-            user: user.clone(),
+            // Empty: ssh picks the user like a plain `ssh node.mesh` does.
+            user: user.clone().unwrap_or_default(),
             socks: self.socks,
             timeout: Duration::from_secs(10),
         };
@@ -399,6 +411,7 @@ impl App {
         let title = if node.is_self {
             format!("{}@{} (here)", Remote::default_user(), node.name)
         } else {
+            let user = user.unwrap_or_else(|| self.login_user(&node.name));
             format!("{user}@{}", node.name)
         };
         let (rows, cols) = (self.body.height.max(5), self.body.width.max(20));
@@ -426,7 +439,7 @@ impl App {
             .current()
             .and_then(|s| s.title.split('@').next().map(String::from))
             .filter(|_| self.tab > 0)
-            .unwrap_or_else(|| self.user.clone());
+            .unwrap_or_else(|| self.login_user(node));
         let target = crate::desktop::client::Target {
             node: n,
             remote: Remote {
@@ -600,7 +613,11 @@ impl App {
         )
         .header(Row::new(["NODE", "MESH IP", "PATH", "RTT", "GPUS", "TAGS"]).style(Style::new().bold().fg(Color::Cyan)))
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-        .block(Block::bordered().title(format!(" {} nodes · shells as {} ", self.nodes.len(), self.user)));
+        .block(Block::bordered().title(format!(
+            " {} nodes · shells as {} ",
+            self.nodes.len(),
+            self.user.as_deref().unwrap_or("with your ssh settings")
+        )));
         f.render_stateful_widget(table, list, &mut self.table);
 
         let sel = self.table.selected().and_then(|i| self.nodes.get(i));

@@ -477,13 +477,6 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             format!("meshvpn {v} is available"),
             Some("sudo meshvpn update"),
         ));
-    } else if cfg.as_ref().is_some_and(|c| !c.auto_update) {
-        c.push(check(
-            "updates",
-            Level::Info,
-            "automatic updates are off (auto_update = false)",
-            None,
-        ));
     } else {
         c.push(check("updates", Level::Ok, "up to date as far as known", None));
     }
