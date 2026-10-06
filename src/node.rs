@@ -166,6 +166,8 @@ struct State {
     bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
     /// Throughput tests over the data path being received: id -> (first, bytes, last).
     bench_ip_rx: HashMap<u64, (Instant, u64, Instant)>,
+    /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
+    bench_ip_done: HashMap<u64, (f32, Instant)>,
     measure_seen: HashSet<u64>,
     measured: u64,
     udp_paths: HashMap<NodeId, udp::UdpPath>,
@@ -2523,15 +2525,22 @@ impl Node {
                     tokio::task::yield_now().await;
                 }
             }
-            // The end marker, a few times (UDP may lose one).
-            for _ in 0..3 {
+            // The end marker until the result comes back: on a busy path (a relay's full
+            // queue, UDP) the marker or the answer can get lost.
+            let mut orx = orx;
+            for _ in 0..10 {
                 self.send_packet_waiting(dst, &self.bench_packet(dst, BENCH_END, id, sent, 64))
                     .await;
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                if let Ok(r) = timeout(Duration::from_secs(1), &mut orx).await {
+                    return r.ok();
+                }
             }
-            orx.await.ok()
+            None
         };
-        let res = timeout(Duration::from_secs(90), run).await.ok().flatten();
+        let res = timeout(Duration::from_secs(30 + bytes / 2_000_000), run)
+            .await
+            .ok()
+            .flatten();
         self.state.lock().unwrap().bench_wait.remove(&id);
         res
     }
@@ -2597,13 +2606,22 @@ impl Node {
                 }
             }
             BENCH_END => {
-                let Some((first, got, last)) = st.bench_ip_rx.remove(&id) else {
-                    return; // a repeated end marker
+                let mbps = match st.bench_ip_rx.remove(&id) {
+                    Some((first, got, last)) => {
+                        let secs = last.duration_since(first).as_secs_f64().max(1e-4);
+                        let mbps = (got as f64 * 8.0 / secs / 1e6) as f32;
+                        debug!("throughput test from {src}: {got} of {value} bytes, {mbps:.0} Mbit/s");
+                        st.bench_ip_done.retain(|_, d| d.1.elapsed() < Duration::from_secs(60));
+                        st.bench_ip_done.insert(id, (mbps, Instant::now()));
+                        mbps
+                    }
+                    // A repeated end marker: the answer got lost, send it again.
+                    None => match st.bench_ip_done.get(&id) {
+                        Some(d) => d.0,
+                        None => return,
+                    },
                 };
                 drop(st);
-                let secs = last.duration_since(first).as_secs_f64().max(1e-4);
-                let mbps = (got as f64 * 8.0 / secs / 1e6) as f32;
-                debug!("throughput test from {src}: {got} of {value} bytes, {mbps:.0} Mbit/s");
                 let reply = self.bench_packet(src, BENCH_RESULT, id, u64::from(mbps.to_bits()), 64);
                 for _ in 0..3 {
                     self.send_packet(src, &reply);

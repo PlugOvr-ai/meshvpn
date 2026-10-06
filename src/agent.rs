@@ -636,7 +636,8 @@ pub fn measure(dir: &Path, nodes: &[NodeView], mb: u64) -> Result<Vec<NodeView>>
             bytes: mb * 1_000_000,
         },
     ))?;
-    let deadline = Instant::now() + Duration::from_secs(30 + nodes.len() as u64 * (mb / 4).max(5));
+    // Each node measures towards the others one after another.
+    let deadline = Instant::now() + Duration::from_secs(30 + nodes.len() as u64 * (mb / 2 + 10));
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let fresh: Vec<NodeView> = select(&self::nodes(&status(dir)?), &ids)?;
