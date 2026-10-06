@@ -14,6 +14,9 @@ laptop (behind NAT) ───► server (public IP) ◄─── ssh -R ──�
             └───────────── relayed through server, end-to-end encrypted ──────────┘
 ```
 
+**New here? The [tutorial](docs/tutorial.md) builds a complete network step by step**, from the first node to
+containers without root, SSH, the browser desktop and troubleshooting.
+
 ## Install
 
 For any Linux machine: PCs, servers, VMs and Raspberry Pis (x86_64, ARM64, ARMv7, ARMv6). The binary is fully static
