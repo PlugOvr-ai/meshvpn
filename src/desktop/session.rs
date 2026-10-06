@@ -174,13 +174,25 @@ pub fn attach(want: &str) -> Result<()> {
     let sock = socket_path(&dir);
     let stream = match std::os::unix::net::UnixStream::connect(&sock) {
         Ok(s) => {
-            // A running session keeps its flavour; say so if another one was asked for.
-            let running = std::fs::read_to_string(dir.join("mode")).unwrap_or_default();
-            if (want == "xfce" || want == "plain") && running.trim() != want && !running.is_empty() {
+            // A running session keeps its flavour; say so if another one was asked for (or Xfce
+            // was installed after the session started). Sessions before 0.13 were all plain.
+            let running = std::fs::read_to_string(dir.join("mode")).unwrap_or_else(|_| "plain".into());
+            let running = running.trim();
+            let explicit = (want == "xfce" || want == "plain") && running != want;
+            if explicit || (want == "auto" && running != "xfce" && has_xfce()) {
+                let other = if running == "xfce" {
+                    "the built-in desktop"
+                } else {
+                    "Xfce"
+                };
                 notice(&format!(
-                    "This desktop session runs the {} desktop. To switch: `meshvpn desktop stop` on the node \
-                     (closes its applications), then open it again.",
-                    running.trim()
+                    "This desktop session was started with {} and keeps it. To get {other}: End session (⏻, closes \
+                     its applications), then reconnect.",
+                    if running == "xfce" {
+                        "Xfce"
+                    } else {
+                        "the built-in desktop"
+                    }
                 ));
             }
             s
@@ -716,8 +728,40 @@ impl Desk {
                 if let Some(s) = &mut self.session
                     && !matches!(s.try_wait(), Ok(None))
                 {
-                    info!("the desktop session ended (logged out)");
-                    self.stop = true;
+                    self.session = None;
+                    // A window manager that registered itself means Xfce was up: this is a log
+                    // out. Without one, Xfce failed to start.
+                    let wm_was_up = self
+                        .conn
+                        .get_property(
+                            false,
+                            self.root,
+                            self.atoms._NET_SUPPORTING_WM_CHECK,
+                            AtomEnum::WINDOW,
+                            0,
+                            1,
+                        )
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .and_then(|r| r.value32().and_then(|mut v| v.next()))
+                        .is_some_and(|w| w != 0);
+                    if !wm_was_up {
+                        // Xfce gave up right away: keep the session with the built-in desktop.
+                        warn!("Xfce ended right after starting - using the built-in desktop");
+                        if let Err(e) = self.become_wm() {
+                            warn!("taking over the windows: {e:#}");
+                        }
+                        let msg = frame(
+                            S_NOTICE,
+                            "Xfce stopped right after starting, so this is the built-in desktop. The reason is in \
+                             the session log on the node (meshvpn-desktop*/session.log in $XDG_RUNTIME_DIR or /tmp)."
+                                .as_bytes(),
+                        );
+                        self.broadcast(&msg);
+                    } else {
+                        info!("the desktop session ended (logged out)");
+                        self.stop = true;
+                    }
                 }
                 last_reap = Instant::now();
             }
@@ -730,6 +774,12 @@ impl Desk {
     }
 
     // ----------------------------------------------------------------------- clients
+
+    fn send_to(&mut self, id: u64, msg: Vec<u8>) {
+        if let Some(c) = self.clients.iter().find(|c| c.id == id) {
+            let _ = c.tx.try_send(msg);
+        }
+    }
 
     fn broadcast(&mut self, msg: &[u8]) {
         self.clients.retain(|c| c.tx.try_send(msg.to_vec()).is_ok());
@@ -810,6 +860,26 @@ impl Desk {
                 }
             }
             C_STOP => self.stop = true,
+            C_FILES => {
+                let msg = files::list(&String::from_utf8_lossy(p));
+                self.send_to(from, msg);
+            }
+            C_FILE_READ => {
+                let id = u32_at(p, 0);
+                let path = String::from_utf8_lossy(p.get(4..).unwrap_or_default()).into_owned();
+                if let Some(c) = self.clients.iter().find(|c| c.id == from) {
+                    files::read(id, path, c.tx.clone());
+                }
+            }
+            C_FILE_WRITE => {
+                if let (id, Some(r)) = files::write(p) {
+                    self.send_to(from, files::done(id, r));
+                }
+            }
+            C_FILE_OP => {
+                let (id, r) = files::op(p);
+                self.send_to(from, files::done(id, r));
+            }
             _ => {}
         }
         Ok(())
@@ -1264,6 +1334,49 @@ impl Desk {
         let _ = self.client_list();
         let msg = self.windows_msg();
         self.broadcast(&msg);
+    }
+
+    /// Xfce is gone: be the window manager after all, and adopt the windows that are open.
+    fn become_wm(&mut self) -> Result<()> {
+        self.external_wm = false;
+        self.conn
+            .change_window_attributes(
+                self.root,
+                &ChangeWindowAttributesAux::new().event_mask(
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY,
+                ),
+            )?
+            .check()?;
+        let a = &self.atoms;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            a._NET_SUPPORTING_WM_CHECK,
+            AtomEnum::WINDOW,
+            &[self.support],
+        )?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.support,
+            a._NET_SUPPORTING_WM_CHECK,
+            AtomEnum::WINDOW,
+            &[self.support],
+        )?;
+        let _ = std::fs::write(self.env.xauthority.with_file_name("mode"), "plain");
+        self.windows.clear();
+        let tree = self.conn.query_tree(self.root)?.reply()?;
+        for win in tree.children {
+            let Ok(attrs) = self.conn.get_window_attributes(win)?.reply() else {
+                continue;
+            };
+            if attrs.override_redirect || attrs.map_state != MapState::VIEWABLE || win == self.support {
+                continue;
+            }
+            self.manage(win)?;
+        }
+        let msg = self.windows_msg();
+        self.broadcast(&msg);
+        Ok(())
     }
 
     /// Asks the window manager (Xfce) to do something with a window (EWMH).
@@ -1741,5 +1854,212 @@ mod tests {
         assert_eq!(encode_tile(&flat, 64 * 4, 0, 0, 64, 64).0, 1);
         let noise: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 7919 % 251) as u8).collect();
         assert_eq!(encode_tile(&noise, 64 * 4, 0, 0, 64, 64).0, 2);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Files: the viewer's file browser and image viewer (the session runs as the user, so it sees
+// exactly what the user may see).
+
+pub(super) mod files {
+    use super::super::proto::*;
+    use std::path::{Path, PathBuf};
+
+    pub fn home() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// A directory listing for the viewer: folders first, then by name.
+    pub fn list(path: &str) -> Vec<u8> {
+        let dir = if path.trim().is_empty() {
+            home()
+        } else {
+            PathBuf::from(path)
+        };
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let mut entries = vec![];
+        let error = match std::fs::read_dir(&dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let link = e.file_type().is_ok_and(|t| t.is_symlink());
+                    // Follow links for what they point to.
+                    let meta = std::fs::metadata(e.path()).or_else(|_| e.metadata());
+                    let (is_dir, size, mtime) = match &meta {
+                        Ok(m) => (
+                            m.is_dir(),
+                            m.len(),
+                            m.modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map_or(0, |d| d.as_secs()),
+                        ),
+                        Err(_) => (false, 0, 0),
+                    };
+                    entries.push(
+                        serde_json::json!({"name": name, "dir": is_dir, "size": size, "mtime": mtime, "link": link}),
+                    );
+                }
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        };
+        entries.sort_by_key(|e| {
+            (
+                !e["dir"].as_bool().unwrap_or(false),
+                e["name"].as_str().unwrap_or("").to_lowercase(),
+            )
+        });
+        let parent = dir.parent().map(|p| p.display().to_string());
+        frame(
+            S_FILES,
+            &serde_json::to_vec(&serde_json::json!({
+                "path": dir.display().to_string(),
+                "parent": parent,
+                "home": home().display().to_string(),
+                "entries": entries,
+                "error": error,
+            }))
+            .unwrap_or_default(),
+        )
+    }
+
+    pub fn done(id: u32, result: Result<(), String>) -> Vec<u8> {
+        let (ok, error) = match result {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e)),
+        };
+        frame(
+            S_FILE_DONE,
+            &serde_json::to_vec(&serde_json::json!({"id": id, "ok": ok, "error": error})).unwrap_or_default(),
+        )
+    }
+
+    /// Streams a file to one viewer, in its own thread (back pressure from the connection).
+    pub fn read(id: u32, path: String, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut f = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.blocking_send(done(id, Err(e.to_string())));
+                    return;
+                }
+            };
+            let total = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if total == 0 {
+                let mut p = Vec::with_capacity(20);
+                p.extend_from_slice(&id.to_le_bytes());
+                p.extend_from_slice(&0u64.to_le_bytes());
+                p.extend_from_slice(&0u64.to_le_bytes());
+                let _ = tx.blocking_send(frame(S_FILE_DATA, &p));
+                return;
+            }
+            let mut offset = 0u64;
+            let mut buf = vec![0u8; 256 * 1024];
+            while offset < total {
+                let n = match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = tx.blocking_send(done(id, Err(e.to_string())));
+                        return;
+                    }
+                };
+                let mut p = Vec::with_capacity(20 + n);
+                p.extend_from_slice(&id.to_le_bytes());
+                p.extend_from_slice(&offset.to_le_bytes());
+                p.extend_from_slice(&total.to_le_bytes());
+                p.extend_from_slice(&buf[..n]);
+                if tx.blocking_send(frame(S_FILE_DATA, &p)).is_err() {
+                    return; // the viewer went away
+                }
+                offset += n as u64;
+            }
+            if offset < total {
+                let _ = tx.blocking_send(done(id, Err("the file got shorter while reading".into())));
+            }
+        });
+    }
+
+    fn upload_tmp(path: &Path) -> PathBuf {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        path.with_file_name(format!(".{name}.meshvpn-upload"))
+    }
+
+    /// One part of an upload; the finished file replaces `path` atomically. Some(result) at the end.
+    pub fn write(p: &[u8]) -> (u32, Option<Result<(), String>>) {
+        use std::os::unix::fs::FileExt;
+        let id = u32_at(p, 0);
+        let (Some(off), Some(total)) = (p.get(4..12), p.get(12..20)) else {
+            return (id, Some(Err("bad upload".into())));
+        };
+        let offset = u64::from_le_bytes(off.try_into().unwrap());
+        let total = u64::from_le_bytes(total.try_into().unwrap());
+        let plen = u16_at(p, 20) as usize;
+        let Some(path) = p
+            .get(22..22 + plen)
+            .map(|b| PathBuf::from(String::from_utf8_lossy(b).into_owned()))
+        else {
+            return (id, Some(Err("bad upload".into())));
+        };
+        let data = &p[22 + plen..];
+        let tmp = upload_tmp(&path);
+        let r: std::io::Result<bool> = (|| {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(offset == 0)
+                .open(&tmp)?;
+            f.write_all_at(data, offset)?;
+            if offset + data.len() as u64 >= total {
+                drop(f);
+                std::fs::rename(&tmp, &path)?;
+                return Ok(true);
+            }
+            Ok(false)
+        })();
+        match r {
+            Ok(true) => (id, Some(Ok(()))),
+            Ok(false) => (id, None),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                (id, Some(Err(e.to_string())))
+            }
+        }
+    }
+
+    /// mkdir / delete / rename from the file browser.
+    pub fn op(p: &[u8]) -> (u32, Result<(), String>) {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(p) else {
+            return (0, Err("bad request".into()));
+        };
+        let id = v["id"].as_u64().unwrap_or(0) as u32;
+        let path = PathBuf::from(v["path"].as_str().unwrap_or(""));
+        if path.as_os_str().is_empty() || path == Path::new("/") {
+            return (id, Err("no path".into()));
+        }
+        let r = match v["op"].as_str() {
+            Some("mkdir") => std::fs::create_dir(&path),
+            Some("delete") => match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(e) => Err(e),
+            },
+            Some("rename") => {
+                let to = v["to"].as_str().unwrap_or("");
+                if to.is_empty() || to.contains('/') {
+                    return (id, Err("invalid name".into()));
+                }
+                std::fs::rename(&path, path.with_file_name(to))
+            }
+            _ => return (id, Err("unknown operation".into())),
+        };
+        (id, r.map_err(|e| e.to_string()))
     }
 }

@@ -39,6 +39,40 @@
   #notice { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); background: #3a2f12;
     border: 1px solid #806523; color: #f3dfa4; padding: 8px 14px; border-radius: 6px; z-index: 20;
     max-width: 80vw; white-space: pre-wrap; }
+  /* files */
+  #files { position: absolute; top: 35px; left: 0; bottom: 0; width: min(420px, 100vw); background: #1b1e24;
+    border-right: 1px solid #000; z-index: 15; display: flex; flex-direction: column; box-shadow: 6px 0 24px #0006; }
+  #files.drop { outline: 2px dashed var(--acc); outline-offset: -6px; }
+  #fsTools { display: flex; gap: 4px; padding: 6px; border-bottom: 1px solid #2a2f38; flex-wrap: wrap; }
+  #fsTools button, .imgbar button, #dlg button { background: #2c313a; color: var(--fg); border: 1px solid #3a404b;
+    border-radius: 5px; padding: 3px 8px; font: inherit; cursor: pointer; }
+  #fsTools button:hover, .imgbar button:hover, #dlg button:hover { border-color: var(--acc); }
+  #fsPath { padding: 4px 8px; color: var(--dim); overflow-x: auto; white-space: nowrap; font-size: 12px; }
+  #fsPath span { cursor: pointer; color: var(--fg); }
+  #fsPath span:hover { text-decoration: underline; }
+  #fsList { flex: 1; overflow-y: auto; }
+  .fsrow { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; }
+  .fsrow:hover { background: #263450; }
+  .fsrow .n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fsrow .m { color: var(--dim); font-size: 12px; white-space: nowrap; }
+  .fsrow .a { visibility: hidden; display: flex; gap: 2px; }
+  .fsrow:hover .a { visibility: visible; }
+  .fsrow .a b { font-weight: normal; padding: 0 4px; border-radius: 3px; color: var(--dim); }
+  .fsrow .a b:hover { background: #3a404b; color: var(--fg); }
+  #fsStatus { padding: 5px 8px; color: var(--dim); font-size: 12px; border-top: 1px solid #2a2f38; min-height: 26px; }
+  /* image and text viewer */
+  .overlay { position: absolute; top: 35px; left: 0; right: 0; bottom: 0; background: #0b0c0f; z-index: 25;
+    display: flex; flex-direction: column; outline: none; }
+  .imgbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #15171c; color: var(--dim); }
+  .imgbar .t { flex: 1; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #imgBox { flex: 1; overflow: hidden; display: flex; align-items: center; justify-content: center; cursor: grab; }
+  #imgEl { max-width: 100%; max-height: 100%; transform-origin: center; user-select: none; image-rendering: auto; }
+  #textPre { flex: 1; overflow: auto; margin: 0; padding: 10px 14px; font: 12px ui-monospace, monospace;
+    color: #d8dde6; white-space: pre-wrap; word-break: break-all; }
+  #dlg { position: absolute; top: 30%; left: 50%; transform: translateX(-50%); z-index: 40; background: var(--bar);
+    border: 1px solid #3a404b; border-radius: 8px; padding: 14px; width: min(420px, 90vw); box-shadow: 0 10px 40px #000a; }
+  #dlg input { width: 100%; margin-top: 10px; background: #14161a; color: var(--fg); border: 1px solid #3a404b;
+    border-radius: 4px; padding: 6px; font: inherit; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -47,9 +81,11 @@
   <span id="dot" title="connection"></span>
   <span id="title">__TITLE__</span>
   <button id="appsBtn">Apps ▾</button>
+  <button id="filesBtn" title="Files on the node: browse, view images, download, upload (drag files here)">Files</button>
   <div id="tabs"></div>
   <button id="clipBtn" title="Clipboard">Clipboard</button>
   <button id="fullBtn" title="Fullscreen (keyboard shortcuts like Ctrl+W go to the desktop)">⛶</button>
+  <button id="endBtn" title="End this desktop session (closes its applications)">⏻</button>
 </div>
 <div id="area"><canvas id="screen" tabindex="0" width="1280" height="800"></canvas></div>
 <div id="apps" class="menu" hidden>
@@ -63,10 +99,39 @@
   <div class="hint">Ctrl+V on the desktop also pastes from this computer's clipboard (the browser may ask once).</div>
 </div>
 <div id="notice" hidden></div>
+<div id="files" hidden>
+  <div id="fsTools">
+    <button id="fsUp" title="Parent folder">↑</button>
+    <button id="fsHome" title="Home folder">⌂</button>
+    <button id="fsReload" title="Refresh">⟳</button>
+    <button id="fsMkdir" title="New folder">+ Folder</button>
+    <button id="fsUpload" title="Upload files (or drop them here)">⇪ Upload</button>
+    <button id="fsHidden" title="Show hidden files">.*</button>
+    <input id="fsInput" type="file" multiple hidden>
+  </div>
+  <div id="fsPath"></div>
+  <div id="fsList"></div>
+  <div id="fsStatus"></div>
+</div>
+<div id="imgv" class="overlay" tabindex="0" hidden>
+  <div class="imgbar"><button id="imgPrev" title="Previous (←)">‹</button><button id="imgNext" title="Next (→)">›</button>
+    <span class="t" id="imgTitle"></span><span id="imgInfo"></span>
+    <button id="imgFit" title="Fit (0)">Fit</button><button id="img100" title="Actual size (1)">1:1</button>
+    <button id="imgDown" title="Download">⬇</button><button id="imgClose" title="Close (Esc)">✕</button></div>
+  <div id="imgBox"><img id="imgEl" alt=""></div>
+</div>
+<div id="textv" class="overlay" tabindex="0" hidden>
+  <div class="imgbar"><span class="t" id="textTitle"></span><button id="textDown" title="Download">⬇</button>
+    <button id="textClose" title="Close (Esc)">✕</button></div>
+  <pre id="textPre"></pre>
+</div>
+<div id="dlg" hidden><div id="dlgText"></div><input id="dlgInput" hidden>
+  <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button id="dlgCancel">Cancel</button><button id="dlgOk">OK</button></div></div>
 <script>
 "use strict";
-const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8;
+const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8,S_FILES=9,S_FILE_DATA=10,S_FILE_DONE=11;
 const C_POINTER=101,C_WHEEL=102,C_KEY=103,C_CLIPBOARD=104,C_ACTIVATE=105,C_CLOSE=106,C_LAUNCH=107,C_ACK=108,C_REFRESH=109,C_RESIZE=110;
+const C_FILES=111,C_FILE_READ=112,C_FILE_WRITE=113,C_FILE_OP=114,C_STOP=120;
 const $ = id => document.getElementById(id);
 const canvas = $("screen"), ctx = canvas.getContext("2d"), area = $("area");
 const token = location.hash.slice(1);
@@ -92,7 +157,14 @@ function connect() {
   ws = new WebSocket(`${proto}://${location.host}/ws?token=${token}`);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => { $("dot").classList.add("on"); send(C_RESIZE, u16s(...wantedSize())); canvas.focus(); };
-  ws.onclose = () => { $("dot").classList.remove("on"); notice("Disconnected. Click here to reconnect."); $("notice").onclick = () => { $("notice").hidden = true; $("notice").onclick = null; connect(); }; };
+  ws.onclose = () => {
+    $("dot").classList.remove("on");
+    for (const r of reads.values()) r.reject(new Error("disconnected"));
+    reads.clear();
+    notice(ending ? "Session ended. Click here to start a new one." : "Disconnected. Click here to reconnect.");
+    ending = false;
+    $("notice").onclick = () => { $("notice").hidden = true; $("notice").onclick = null; connect(); };
+  };
   ws.onmessage = ev => handle(new Uint8Array(ev.data));
 }
 
@@ -126,7 +198,10 @@ function handle(m) {
       break;
     }
     case S_APPS: apps(JSON.parse(dec.decode(p))); break;
-    case S_NOTICE: notice(dec.decode(p), 8000); break;
+    case S_NOTICE: notice(dec.decode(p), 15000); break;
+    case S_FILES: onFiles(JSON.parse(dec.decode(p))); break;
+    case S_FILE_DATA: onFileData(p); break;
+    case S_FILE_DONE: onFileDone(JSON.parse(dec.decode(p))); break;
   }
 }
 
@@ -223,6 +298,199 @@ canvas.addEventListener("blur", () => {
   if (buttons) { buttons = 0; const b = new Uint8Array(5); b.set(u16s(lastX, lastY)); send(C_POINTER, b); }
 });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) send(C_REFRESH); });
+
+// ---- dialogs (instead of the browser's confirm/prompt)
+let ending = false;
+function ask(text, opts) {
+  opts = opts || {};
+  return new Promise(res => {
+    const d = $("dlg"), i = $("dlgInput");
+    $("dlgText").textContent = text; i.hidden = opts.input === undefined; i.value = opts.input || "";
+    $("dlgOk").textContent = opts.ok || "OK"; d.hidden = false;
+    (opts.input !== undefined ? i : $("dlgOk")).focus();
+    const done = v => { d.hidden = true; $("dlgOk").onclick = $("dlgCancel").onclick = i.onkeydown = null; res(v); };
+    $("dlgOk").onclick = () => done(opts.input !== undefined ? i.value : true);
+    $("dlgCancel").onclick = () => done(opts.input !== undefined ? null : false);
+    i.onkeydown = e => { if (e.key === "Enter") done(i.value); if (e.key === "Escape") done(null); };
+  });
+}
+$("endBtn").onclick = async () => {
+  if (await ask("End this desktop session? All its applications are closed.", { ok: "End session" })) { ending = true; send(C_STOP); }
+  else canvas.focus();
+};
+
+// ---- files: browse, view images and text, download, upload
+let fsPath = "", fsEntries = [], fsHidden = false, nextId = 1;
+const reads = new Map(), ops = new Map();
+const IMG = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp",
+  svg: "image/svg+xml", avif: "image/avif", ico: "image/x-icon" };
+const TEXT = /\.(txt|md|log|json|ya?ml|toml|ini|cfg|conf|py|rs|c|h|cc|cpp|hpp|js|ts|sh|bash|csv|tsv|xml|urdf|xacro|launch|srdf|sdf|env|service|gitignore|dockerfile|cmake|go|java|lua|rst)$/i;
+const ext = n => { const m = n.toLowerCase().match(/\.([^.\/]+)$/); return m ? m[1] : ""; };
+const join = (dir, name) => (dir.endsWith("/") ? dir : dir + "/") + name;
+const human = b => b < 1024 ? b + " B" : b < 1048576 ? (b / 1024).toFixed(1) + " KB" : b < 1073741824 ? (b / 1048576).toFixed(1) + " MB" : (b / 1073741824).toFixed(2) + " GB";
+const fsStatus = t => { $("fsStatus").textContent = t || ""; };
+function listDir(path) { send(C_FILES, enc.encode(path || "")); }
+function onFiles(v) {
+  fsPath = v.path; fsEntries = v.entries || [];
+  const crumbs = $("fsPath"); crumbs.textContent = "";
+  const parts = v.path.split("/").filter(Boolean);
+  const root = document.createElement("span"); root.textContent = "/"; root.onclick = () => listDir("/"); crumbs.append(root);
+  parts.forEach((part, i) => {
+    const s = document.createElement("span"); s.textContent = part + (i < parts.length - 1 ? "/" : "");
+    s.onclick = () => listDir("/" + parts.slice(0, i + 1).join("/")); crumbs.append(s);
+  });
+  $("fsUp").onclick = () => v.parent && listDir(v.parent);
+  $("fsHome").onclick = () => listDir(v.home);
+  renderFiles(); fsStatus(v.error ? "⚠ " + v.error : "");
+}
+function renderFiles() {
+  const l = $("fsList"); l.textContent = "";
+  for (const e of fsEntries) {
+    if (!fsHidden && e.name.startsWith(".")) continue;
+    const r = document.createElement("div"); r.className = "fsrow";
+    const icon = e.dir ? "📁" : IMG[ext(e.name)] ? "🖼" : "📄";
+    const n = document.createElement("span"); n.className = "n"; n.textContent = icon + " " + e.name + (e.link ? " ↪" : "");
+    const m = document.createElement("span"); m.className = "m";
+    m.textContent = (e.dir ? "" : human(e.size) + " · ") + (e.mtime ? new Date(e.mtime * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" }) : "");
+    const a = document.createElement("span"); a.className = "a";
+    const act = (sym, title, fn) => { const b = document.createElement("b"); b.textContent = sym; b.title = title; b.onclick = ev => { ev.stopPropagation(); fn(); }; a.append(b); };
+    if (!e.dir) act("⬇", "Download", () => download(join(fsPath, e.name), e.name, e.size));
+    if (!e.dir) act("▶", "Open with an application on the desktop (xdg-open)", () => send(C_LAUNCH, enc.encode("xdg-open " + shq(join(fsPath, e.name)))));
+    act("✎", "Rename", async () => { const to = await ask("New name for " + e.name, { input: e.name, ok: "Rename" }); if (to && to !== e.name) op("rename", join(fsPath, e.name), to); });
+    act("🗑", "Delete", async () => { if (await ask((e.dir ? "Delete the folder " + e.name + " and everything in it?" : "Delete " + e.name + "?"), { ok: "Delete" })) op("delete", join(fsPath, e.name)); });
+    r.append(n, m, a);
+    r.onclick = () => e.dir ? listDir(join(fsPath, e.name)) : openEntry(e);
+    l.append(r);
+  }
+  if (!l.children.length) { const h = document.createElement("div"); h.className = "fsrow m"; h.textContent = "(empty)"; l.append(h); }
+}
+const shq = s => "'" + s.replace(/'/g, "'\\''") + "'";
+function readFile(path, progress) {
+  return new Promise((resolve, reject) => {
+    const id = nextId++; reads.set(id, { chunks: [], got: 0, resolve, reject, progress });
+    const p = enc.encode(path), b = new Uint8Array(4 + p.length);
+    new DataView(b.buffer).setUint32(0, id, true); b.set(p, 4); send(C_FILE_READ, b);
+  });
+}
+function onFileData(p) {
+  const d = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  const id = d.getUint32(0, true), total = Number(d.getBigUint64(12, true));
+  const r = reads.get(id); if (!r) return;
+  const chunk = p.slice(20); r.chunks.push(chunk); r.got += chunk.length;
+  if (r.progress) r.progress(r.got, total);
+  if (r.got >= total) { reads.delete(id); r.resolve(new Blob(r.chunks)); }
+}
+function onFileDone(v) {
+  const r = reads.get(v.id) || ops.get(v.id); reads.delete(v.id); ops.delete(v.id);
+  if (r) v.ok ? r.resolve() : r.reject(new Error(v.error || "failed"));
+}
+function op(name, path, to) {
+  const id = nextId++;
+  new Promise((resolve, reject) => ops.set(id, { resolve, reject }))
+    .then(() => listDir(fsPath), e => { fsStatus("⚠ " + e.message); });
+  send(C_FILE_OP, enc.encode(JSON.stringify({ id, op: name, path, to })));
+}
+async function download(path, name, size) {
+  try {
+    const blob = await readFile(path, (got, total) => fsStatus(`Downloading ${name}: ${Math.round(got * 100 / Math.max(total, 1))}%`));
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000); fsStatus("Downloaded " + name);
+  } catch (e) { fsStatus("⚠ " + name + ": " + e.message); }
+}
+async function upload(file) {
+  const id = nextId++, path = join(fsPath, file.name), pb = enc.encode(path), total = file.size, CH = 256 * 1024;
+  const finished = new Promise((resolve, reject) => ops.set(id, { resolve, reject }));
+  let off = 0;
+  do {
+    const chunk = new Uint8Array(await file.slice(off, off + CH).arrayBuffer());
+    const b = new Uint8Array(22 + pb.length + chunk.length), d = new DataView(b.buffer);
+    d.setUint32(0, id, true); d.setBigUint64(4, BigInt(off), true); d.setBigUint64(12, BigInt(total), true);
+    d.setUint16(20, pb.length, true); b.set(pb, 22); b.set(chunk, 22 + pb.length);
+    while (ws && ws.bufferedAmount > 4e6) await new Promise(r => setTimeout(r, 20));
+    send(C_FILE_WRITE, b); off += chunk.length;
+    fsStatus(`Uploading ${file.name}: ${Math.round(off * 100 / Math.max(total, 1))}%`);
+  } while (off < total);
+  await finished;
+}
+async function uploadAll(files) {
+  for (const f of files) {
+    try { await upload(f); } catch (e) { fsStatus("⚠ " + f.name + ": " + e.message); return; }
+  }
+  fsStatus(files.length + " file(s) uploaded"); listDir(fsPath);
+}
+$("filesBtn").onclick = () => { const f = $("files"); f.hidden = !f.hidden; $("apps").hidden = $("clip").hidden = true; if (!f.hidden) listDir(fsPath); else canvas.focus(); };
+$("fsReload").onclick = () => listDir(fsPath);
+$("fsHidden").onclick = () => { fsHidden = !fsHidden; $("fsHidden").style.borderColor = fsHidden ? "var(--acc)" : ""; renderFiles(); };
+$("fsMkdir").onclick = async () => { const n = await ask("Name of the new folder", { input: "", ok: "Create" }); if (n) op("mkdir", join(fsPath, n)); };
+$("fsUpload").onclick = () => $("fsInput").click();
+$("fsInput").onchange = e => { uploadAll([...e.target.files]); e.target.value = ""; };
+const filesEl = $("files");
+filesEl.addEventListener("dragover", e => { e.preventDefault(); filesEl.classList.add("drop"); });
+filesEl.addEventListener("dragleave", () => filesEl.classList.remove("drop"));
+filesEl.addEventListener("drop", e => { e.preventDefault(); filesEl.classList.remove("drop"); if (e.dataTransfer.files.length) uploadAll([...e.dataTransfer.files]); });
+// Dropping files on the desktop uploads them to the folder shown in Files (home at first).
+area.addEventListener("dragover", e => e.preventDefault());
+area.addEventListener("drop", e => { e.preventDefault(); if (e.dataTransfer.files.length) { $("files").hidden = false; uploadAll([...e.dataTransfer.files]); } });
+
+function openEntry(e) {
+  const path = join(fsPath, e.name);
+  if (IMG[ext(e.name)]) return viewImage(fsEntries.filter(x => !x.dir && IMG[ext(x.name)] && (fsHidden || !x.name.startsWith("."))).findIndex(x => x.name === e.name));
+  if ((TEXT.test(e.name) || !ext(e.name)) && e.size < 4e6) return viewText(path, e.name);
+  download(path, e.name, e.size);
+}
+
+// image viewer: fit / 1:1, wheel zoom, drag to pan, ← → through the folder's images
+let imgList = [], imgIdx = 0, imgScale = 1, imgX = 0, imgY = 0, imgUrl = null, imgDir = "";
+function imgTransform() { $("imgEl").style.transform = `translate(${imgX}px, ${imgY}px) scale(${imgScale})`; }
+async function viewImage(idx) {
+  imgList = fsEntries.filter(x => !x.dir && IMG[ext(x.name)] && (fsHidden || !x.name.startsWith(".")));
+  imgDir = fsPath;
+  if (!imgList.length) return;
+  imgIdx = (idx + imgList.length) % imgList.length;
+  const e = imgList[imgIdx];
+  $("imgv").hidden = false; $("imgv").focus();
+  $("imgTitle").textContent = `${e.name}  (${imgIdx + 1}/${imgList.length})`; $("imgInfo").textContent = "loading…";
+  try {
+    const blob = await readFile(join(imgDir, e.name), (got, total) => $("imgInfo").textContent = `${Math.round(got * 100 / Math.max(total, 1))}%`);
+    if (imgList[imgIdx] !== e) return; // moved on meanwhile
+    if (imgUrl) URL.revokeObjectURL(imgUrl);
+    imgUrl = URL.createObjectURL(new Blob([blob], { type: IMG[ext(e.name)] }));
+    const el = $("imgEl"); el.onload = () => $("imgInfo").textContent = `${el.naturalWidth}×${el.naturalHeight} · ${human(e.size)}`;
+    el.onerror = () => $("imgInfo").textContent = "this browser can't show this image";
+    imgScale = 1; imgX = imgY = 0; imgTransform(); el.style.maxWidth = el.style.maxHeight = "100%"; el.src = imgUrl;
+  } catch (err) { $("imgInfo").textContent = "⚠ " + err.message; }
+}
+function closeImage() { $("imgv").hidden = true; if (imgUrl) { URL.revokeObjectURL(imgUrl); imgUrl = null; } $("imgEl").removeAttribute("src"); canvas.focus(); }
+$("imgPrev").onclick = () => viewImage(imgIdx - 1);
+$("imgNext").onclick = () => viewImage(imgIdx + 1);
+$("imgClose").onclick = closeImage;
+$("imgFit").onclick = () => { const el = $("imgEl"); el.style.maxWidth = el.style.maxHeight = "100%"; imgScale = 1; imgX = imgY = 0; imgTransform(); };
+$("img100").onclick = () => { const el = $("imgEl"); el.style.maxWidth = el.style.maxHeight = "none"; imgScale = 1; imgX = imgY = 0; imgTransform(); };
+$("imgDown").onclick = () => { const e = imgList[imgIdx]; if (e) download(join(imgDir, e.name), e.name, e.size); };
+$("imgv").addEventListener("keydown", e => {
+  if (e.key === "Escape") closeImage(); else if (e.key === "ArrowLeft") viewImage(imgIdx - 1); else if (e.key === "ArrowRight" || e.key === " ") viewImage(imgIdx + 1);
+  else if (e.key === "0") $("imgFit").click(); else if (e.key === "1") $("img100").click();
+  else if (e.key === "+" || e.key === "=") { imgScale *= 1.25; imgTransform(); } else if (e.key === "-") { imgScale /= 1.25; imgTransform(); }
+  else return;
+  e.preventDefault();
+});
+$("imgBox").addEventListener("wheel", e => { e.preventDefault(); imgScale *= e.deltaY < 0 ? 1.15 : 1 / 1.15; imgScale = Math.min(Math.max(imgScale, 0.05), 50); imgTransform(); }, { passive: false });
+let drag = null;
+$("imgBox").addEventListener("mousedown", e => { drag = [e.clientX - imgX, e.clientY - imgY]; e.preventDefault(); });
+window.addEventListener("mousemove", e => { if (drag) { imgX = e.clientX - drag[0]; imgY = e.clientY - drag[1]; imgTransform(); } });
+window.addEventListener("mouseup", () => drag = null);
+
+// text preview
+let textPath = "", textName = "";
+async function viewText(path, name) {
+  textPath = path; textName = name; $("textTitle").textContent = name; $("textPre").textContent = "loading…";
+  $("textv").hidden = false; $("textv").focus();
+  try { $("textPre").textContent = await (await readFile(path)).text(); } catch (e) { $("textPre").textContent = "⚠ " + e.message; }
+}
+const closeText = () => { $("textv").hidden = true; canvas.focus(); };
+$("textClose").onclick = closeText;
+$("textDown").onclick = () => download(textPath, textName);
+$("textv").addEventListener("keydown", e => { if (e.key === "Escape") { closeText(); e.preventDefault(); } });
 
 if (!token) notice("Open this page with the link meshvpn printed (it contains the access token).");
 else connect();

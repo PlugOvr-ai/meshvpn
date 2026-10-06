@@ -237,8 +237,12 @@ applications you want to run.
   plugin. The bar on top lists the windows (click to switch, ✕ to close), **Apps** starts installed applications or any
   command, **Clipboard** shows what was copied on the desktop, ⛶ goes fullscreen (then Ctrl+W & co. go to the desktop).
   The desktop always matches the size of the browser window.
-* **Sessions keep running** when you close the tab; open it again to continue. `meshvpn desktop stop` (on the node)
-  ends the session and its applications.
+* **Files** (in the bar) browses the node's files as the logged-in user: images open in an image viewer (PNG, JPEG,
+  GIF, WebP, SVG, BMP, AVIF; ← → through the folder, zoom with the wheel, drag to pan), text files in a preview, any
+  file downloads with ⬇, files dropped onto the panel or the desktop are uploaded, and folders can be created,
+  renamed and deleted. All of it works without any program installed on the node.
+* **Sessions keep running** when you close the tab; open it again to continue. `meshvpn desktop stop` (on the node) or ⏻ in the
+  bar ends the session and its applications.
 * **First use** downloads the bundle by itself; on machines without internet copy `meshvpn-desktop-<arch>.tar.gz` from
   the release and run `meshvpn desktop setup --from <file>` (also handy in a Dockerfile).
 * Apps get a UTF-8 locale and the bundled DejaVu fonts if the image has none. Not yet: OpenGL/GPU acceleration, sound.

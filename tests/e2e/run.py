@@ -823,6 +823,24 @@ def test_desktop_xfce(lab):
 
 
 @test
+def test_desktop_fallback(lab):
+    """An Xfce that dies right after starting: the session falls back to the built-in desktop."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    box.sh("printf '#!/bin/sh\\necho broken >&2\\nexit 1\\n' > /usr/local/bin/xfce4-session && chmod 755 /usr/local/bin/xfce4-session")
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    # The viewer reaches the session through `docker exec` here (no mesh needed for this).
+    env = f"MESHVPN_DESKTOP_BRIDGE='su agent -c \"meshvpn desktop attach\"'"
+    box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port 18082 > /tmp/desktop.out 2>&1 &)")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18082 {token} fallback", ok=False, timeout=180)
+    check(p.returncode == 0, f"fallback: {p.stdout[-2000:]}{p.stderr[-1000:]}")
+
+
+@test
 def test_console(lab):
     """meshvpn console: node list, shells on nodes as tabs (user as plain ssh picks it), desktop link with the ssh -L hint."""
     net = lab.network("net")

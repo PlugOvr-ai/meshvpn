@@ -6,8 +6,9 @@ runs a scripted session. Prints a JSON summary for the test to check.
 """
 import base64, json, os, select, socket, struct, sys, time
 
-S_INIT, S_TILE, S_FRAME_END, S_WINDOWS, S_CLIPBOARD, S_CURSOR, S_APPS, S_NOTICE = range(1, 9)
+S_INIT, S_TILE, S_FRAME_END, S_WINDOWS, S_CLIPBOARD, S_CURSOR, S_APPS, S_NOTICE, S_FILES, S_FILE_DATA, S_FILE_DONE = range(1, 12)
 C_POINTER, C_WHEEL, C_KEY, C_CLIPBOARD, C_ACTIVATE, C_CLOSE, C_LAUNCH, C_ACK, C_REFRESH, C_RESIZE = range(101, 111)
+C_FILES, C_FILE_READ, C_FILE_WRITE, C_FILE_OP = range(111, 115)
 
 
 class Viewer:
@@ -24,12 +25,18 @@ class Viewer:
         self.buf = b""
         self.size = None; self.windows = []; self.apps = None; self.clip = None; self.notices = []
         self.tiles = {1: 0, 2: 0}; self.frames = 0; self.cursor = False
+        self.listing = None; self.reads = {}; self.done = {}
 
     def send(self, kind, payload=b""):
         data = bytes([kind]) + struct.pack("<I", len(payload)) + payload
         mask = os.urandom(4)
         n = len(data)
-        hdr = bytes([0x82]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
+        if n < 126:
+            hdr = bytes([0x82, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([0x82, 0x80 | 126]) + struct.pack(">H", n)
+        else:
+            hdr = bytes([0x82, 0x80 | 127]) + struct.pack(">Q", n)
         self.s.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
 
     def pump(self, timeout=0.3):
@@ -59,6 +66,13 @@ class Viewer:
         elif kind == S_CURSOR: self.cursor = True
         elif kind == S_APPS: self.apps = json.loads(p)
         elif kind == S_NOTICE: self.notices.append(p.decode())
+        elif kind == S_FILES: self.listing = json.loads(p)
+        elif kind == S_FILE_DATA:
+            fid, off, total = struct.unpack("<IQQ", p[:20])
+            r = self.reads.setdefault(fid, {"data": bytearray(), "total": total})
+            r["data"] += p[20:]
+        elif kind == S_FILE_DONE:
+            v = json.loads(p); self.done[v["id"]] = v
 
     def until(self, cond, what, timeout=30):
         end = time.time() + timeout
@@ -76,6 +90,49 @@ class Viewer:
     def key(self, keysym, char):
         for down in (1, 0):
             self.send(C_KEY, bytes([down, char]) + struct.pack("<I", keysym))
+
+
+def files(v):
+    """The file browser's protocol: list, upload, read back, mkdir, rename, delete."""
+    v.listing = None
+    v.send(C_FILES, b"")
+    v.until(lambda: v.listing is not None, "home listing")
+    home = v.listing["path"]
+    blob = os.urandom(700_000) + b"end"  # several chunks
+    path = (home + "/up.bin").encode()
+    for off in range(0, len(blob), 256 * 1024):
+        chunk = blob[off:off + 256 * 1024]
+        v.send(C_FILE_WRITE, struct.pack("<IQQH", 7, off, len(blob), len(path)) + path + chunk)
+    v.until(lambda: 7 in v.done, "upload done")
+    assert v.done[7]["ok"], v.done[7]
+    v.send(C_FILE_READ, struct.pack("<I", 8) + path)
+    v.until(lambda: 8 in v.reads and len(v.reads[8]["data"]) == v.reads[8]["total"], "read back")
+    assert bytes(v.reads[8]["data"]) == blob, "upload/download corrupted"
+    for i, (op, p_, to) in enumerate([("mkdir", home + "/newdir", None), ("rename", home + "/up.bin", "renamed.bin"),
+                                      ("delete", home + "/newdir", None)]):
+        v.send(C_FILE_OP, json.dumps({"id": 20 + i, "op": op, "path": p_, "to": to}).encode())
+        v.until(lambda i=i: 20 + i in v.done, op)
+        assert v.done[20 + i]["ok"], v.done[20 + i]
+    v.listing = None
+    v.send(C_FILES, home.encode())
+    v.until(lambda: v.listing is not None, "listing again")
+    names = [e["name"] for e in v.listing["entries"]]
+    assert "renamed.bin" in names and "newdir" not in names and "up.bin" not in names, names
+    v.send(C_FILE_READ, struct.pack("<I", 9) + b"/nonexistent/file")
+    v.until(lambda: 9 in v.done, "error for a missing file")
+    assert not v.done[9]["ok"]
+    return {"home": home, "listed": len(names)}
+
+
+def fallback(port, token):
+    """Xfce that exits right away: the built-in desktop takes over, with a notice."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
+    v.until(lambda: v.frames >= 1, "first frame", 90)
+    v.until(lambda: any("built-in desktop" in n for n in v.notices), "fallback notice", 40)
+    v.send(C_LAUNCH, b"xlogo")
+    v.until(lambda: any(w["title"] == "xlogo" for w in v.windows), "a window, managed by meshvpn", 30)
+    print(json.dumps({"notices": v.notices, "windows": v.windows}))
 
 
 def xfce(port, token):
@@ -108,6 +165,8 @@ def main():
     port, token = int(sys.argv[1]), sys.argv[2]
     if len(sys.argv) > 3 and sys.argv[3] == "xfce":
         return xfce(port, token)
+    if len(sys.argv) > 3 and sys.argv[3] == "fallback":
+        return fallback(port, token)
     v = Viewer(port, token)
     v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
     v.until(lambda: v.size == [1000, 640] and v.frames >= 1, "first frame at the requested size", 90)
@@ -131,7 +190,8 @@ def main():
     v.send(C_RESIZE, struct.pack("<HH", 800, 500))
     v.until(lambda: v.size == [800, 500], "resized")
     v.settle(1)
-    print(json.dumps({"size": v.size, "first_frame_tiles": first, "tiles": v.tiles, "frames": v.frames,
+    fs = files(v)
+    print(json.dumps({"files": fs, "size": v.size, "first_frame_tiles": first, "tiles": v.tiles, "frames": v.frames,
                       "cursor": v.cursor, "apps": [a["name"] for a in v.apps or []], "notices": v.notices}))
 
 
