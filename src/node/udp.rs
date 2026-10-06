@@ -32,7 +32,7 @@ const SAFE_DATAGRAM: usize = 1200;
 /// Nodes from this version on understand padded probes and fragments.
 const FRAG_VERSION: &str = "0.12.2";
 /// How often a path's full-size capacity is checked again.
-const BIG_RECHECK: Duration = Duration::from_secs(300);
+const BIG_RECHECK: Duration = Duration::from_secs(60);
 /// A path without anything heard for this long is dropped.
 pub(super) const PATH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
@@ -203,10 +203,16 @@ impl Node {
             let Some(key) = self.probe_key(&mut st, &peer) else {
                 continue;
             };
+            // Whether the peer can reassemble: its record may have arrived after the path.
+            let frags = st
+                .records
+                .get(&peer)
+                .is_some_and(|r| crate::update::at_least(&r.info.version, FRAG_VERSION));
             // Full-size check of a path (towards nodes that understand padded probes).
             if let Some(p) = st.udp_paths.get_mut(&peer)
-                && p.frags
+                && (p.frags || frags)
             {
+                p.frags = true;
                 if let Some((_, sent)) = p.big_probe
                     && sent.elapsed() > Duration::from_secs(3)
                 {

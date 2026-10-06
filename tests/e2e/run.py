@@ -872,12 +872,23 @@ def test_console(lab):
 @test
 def test_small_mtu(lab):
     """A path that drops big UDP datagrams (VPN, WSL2): detected, packets split, TCP and ssh still work."""
-    net, (hub, a, b) = mesh(lab, ["hub", "a", "b"], join_args="--ssh-allow-all agent")
-    # b's network drops UDP datagrams of 1300 bytes and more; small probes still pass.
+    net = lab.network("net")
+    hub, a, b = (lab.node(n, [net]) for n in ("hub", "a", "b"))
+    # b's network drops UDP datagrams of 1300 bytes and more (small probes still pass) - from
+    # the start, like a notebook behind such a network.
     for chain, port in (("INPUT", "--dport"), ("OUTPUT", "--sport")):
         b.sh(f"iptables -A {chain} -p udp {port} 7870 -m length --length 1300:65535 -j DROP")
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    for n in (a, b):
+        n.mv(f"join {invite(hub)} --name {n.name} --ssh-allow-all agent")
+        n.up()
     wait(lambda: "direct UDP" in (a.peer("b") or {}).get("path", ""), "direct UDP path a-b")
     wait(lambda: "splitting" in a.peer("b")["path"], "a notices the small path to b", 30)
+    try:
+        wait(lambda: "splitting" in b.peer("a")["path"], "b notices it too (the data flows b -> a)", 30)
+    except Failed:
+        raise Failed(f"b never splits towards a: b sees {b.peer('a')}, a sees {a.peer('b')['path']}")
     b.sh("mkdir -p /srv && head -c 5000000 /dev/urandom > /srv/blob && (cd /srv && python3 -m http.server 8080 >/dev/null 2>&1 &)")
     time.sleep(1)
     want = b.sh("sha256sum /srv/blob | cut -c1-16").strip()
@@ -887,8 +898,12 @@ def test_small_mtu(lab):
     a.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
     wait(lambda: a.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=8 agent@b.mesh echo ok'", ok=False).stdout.strip() == "ok",
          "ssh (big key exchange) over the small path", 60)
-    # A normal path is not split.
+    # A normal path is not split ...
     check("splitting" not in a.peer("hub")["path"], f"a-hub should carry full size: {a.peer('hub')['path']}")
+    # ... until its network changes (e.g. a VPN comes up): noticed at the next check (60 s).
+    for chain, port in (("INPUT", "--dport"), ("OUTPUT", "--sport")):
+        hub.sh(f"iptables -A {chain} -p udp {port} 7870 -m length --length 1300:65535 -j DROP")
+    wait(lambda: "splitting" in a.peer("hub")["path"], "a notices that the path to hub got small", 90)
 
 
 @test
