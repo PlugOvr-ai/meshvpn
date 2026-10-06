@@ -775,6 +775,44 @@ def test_desktop(lab):
 
 
 @test
+def test_desktop_xfce(lab):
+    """meshvpn desktop setup --xfce, then an Xfce desktop: windows as tabs, typing, persistence, log out."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    box.mv(f"join {invite(hub)} --name box --ssh-allow-all agent")
+    box.up()
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    out = box.mv("desktop setup --from /tmp/desktop.tar.gz --xfce", timeout=900)
+    check("Xfce installed" in out, out[-500:])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
+         "ssh from hub to box", 60)
+    hub.sh("cd /home/agent && (meshvpn desktop box --no-browser --port 18081 > /tmp/desktop.out 2>&1 &)", user="agent")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py 18081 {token} xfce", user="agent", ok=False, timeout=300)
+    check(p.returncode == 0, f"xfce session: {p.stdout[-2000:]}{p.stderr[-1000:]}")
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+    check(r["panels_hidden"], f"panels and the desktop should not be tabs: {r}")
+    check(sorted(r["first"]) == sorted(r["again"]), f"windows should survive the browser: {r}")
+    procs = box.sh("ps -o user=,comm= -u agent", ok=False).stdout
+    for p_ in ("xfwm4", "xfce4-panel", "Xvfb"):
+        check(p_ in procs, f"{p_} should run as agent: {procs}")
+    check(box.sh("cat /tmp/xfce_typed", ok=False).stdout.strip() == "typed-in-xfce", "typing into the Xfce terminal")
+    # Logging out of Xfce ends the session.
+    sess = box.sh("ls -d /tmp/meshvpn-desktop-*", user="agent").strip()
+    box.sh(f"DISPLAY=$(grep -o 'display :[0-9]*' {sess}/session.log | tail -1 | cut -c9-) XAUTHORITY={sess}/Xauthority "
+           "xfce4-session-logout --logout --fast", user="agent", ok=False)
+    wait(lambda: box.sh("pgrep -x Xvfb", ok=False).returncode != 0, "session ends after logging out", 30)
+
+
+@test
 def test_console(lab):
     """meshvpn console: node list, shells on nodes as tabs (user as plain ssh picks it), desktop link with the ssh -L hint."""
     net = lab.network("net")

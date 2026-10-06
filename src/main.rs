@@ -252,6 +252,12 @@ enum Cmd {
         /// Only print the link, don't open a browser.
         #[arg(long)]
         no_browser: bool,
+        /// Use Xfce (it must be installed on the node). Default: Xfce if installed.
+        #[arg(long, conflicts_with = "plain")]
+        xfce: bool,
+        /// Use meshvpn's built-in minimal desktop even if Xfce is installed.
+        #[arg(long)]
+        plain: bool,
     },
     /// Connect stdin/stdout to HOST:PORT in the mesh (for ssh's ProxyCommand in userspace mode).
     Nc { host: String, port: u16 },
@@ -387,15 +393,24 @@ enum DesktopCmd {
         /// Install from a downloaded meshvpn-desktop-<arch>.tar.gz (machines without internet).
         #[arg(long)]
         from: Option<PathBuf>,
+        /// Also install the Xfce desktop with the system's package manager (needs root).
+        #[arg(long)]
+        xfce: bool,
     },
     /// End your desktop session on this machine (closes its applications).
     Stop,
     /// Connect stdin/stdout to your desktop session (used through SSH by `meshvpn desktop <node>`).
     #[command(hide = true)]
-    Attach,
+    Attach {
+        #[arg(long, default_value = "auto")]
+        session: String,
+    },
     /// Run the desktop session (started by attach).
     #[command(hide = true)]
-    Session,
+    Session {
+        #[arg(long, default_value = "auto")]
+        session: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1256,10 +1271,19 @@ fn real_main(cli: Cli) -> Result<i32> {
             user,
             port,
             no_browser,
+            xfce,
+            plain,
         } => match cmd {
-            Some(DesktopCmd::Setup { from }) => {
+            Some(DesktopCmd::Setup { from, xfce }) => {
                 let b = desktop::bundle::setup(from.as_deref())?;
                 say(json, &format!("desktop components installed in {}", b.dir.display()));
+                if xfce {
+                    desktop::bundle::install_xfce()?;
+                    say(
+                        json,
+                        "Xfce installed: `meshvpn desktop <this node>` now opens an Xfce desktop",
+                    );
+                }
             }
             Some(DesktopCmd::Stop) => {
                 if desktop::session::stop()? {
@@ -1268,17 +1292,24 @@ fn real_main(cli: Cli) -> Result<i32> {
                     say(json, "no desktop session is running");
                 }
             }
-            Some(DesktopCmd::Attach) => desktop::session::attach()?,
-            Some(DesktopCmd::Session) => {
+            Some(DesktopCmd::Attach { session }) => desktop::session::attach(&session)?,
+            Some(DesktopCmd::Session { session }) => {
                 init_logging();
-                desktop::session::run()?;
+                desktop::session::run(&session)?;
             }
             None => {
                 let Some(node) = node else {
                     bail!("which node? e.g. meshvpn desktop <node> (see meshvpn nodes)");
                 };
                 if std::env::var_os("MESHVPN_DESKTOP_BRIDGE").is_some() {
-                    let target = desktop::client::Target::test(&node, user.as_deref());
+                    let mut target = desktop::client::Target::test(&node, user.as_deref());
+                    target.session = if xfce {
+                        "xfce"
+                    } else if plain {
+                        "plain"
+                    } else {
+                        "auto"
+                    };
                     desktop::client::run(target, port, !no_browser)?;
                     return Ok(0);
                 }
@@ -1291,7 +1322,14 @@ fn real_main(cli: Cli) -> Result<i32> {
                     socks: st.socks.is_some(),
                     timeout: std::time::Duration::from_secs(30),
                 };
-                desktop::client::run(desktop::client::Target { node, remote }, port, !no_browser)?;
+                let session = if xfce {
+                    "xfce"
+                } else if plain {
+                    "plain"
+                } else {
+                    "auto"
+                };
+                desktop::client::run(desktop::client::Target { node, remote, session }, port, !no_browser)?;
             }
         },
         Cmd::Nc { host, port } => {

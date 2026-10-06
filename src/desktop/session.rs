@@ -47,6 +47,8 @@ x11rb::atom_manager! {
         _NET_WM_WINDOW_TYPE_DIALOG,
         _NET_WM_WINDOW_TYPE_SPLASH,
         _NET_WM_WINDOW_TYPE_UTILITY,
+        _NET_WM_WINDOW_TYPE_DOCK,
+        _NET_WM_WINDOW_TYPE_DESKTOP,
         _NET_WM_STATE,
         _NET_CLOSE_WINDOW,
         CLIPBOARD,
@@ -119,7 +121,44 @@ fn write_fonts_conf(path: &Path, bundle: &Bundle, cache: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 // `meshvpn desktop attach`: stdin/stdout <-> the user's session (started if needed)
 
-pub fn attach() -> Result<()> {
+/// Desktop flavour: meshvpn's own window manager, or Xfce if the system has it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Mode {
+    Plain,
+    Xfce,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Plain => "plain",
+            Mode::Xfce => "xfce",
+        }
+    }
+}
+
+/// Xfce is installed (its session manager is in PATH).
+pub fn has_xfce() -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("xfce4-session").is_file()))
+        .unwrap_or(false)
+}
+
+/// "auto" (Xfce if installed), "xfce" or "plain".
+pub fn resolve_mode(want: &str) -> Result<Mode> {
+    match want {
+        "plain" => Ok(Mode::Plain),
+        "xfce" if has_xfce() => Ok(Mode::Xfce),
+        "xfce" => bail!(
+            "Xfce is not installed on this machine - install it with `sudo meshvpn desktop setup --xfce` there, \
+             or use the built-in desktop (--plain)"
+        ),
+        _ if has_xfce() => Ok(Mode::Xfce),
+        _ => Ok(Mode::Plain),
+    }
+}
+
+pub fn attach(want: &str) -> Result<()> {
     let notice = |text: &str| {
         let mut out = std::io::stdout();
         let _ = out.write_all(&frame(S_NOTICE, text.as_bytes()));
@@ -134,8 +173,26 @@ pub fn attach() -> Result<()> {
     };
     let sock = socket_path(&dir);
     let stream = match std::os::unix::net::UnixStream::connect(&sock) {
-        Ok(s) => s,
+        Ok(s) => {
+            // A running session keeps its flavour; say so if another one was asked for.
+            let running = std::fs::read_to_string(dir.join("mode")).unwrap_or_default();
+            if (want == "xfce" || want == "plain") && running.trim() != want && !running.is_empty() {
+                notice(&format!(
+                    "This desktop session runs the {} desktop. To switch: `meshvpn desktop stop` on the node \
+                     (closes its applications), then open it again.",
+                    running.trim()
+                ));
+            }
+            s
+        }
         Err(_) => {
+            let mode = match resolve_mode(want) {
+                Ok(m) => m,
+                Err(e) => {
+                    notice(&format!("{e:#}"));
+                    return Err(e);
+                }
+            };
             if bundle::find().is_none() {
                 notice("first use: installing the desktop components (about 5 MB)...");
                 if let Err(e) = bundle::setup(None) {
@@ -143,7 +200,7 @@ pub fn attach() -> Result<()> {
                     return Err(e);
                 }
             }
-            start_detached(&dir)?;
+            start_detached(&dir, mode)?;
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
@@ -191,7 +248,7 @@ pub fn attach() -> Result<()> {
     Ok(())
 }
 
-fn start_detached(dir: &Path) -> Result<()> {
+fn start_detached(dir: &Path, mode: Mode) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = crate::update::current_exe()?;
     let log = std::fs::OpenOptions::new()
@@ -199,7 +256,7 @@ fn start_detached(dir: &Path) -> Result<()> {
         .append(true)
         .open(dir.join("session.log"))?;
     let mut c = std::process::Command::new(exe);
-    c.args(["desktop", "session"])
+    c.args(["desktop", "session", "--session", mode.name()])
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -232,7 +289,8 @@ enum Cmd {
     Msg(u64, Vec<u8>),
 }
 
-pub fn run() -> Result<()> {
+pub fn run(want: &str) -> Result<()> {
+    let mode = resolve_mode(want)?;
     let dir = runtime_dir()?;
     let sock = socket_path(&dir);
     if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
@@ -262,7 +320,19 @@ pub fn run() -> Result<()> {
         fonts_conf: fonts_conf.clone(),
     };
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-    let mut desk = Desk::new(conn, env)?;
+    let mut desk = Desk::new(conn, env, mode)?;
+    std::fs::write(dir.join("mode"), mode.name())?;
+    if mode == Mode::Xfce {
+        prepare_xfce();
+        // With D-Bus if available (Xfce's settings and panel want a session bus).
+        let line = if which("dbus-launch") {
+            "exec dbus-launch --exit-with-session xfce4-session"
+        } else {
+            "exec xfce4-session"
+        };
+        desk.session = Some(desk.spawn(line).context("starting Xfce")?);
+        info!("Xfce started");
+    }
 
     // The socket for attaching browsers.
     let _ = std::fs::remove_file(&sock);
@@ -329,6 +399,37 @@ async fn serve_client(stream: tokio::net::UnixStream, id: u64, tx: mpsc::Sender<
     }
     let _ = tx.send(Cmd::Leave(id));
     writer.abort();
+}
+
+fn which(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
+        .unwrap_or(false)
+}
+
+/// First start of Xfce for this user: the default panel without asking, no compositing
+/// (it only costs CPU on a virtual screen). Existing settings are left alone.
+fn prepare_xfce() {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = PathBuf::from(home).join(".config/xfce4/xfconf/xfce-perchannel-xml");
+    let _ = std::fs::create_dir_all(&dir);
+    let panel = dir.join("xfce4-panel.xml");
+    if !panel.exists() {
+        for default in ["/etc/xdg/xfce4/panel/default.xml", "/usr/share/xfce4/panel/default.xml"] {
+            if std::fs::copy(default, &panel).is_ok() {
+                break;
+            }
+        }
+    }
+    let wm = dir.join("xfwm4.xml");
+    if !wm.exists() {
+        let _ = std::fs::write(
+            wm,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<channel name=\"xfwm4\" version=\"1.0\">\n  \
+             <property name=\"general\" type=\"empty\">\n    \
+             <property name=\"use_compositing\" type=\"bool\" value=\"false\"/>\n  </property>\n</channel>\n",
+        );
+    }
 }
 
 fn start_xvfb(bundle: &Bundle, xauth: &Path) -> Result<(std::process::Child, u32)> {
@@ -445,26 +546,39 @@ struct Desk {
     apps: Vec<u8>,
     children: Vec<std::process::Child>,
     stop: bool,
+    /// Xfce: its window manager manages the windows, meshvpn only follows its client list.
+    external_wm: bool,
+    /// The desktop session (Xfce); when it ends (log out), so does this session.
+    session: Option<std::process::Child>,
 }
 
 impl Desk {
-    fn new(conn: RustConnection, env: AppEnv) -> Result<Self> {
+    fn new(conn: RustConnection, env: AppEnv, mode: Mode) -> Result<Self> {
         let screen = conn.setup().roots[0].clone();
         let root = screen.root;
         let atoms = Atoms::new(&conn)?.reply()?;
         conn.damage_query_version(1, 1)?.reply().context("DAMAGE extension")?;
         conn.xfixes_query_version(5, 0)?.reply().context("XFIXES extension")?;
         let _ = conn.randr_query_version(1, 3)?.reply();
+        let external_wm = mode == Mode::Xfce;
 
-        // Become the window manager.
-        conn.change_window_attributes(
-            root,
-            &ChangeWindowAttributesAux::new().event_mask(
-                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY,
-            ),
-        )?
-        .check()
-        .context("another window manager is running")?;
+        if external_wm {
+            // Follow the window manager's client list and active window.
+            conn.change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
+            )?;
+        } else {
+            // Become the window manager.
+            conn.change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new().event_mask(
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::STRUCTURE_NOTIFY,
+                ),
+            )?
+            .check()
+            .context("another window manager is running")?;
+        }
         let support = conn.generate_id()?;
         conn.create_window(
             x11rb::COPY_DEPTH_FROM_PARENT,
@@ -479,41 +593,43 @@ impl Desk {
             x11rb::COPY_FROM_PARENT,
             &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            root,
-            atoms._NET_SUPPORTING_WM_CHECK,
-            AtomEnum::WINDOW,
-            &[support],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            support,
-            atoms._NET_SUPPORTING_WM_CHECK,
-            AtomEnum::WINDOW,
-            &[support],
-        )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            support,
-            atoms._NET_WM_NAME,
-            atoms.UTF8_STRING,
-            b"meshvpn",
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            root,
-            atoms._NET_SUPPORTED,
-            AtomEnum::ATOM,
-            &[
-                atoms._NET_ACTIVE_WINDOW,
-                atoms._NET_CLIENT_LIST,
-                atoms._NET_WM_NAME,
-                atoms._NET_CLOSE_WINDOW,
+        if !external_wm {
+            conn.change_property32(
+                PropMode::REPLACE,
+                root,
                 atoms._NET_SUPPORTING_WM_CHECK,
-            ],
-        )?;
-        // A plain dark background instead of X's stipple.
+                AtomEnum::WINDOW,
+                &[support],
+            )?;
+            conn.change_property32(
+                PropMode::REPLACE,
+                support,
+                atoms._NET_SUPPORTING_WM_CHECK,
+                AtomEnum::WINDOW,
+                &[support],
+            )?;
+            conn.change_property8(
+                PropMode::REPLACE,
+                support,
+                atoms._NET_WM_NAME,
+                atoms.UTF8_STRING,
+                b"meshvpn",
+            )?;
+            conn.change_property32(
+                PropMode::REPLACE,
+                root,
+                atoms._NET_SUPPORTED,
+                AtomEnum::ATOM,
+                &[
+                    atoms._NET_ACTIVE_WINDOW,
+                    atoms._NET_CLIENT_LIST,
+                    atoms._NET_WM_NAME,
+                    atoms._NET_CLOSE_WINDOW,
+                    atoms._NET_SUPPORTING_WM_CHECK,
+                ],
+            )?;
+        }
+        // A plain dark background instead of X's stipple (Xfce paints its own).
         conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().background_pixel(0x2b2f36))?;
         conn.clear_area(false, root, 0, 0, 0, 0)?;
 
@@ -559,6 +675,8 @@ impl Desk {
             apps: frame(S_APPS, &serde_json::to_vec(&list_apps()).unwrap_or_default()),
             children: vec![],
             stop: false,
+            external_wm,
+            session: None,
         };
         d.load_keymap()?;
         d.resize(1280, 800);
@@ -595,6 +713,12 @@ impl Desk {
             self.conn.flush()?;
             if last_reap.elapsed() > Duration::from_secs(2) {
                 self.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+                if let Some(s) = &mut self.session
+                    && !matches!(s.try_wait(), Ok(None))
+                {
+                    info!("the desktop session ended (logged out)");
+                    self.stop = true;
+                }
                 last_reap = Instant::now();
             }
             if !busy {
@@ -617,6 +741,8 @@ impl Desk {
                 let c = Client { id, tx, inflight: 0 };
                 let mut hello = frame(S_INIT, &[self.w.to_le_bytes(), self.h.to_le_bytes()].concat());
                 hello.extend(self.windows_msg());
+                // Apps installed since the session started show up too.
+                self.apps = frame(S_APPS, &serde_json::to_vec(&list_apps()).unwrap_or_default());
                 hello.extend(self.apps.clone());
                 if let Some(cur) = &self.cursor {
                     hello.extend(cur.clone());
@@ -690,6 +816,20 @@ impl Desk {
     }
 
     fn launch(&mut self, line: &str) {
+        match self.spawn(line) {
+            Ok(child) => {
+                info!("started {line:?}");
+                self.children.push(child);
+            }
+            Err(e) => {
+                let msg = frame(S_NOTICE, format!("cannot start {line:?}: {e}").as_bytes());
+                self.broadcast(&msg);
+            }
+        }
+    }
+
+    /// A command in the session: its display, fonts and a UTF-8 locale; in its own session.
+    fn spawn(&self, line: &str) -> std::io::Result<std::process::Child> {
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("/bin/sh");
         c.arg("-c")
@@ -715,16 +855,7 @@ impl Desk {
                 Ok(())
             });
         }
-        match c.spawn() {
-            Ok(child) => {
-                info!("started {line:?}");
-                self.children.push(child);
-            }
-            Err(e) => {
-                let msg = frame(S_NOTICE, format!("cannot start {line:?}: {e}").as_bytes());
-                self.broadcast(&msg);
-            }
-        }
+        c.spawn()
     }
 
     // ----------------------------------------------------------------------- screen
@@ -746,9 +877,11 @@ impl Desk {
                 self.h = g.height.min(MAX_H);
             }
             self.prev = vec![0; self.w as usize * self.h as usize * 4];
-            for i in 0..self.windows.len() {
-                let win = self.windows[i].win;
-                let _ = self.place(win);
+            if !self.external_wm {
+                for i in 0..self.windows.len() {
+                    let win = self.windows[i].win;
+                    let _ = self.place(win);
+                }
             }
         }
         self.full = true;
@@ -920,12 +1053,19 @@ impl Desk {
                 Event::DamageNotify(_) => self.dirty = true,
                 Event::MapRequest(e) => self.manage(e.window)?,
                 Event::ConfigureRequest(e) => self.configure_request(e)?,
-                Event::UnmapNotify(e) => {
+                Event::UnmapNotify(e) if !self.external_wm => {
                     if e.event == self.root || e.event == e.window {
                         self.unmanage(e.window);
                     }
                 }
-                Event::DestroyNotify(e) => self.unmanage(e.window),
+                Event::DestroyNotify(e) if !self.external_wm => self.unmanage(e.window),
+                Event::PropertyNotify(e)
+                    if self.external_wm
+                        && e.window == self.root
+                        && (e.atom == self.atoms._NET_CLIENT_LIST || e.atom == self.atoms._NET_ACTIVE_WINDOW) =>
+                {
+                    self.sync_clients()?;
+                }
                 Event::PropertyNotify(e) => {
                     if (e.atom == self.atoms._NET_WM_NAME || e.atom == u32::from(AtomEnum::WM_NAME))
                         && let Some(i) = self.windows.iter().position(|m| m.win == e.window)
@@ -935,7 +1075,7 @@ impl Desk {
                         self.broadcast(&msg);
                     }
                 }
-                Event::ClientMessage(e) => {
+                Event::ClientMessage(e) if !self.external_wm => {
                     if e.type_ == self.atoms._NET_ACTIVE_WINDOW {
                         self.activate(e.window)?;
                     } else if e.type_ == self.atoms._NET_CLOSE_WINDOW {
@@ -1126,7 +1266,77 @@ impl Desk {
         self.broadcast(&msg);
     }
 
+    /// Asks the window manager (Xfce) to do something with a window (EWMH).
+    fn ask_wm(&self, kind: Atom, win: Window, data: [u32; 5]) -> Result<()> {
+        let ev = ClientMessageEvent::new(32, win, kind, data);
+        self.conn.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
+        )?;
+        Ok(())
+    }
+
+    /// Xfce mode: the windows (and the active one) as its window manager lists them.
+    fn sync_clients(&mut self) -> Result<()> {
+        let list: Vec<u32> = self
+            .conn
+            .get_property(false, self.root, self.atoms._NET_CLIENT_LIST, AtomEnum::WINDOW, 0, 1024)?
+            .reply()?
+            .value32()
+            .map(|v| v.collect())
+            .unwrap_or_default();
+        let active = self
+            .conn
+            .get_property(false, self.root, self.atoms._NET_ACTIVE_WINDOW, AtomEnum::WINDOW, 0, 1)?
+            .reply()?
+            .value32()
+            .and_then(|mut v| v.next())
+            .filter(|w| *w != 0);
+        let mut windows = vec![];
+        for win in list {
+            if let Some(m) = self.windows.iter().position(|m| m.win == win) {
+                windows.push(self.windows.remove(m));
+                continue;
+            }
+            // Panels and the desktop background are no windows to switch to.
+            let types: Vec<u32> = self
+                .conn
+                .get_property(false, win, self.atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM, 0, 16)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .and_then(|r| r.value32().map(|v| v.collect()))
+                .unwrap_or_default();
+            if types
+                .iter()
+                .any(|t| *t == self.atoms._NET_WM_WINDOW_TYPE_DOCK || *t == self.atoms._NET_WM_WINDOW_TYPE_DESKTOP)
+            {
+                continue;
+            }
+            // Titles change: follow them.
+            let _ = self.conn.change_window_attributes(
+                win,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            );
+            windows.push(Managed {
+                win,
+                title: self.title(win),
+                floating: false,
+            });
+        }
+        self.windows = windows;
+        self.active = active;
+        let msg = self.windows_msg();
+        self.broadcast(&msg);
+        Ok(())
+    }
+
     fn activate(&mut self, win: Window) -> Result<()> {
+        if self.external_wm {
+            // source 2: a pager/taskbar asked
+            return self.ask_wm(self.atoms._NET_ACTIVE_WINDOW, win, [2, x11rb::CURRENT_TIME, 0, 0, 0]);
+        }
         let Some(i) = self.windows.iter().position(|m| m.win == win) else {
             return Ok(());
         };
@@ -1152,6 +1362,9 @@ impl Desk {
     fn close(&mut self, win: Window) -> Result<()> {
         if !self.windows.iter().any(|m| m.win == win) {
             return Ok(());
+        }
+        if self.external_wm {
+            return self.ask_wm(self.atoms._NET_CLOSE_WINDOW, win, [x11rb::CURRENT_TIME, 2, 0, 0, 0]);
         }
         let protocols: Vec<u32> = self
             .conn
@@ -1209,7 +1422,8 @@ impl Desk {
             if is && !was {
                 // Click to focus.
                 let under = self.conn.query_pointer(self.root)?.reply().map(|p| p.child).ok();
-                if let Some(child) = under
+                if !self.external_wm
+                    && let Some(child) = under
                     && child != x11rb::NONE
                     && Some(child) != self.active
                 {

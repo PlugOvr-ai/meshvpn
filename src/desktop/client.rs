@@ -16,6 +16,8 @@ const PAGE: &str = include_str!("viewer.html");
 pub struct Target {
     pub node: NodeView,
     pub remote: Remote,
+    /// "auto" (Xfce if the node has it), "xfce" or "plain".
+    pub session: &'static str,
 }
 
 impl Target {
@@ -28,6 +30,7 @@ impl Target {
                 socks: false,
                 timeout: std::time::Duration::from_secs(30),
             },
+            session: "auto",
         }
     }
 
@@ -43,8 +46,13 @@ impl Target {
             c.arg("-c").arg(cmd);
             return c;
         }
-        let script = "exec \"$(command -v meshvpn || echo \"$HOME/.local/bin/meshvpn\")\" desktop attach";
-        self.remote.command(&self.node, script).into()
+        let mut script =
+            "exec \"$(command -v meshvpn || echo \"$HOME/.local/bin/meshvpn\")\" desktop attach".to_string();
+        // Only when asked: nodes before 0.13 don't know the option.
+        if self.session != "auto" {
+            script.push_str(&format!(" --session {}", self.session));
+        }
+        self.remote.command(&self.node, &script).into()
     }
 }
 

@@ -53,6 +53,45 @@ pub fn find() -> Option<Bundle> {
         .map(|dir| Bundle { dir })
 }
 
+/// `meshvpn desktop setup --xfce`: Xfce from the system's package manager - a real desktop
+/// (panel with the applications menu, file manager, terminal) instead of the built-in one.
+pub fn install_xfce() -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("installing Xfce needs root (the system's package manager) - try again with sudo, or ask an admin");
+    }
+    let has = |c: &str| {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join(c).is_file()))
+            .unwrap_or(false)
+    };
+    // Lean: the desktop, a terminal and D-Bus; no screensaver, power manager or display manager.
+    let script = if has("apt-get") {
+        "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+         xfce4 xfce4-terminal dbus-x11 adwaita-icon-theme fonts-dejavu-core librsvg2-common"
+    } else if has("dnf") {
+        "dnf install -y xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-settings Thunar xfce4-terminal \
+         xfce4-appfinder dbus-x11 adwaita-icon-theme dejavu-sans-fonts"
+    } else if has("apk") {
+        "apk add xfce4 xfce4-terminal dbus-x11 adwaita-icon-theme font-dejavu librsvg"
+    } else if has("zypper") {
+        "zypper --non-interactive install xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-settings thunar \
+         xfce4-terminal dbus-1-x11 adwaita-icon-theme dejavu-fonts"
+    } else {
+        bail!("no supported package manager (apt, dnf, apk, zypper) - install Xfce yourself");
+    };
+    println!("Installing Xfce (this takes a few minutes)...");
+    let ok = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .status()
+        .context("running the package manager")?
+        .success();
+    if !ok {
+        bail!("installing Xfce failed (see above)");
+    }
+    Ok(())
+}
+
 pub fn archive_name() -> String {
     format!("meshvpn-desktop-{}.tar.gz", std::env::consts::ARCH)
 }

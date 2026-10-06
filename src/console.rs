@@ -447,6 +447,7 @@ impl App {
                 socks: self.socks,
                 timeout: Duration::from_secs(30),
             },
+            session: "auto",
         };
         match crate::desktop::client::start(target, 0) {
             Ok(v) => {

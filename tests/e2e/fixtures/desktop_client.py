@@ -78,8 +78,36 @@ class Viewer:
             self.send(C_KEY, bytes([down, char]) + struct.pack("<I", keysym))
 
 
+def xfce(port, token):
+    """Xfce session: its windows as tabs, typing into its terminal, survives the browser closing."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1280, 800))
+    v.until(lambda: v.size == [1280, 800] and v.frames >= 1, "first frame", 90)
+    v.settle(8)  # Xfce starting
+    panels_hidden = v.windows == []
+    v.send(C_LAUNCH, b"xfce4-terminal")
+    v.until(lambda: any("Terminal" in w["title"] for w in v.windows), "the Xfce terminal as a tab", 60)
+    v.settle(2)
+    for ch in "echo typed-in-xfce > /tmp/xfce_typed":
+        v.key(ord(ch), 1)
+    v.key(0xFF0D, 0)
+    v.settle(1)
+    v.send(C_LAUNCH, b"thunar")
+    v.until(lambda: any("Thunar" in w["title"] for w in v.windows), "Thunar", 60)
+    first = [w["title"] for w in v.windows]
+    v.s.close()
+    # The browser went away; a new one sees the same windows.
+    v2 = Viewer(port, token)
+    v2.send(C_RESIZE, struct.pack("<HH", 1280, 800))
+    v2.until(lambda: v2.frames >= 1 and len(v2.windows) >= 2, "the same windows after reconnecting", 30)
+    print(json.dumps({"panels_hidden": panels_hidden, "first": first, "again": [w["title"] for w in v2.windows],
+                      "notices": v.notices + v2.notices}))
+
+
 def main():
     port, token = int(sys.argv[1]), sys.argv[2]
+    if len(sys.argv) > 3 and sys.argv[3] == "xfce":
+        return xfce(port, token)
     v = Viewer(port, token)
     v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
     v.until(lambda: v.size == [1000, 640] and v.frames >= 1, "first frame at the requested size", 90)

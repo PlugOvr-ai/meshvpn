@@ -242,6 +242,11 @@ applications you want to run.
 * **First use** downloads the bundle by itself; on machines without internet copy `meshvpn-desktop-<arch>.tar.gz` from
   the release and run `meshvpn desktop setup --from <file>` (also handy in a Dockerfile).
 * Apps get a UTF-8 locale and the bundled DejaVu fonts if the image has none. Not yet: OpenGL/GPU acceleration, sound.
+* **A full desktop with Xfce:** `sudo meshvpn desktop setup --xfce` on the node (or `xfce4` in the Dockerfile) installs
+  Xfce with the system's package manager (apt, dnf, apk, zypper; about 300 MB). From then on `meshvpn desktop <node>`
+  opens an Xfce desktop: panel with the applications menu, file manager, terminal, windows you can move and resize.
+  The tabs in the browser bar follow Xfce's windows; logging out of Xfce ends the session. `--plain` keeps the
+  built-in minimal desktop, `--xfce` insists on Xfce. A running session keeps its desktop until `meshvpn desktop stop`.
 * **Logged in over SSH** (e.g. on your main node from outside the mesh)? `meshvpn desktop` notices and prints the
   matching forward, e.g. `ssh -L 7880:127.0.0.1:7880 you@main-node` - run it on your computer (or add it to the open
   session with Enter `~C`), then open the link in your local browser.
