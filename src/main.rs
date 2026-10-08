@@ -479,6 +479,15 @@ enum SshCmd {
     },
     /// Show who may log in here, and which keys this machine offers to others.
     List,
+    /// The account others log in as by default (console, desktop). Without USER: show it.
+    ///
+    /// Example: `sudo meshvpn ssh default-user ubuntu`
+    DefaultUser {
+        user: Option<String>,
+        /// Remove it (then: the --ssh-allow-all account if there is exactly one).
+        #[arg(long, conflicts_with = "user")]
+        clear: bool,
+    },
 }
 
 #[derive(Args)]
@@ -1225,6 +1234,48 @@ fn real_main(cli: Cli) -> Result<i32> {
             require_owner()?;
             tui::run(&dir)?;
         }
+        Cmd::Ssh {
+            cmd: Some(SshCmd::DefaultUser { user, clear }),
+        } => {
+            if user.is_none() && !clear {
+                let cfg = Config::load(&dir)?;
+                let derived = (cfg.ssh_allow_all.len() == 1).then(|| cfg.ssh_allow_all[0].clone());
+                match (cfg.ssh_default_user, derived) {
+                    (Some(u), _) => say(json, &format!("others log in here as {u} by default")),
+                    (None, Some(u)) => say(
+                        json,
+                        &format!("others log in here as {u} by default (from --ssh-allow-all)"),
+                    ),
+                    (None, None) => say(json, "no default login set (others log in as themselves)"),
+                }
+                return Ok(0);
+            }
+            require_owner()?;
+            if let Some(u) = &user
+                && !proto::valid_user(u)
+            {
+                bail!("invalid user name {u:?}");
+            }
+            if control::is_running(&dir) {
+                let req = control::Request::LoginUser { user };
+                if let control::Response::Message { text } =
+                    tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
+                {
+                    say(json, &text);
+                }
+            } else {
+                let mut cfg = Config::load(&dir)?;
+                cfg.ssh_default_user = user.clone();
+                cfg.save(&dir)?;
+                say(
+                    json,
+                    &match user {
+                        Some(u) => format!("others log in here as {u} by default (announced when meshvpn starts)"),
+                        None => "default login removed".into(),
+                    },
+                );
+            }
+        }
         Cmd::Ssh { cmd } => {
             let req = match cmd.unwrap_or(SshCmd::List) {
                 SshCmd::Allow { who, users } if !control::is_running(&dir) => {
@@ -1256,6 +1307,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     control::Request::SshDeny { who, users }
                 }
                 SshCmd::List => control::Request::SshList,
+                SshCmd::DefaultUser { .. } => unreachable!("handled above"),
             };
             if let control::Response::Message { text } =
                 tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?
@@ -1318,7 +1370,8 @@ fn real_main(cli: Cli) -> Result<i32> {
                 let [node] = <[agent::NodeView; 1]>::try_from(targets)
                     .map_err(|_| anyhow::anyhow!("select exactly one node"))?;
                 let remote = agent::Remote {
-                    user: user.unwrap_or_else(agent::Remote::default_user),
+                    // Default: a User from ~/.ssh/config, else the node's announced default.
+                    user: user.unwrap_or_else(|| agent::Remote::login_user_for(&node)),
                     socks: st.socks.is_some(),
                     timeout: std::time::Duration::from_secs(30),
                 };

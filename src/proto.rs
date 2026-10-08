@@ -155,6 +155,9 @@ pub struct NodeInfo {
     /// nodes can trust it without asking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_host_key: Option<String>,
+    /// The account to log in as by default (`meshvpn ssh default-user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_user: Option<String>,
 }
 
 /// GPUs of a node reserved for someone until `expires` (ms since epoch).
@@ -482,6 +485,7 @@ mod tests {
             objects: vec![],
             leases: vec![],
             ssh_host_key: None,
+            login_user: None,
             version: String::new(),
         }
     }

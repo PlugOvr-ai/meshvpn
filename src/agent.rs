@@ -19,6 +19,8 @@ use crate::proto::{Inventory, Lease, ObjectAd, Perf};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NodeView {
     pub name: String,
+    /// The account the node suggests logging in as (`meshvpn ssh default-user`).
+    pub login_user: Option<String>,
     /// meshvpn version on the node.
     pub version: String,
     pub id: String,
@@ -48,6 +50,7 @@ impl NodeView {
     pub fn named(name: &str) -> Self {
         NodeView {
             name: name.into(),
+            login_user: None,
             version: String::new(),
             id: String::new(),
             ip: Ipv4Addr::UNSPECIFIED,
@@ -90,6 +93,7 @@ pub fn status(dir: &Path) -> Result<Status> {
 pub fn nodes(st: &Status) -> Vec<NodeView> {
     let mut out = vec![NodeView {
         name: st.name.clone(),
+        login_user: None,
         version: st.version.clone(),
         id: st.id.clone(),
         ip: st.ip,
@@ -107,6 +111,7 @@ pub fn nodes(st: &Status) -> Vec<NodeView> {
     }];
     out.extend(st.peers.iter().map(|p| NodeView {
         name: p.name.clone(),
+        login_user: p.login_user.clone(),
         version: p.version.clone(),
         id: p.id.clone(),
         ip: p.ip,
@@ -294,6 +299,25 @@ impl Remote {
         } else {
             format!("{}@{}.mesh", self.user, node.name)
         }
+    }
+
+    /// Who to log in as on `node` without -u: a `User` from ~/.ssh/config for that host, else
+    /// the node's announced default (`meshvpn ssh default-user`), else the local account.
+    pub fn login_user_for(node: &NodeView) -> String {
+        let configured = Self::ssh_config_user(&node.name);
+        // ssh's own default is the account it runs as (root under sudo, not SUDO_USER).
+        let process_account = {
+            let pw = unsafe { libc::getpwuid(libc::geteuid()) };
+            (!pw.is_null()).then(|| {
+                unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        };
+        if Some(&configured) != process_account.as_ref() {
+            return configured; // a User line in the ssh config
+        }
+        node.login_user.clone().filter(|u| !u.is_empty()).unwrap_or(configured)
     }
 
     /// The account ssh logs in with for `node` when no user is given (`ssh -G`: User lines

@@ -846,7 +846,7 @@ def test_desktop_fallback(lab):
 
 @test
 def test_console(lab):
-    """meshvpn console: node list, shells on nodes as tabs (user as plain ssh picks it), desktop link with the ssh -L hint."""
+    """meshvpn console: node list, shells as tabs with each node's default user (or the one last used), desktop link."""
     net = lab.network("net")
     hub = lab.node("hub", [net])
     box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])
@@ -856,21 +856,33 @@ def test_console(lab):
     box.mv(f"join {invite(hub)} --name box --ssh-allow-all agent")
     box.up()
     wait(lambda: hub.online("box") and box.status().get("ssh_server") == "built-in", "box online with ssh")
-    # root on hub logs in to mesh hosts as agent (its ssh config says so), like `ssh box.mesh` does
-    hub.sh("ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519 && printf 'Host *.mesh\\n  User agent\\n' > /root/.ssh/config")
-    wait(lambda: hub.sh("ssh -o BatchMode=yes -o ConnectTimeout=5 box.mesh true", ok=False).returncode == 0,
-         "plain ssh from hub to box", 60)
-    steps = [
+    # root on hub has no ssh config: the console logs in as the user box announces (from
+    # --ssh-allow-all agent), not as root.
+    hub.sh("ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519")
+    check("agent" in box.mv("ssh default-user"), "box should announce agent")
+    wait(lambda: (hub.peer("box") or {}).get("login_user") == "agent", "hub learns box's default user", 30)
+    wait(lambda: hub.sh("ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true", ok=False).returncode == 0,
+         "ssh from hub to box", 60)
+
+    def console(steps, env="SSH_CONNECTION='10.9.9.9 50000 10.1.2.3 2222'"):
+        quoted = " ".join("'" + s + "'" for s in steps)
+        p = hub.sh(f"cd /root && {env} console_driver.py {quoted}", ok=False, timeout=120)
+        check(p.returncode == 0, f"console: {p.stdout[-3000:]}{p.stderr[-500:]}")
+
+    console([
         "expect:NODE", "expect:box",
-        "key:down", "key:enter", "expect:agent@box",
+        "key:down", "expect:log in as agent", "key:enter", "expect:agent@box",
         "send:echo MARK-$(hostname)\\r", "expect:MARK-box",
         "send:\\x020", "expect:shells as",   # Ctrl+B 0: back to the node list
         "send:\\x021", "send:exit\\r", "expect:session ended",
         "key:enter", "send:d", "expect:ssh -L 7880:127.0.0.1:7880 -p 2222 root@10.1.2.3",
-    ]
-    quoted = " ".join("'" + s + "'" for s in steps)
-    p = hub.sh(f"cd /root && SSH_CONNECTION='10.9.9.9 50000 10.1.2.3 2222' console_driver.py {quoted}", ok=False, timeout=120)
-    check(p.returncode == 0, f"console: {p.stdout[-3000:]}{p.stderr[-500:]}")
+    ])
+    # Another account once (u), and the console remembers it for this node.
+    box.sh("useradd -m -s /bin/bash other")
+    box.mv("ssh allow everyone --as other")
+    console(["expect:box", "key:down", "send:u", "send:\\x7f\\x7f\\x7f\\x7f\\x7fother\\r", "expect:other@box",
+             "send:echo WHO-$(whoami)\\r", "expect:WHO-other", "send:exit\\r", "expect:session ended", "key:enter"])
+    console(["expect:box", "key:down", "key:enter", "expect:other@box", "send:echo WHO-$(whoami)\\r", "expect:WHO-other"])
 
 
 @test

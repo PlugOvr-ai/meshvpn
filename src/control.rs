@@ -47,6 +47,10 @@ pub enum Request {
     Rename {
         name: String,
     },
+    /// `meshvpn ssh default-user`: None clears it.
+    LoginUser {
+        user: Option<String>,
+    },
     AdminStatus,
     /// GPU reservations on this node (allowed for every local user: they are advisory).
     GpuReserve {
@@ -282,6 +286,12 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                     Ok((ticket, admins)) => Response::Message {
                         text: serde_json::json!({ "ticket": ticket, "admins": admins }).to_string(),
                     },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::LoginUser { user }) => match node.set_login_user(user) {
+                    Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },

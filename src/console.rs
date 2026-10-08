@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -117,8 +118,10 @@ impl Drop for Shell {
 
 struct App {
     dir: PathBuf,
-    /// `-u`: the account for shells; None: what plain `ssh` uses.
+    /// `-u`: the account for shells on every node.
     user: Option<String>,
+    /// The account last used per node (with `u`), remembered across runs.
+    remembered: HashMap<String, String>,
     socks: bool,
     nodes: Vec<NodeView>,
     network: String,
@@ -141,6 +144,7 @@ pub fn run(dir: &Path, user: Option<String>) -> Result<()> {
     let mut app = App {
         dir: dir.to_path_buf(),
         user,
+        remembered: load_remembered(),
         socks: false,
         nodes: vec![],
         network: String::new(),
@@ -395,15 +399,30 @@ impl App {
         Some(t.split('@').nth(1)?.split(' ').next()?.to_string())
     }
 
-    /// Who a shell on `node` logs in as.
+    /// Who a shell on `node` logs in as: -u, else the account last used there, else a User
+    /// from ~/.ssh/config, else the node's announced default, else the local account.
     fn login_user(&self, node: &str) -> String {
-        self.user.clone().unwrap_or_else(|| Remote::ssh_config_user(node))
+        if let Some(u) = self.user.clone().or_else(|| self.remembered.get(node).cloned()) {
+            return u;
+        }
+        match self.nodes.iter().find(|n| n.name == node) {
+            Some(n) => Remote::login_user_for(n),
+            None => Remote::ssh_config_user(node),
+        }
     }
 
     fn open_shell(&mut self, node: &NodeView, user: Option<String>) {
+        // A user chosen with `u` is remembered for this node.
+        if let Some(u) = &user
+            && !node.is_self
+            && self.remembered.get(&node.name) != Some(u)
+        {
+            self.remembered.insert(node.name.clone(), u.clone());
+            save_remembered(&self.remembered);
+        }
+        let user = user.unwrap_or_else(|| self.login_user(&node.name));
         let remote = Remote {
-            // Empty: ssh picks the user like a plain `ssh node.mesh` does.
-            user: user.clone().unwrap_or_default(),
+            user: user.clone(),
             socks: self.socks,
             timeout: Duration::from_secs(10),
         };
@@ -411,7 +430,6 @@ impl App {
         let title = if node.is_self {
             format!("{}@{} (here)", Remote::default_user(), node.name)
         } else {
-            let user = user.unwrap_or_else(|| self.login_user(&node.name));
             format!("{user}@{}", node.name)
         };
         let (rows, cols) = (self.body.height.max(5), self.body.width.max(20));
@@ -622,7 +640,7 @@ impl App {
         .block(Block::bordered().title(format!(
             " {} nodes · shells as {} ",
             self.nodes.len(),
-            self.user.as_deref().unwrap_or("with your ssh settings")
+            self.user.as_deref().unwrap_or("each node's default user")
         )));
         f.render_stateful_widget(table, list, &mut self.table);
 
@@ -630,9 +648,14 @@ impl App {
         let text = match sel {
             None => vec![Line::raw("No nodes known yet.")],
             Some(n) => {
+                let login = if n.is_self {
+                    String::new()
+                } else {
+                    format!("  ·  log in as {}", self.login_user(&n.name))
+                };
                 let mut l = vec![Line::from(vec![
                     Span::styled(n.name.clone(), Style::new().bold()),
-                    Span::raw(format!("  {}.mesh  {}", n.name, n.ip)),
+                    Span::raw(format!("  {}.mesh  {}{login}", n.name, n.ip)),
                 ])];
                 if let Some(i) = &n.inventory {
                     l.push(Line::raw(format!(
@@ -667,6 +690,31 @@ impl Shell {
         let next = (self.scroll as isize + delta).max(0) as usize;
         p.screen_mut().set_scrollback(next);
         self.scroll = p.screen().scrollback();
+    }
+}
+
+/// ~/.config/meshvpn/console.json: the account last used per node.
+fn remembered_path() -> Option<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(x) => PathBuf::from(x),
+        None => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(base.join("meshvpn/console.json"))
+}
+
+fn load_remembered() -> HashMap<String, String> {
+    remembered_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_remembered(map: &HashMap<String, String>) {
+    if let Some(p) = remembered_path() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, serde_json::to_vec_pretty(map).unwrap_or_default());
     }
 }
 

@@ -164,6 +164,8 @@ struct State {
     /// Throughput tests: being received (per peer), and waiting for their result.
     bench_rx: HashMap<NodeId, (u64, Instant, u64)>,
     bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
+    /// `meshvpn ssh default-user` (overrides the derived default).
+    login_user: Option<String>,
     /// Throughput tests over the data path being received: id -> (first, bytes, last).
     bench_ip_rx: HashMap<u64, (Instant, u64, Instant)>,
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
@@ -313,6 +315,9 @@ pub struct SshOverview {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PeerStatus {
     pub name: String,
+    /// The account the node suggests logging in as.
+    #[serde(default)]
+    pub login_user: Option<String>,
     /// meshvpn version the node runs (from its record; empty for very old nodes).
     #[serde(default)]
     pub version: String,
@@ -404,6 +409,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.objects_ad = node.shares.ads();
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
+        st.login_user = node.cfg.ssh_default_user.clone();
         st.trusted_admins = node.cfg.trusted_admins.clone();
         st.leases = saved.leases.clone();
         st.my_claim = node.own_claim();
@@ -600,6 +606,10 @@ impl Node {
             udp: st.my_udp.clone(),
             leases: st.leases.clone(),
             ssh_host_key: st.my_ssh_host_key.clone(),
+            login_user: st
+                .login_user
+                .clone()
+                .or_else(|| (st.ssh_allow_all.len() == 1).then(|| st.ssh_allow_all[0].clone())),
             measured: st.measured,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
@@ -1052,6 +1062,12 @@ impl Node {
     pub fn ssh_list(&self) -> String {
         let st = self.state.lock().unwrap();
         let mut out = String::from("Password-less SSH logins into this machine:\n");
+        let derived = (st.ssh_allow_all.len() == 1).then(|| st.ssh_allow_all[0].clone());
+        if let Some(u) = st.login_user.clone().or(derived) {
+            out.push_str(&format!(
+                "  (others log in as {u} by default - meshvpn ssh default-user)\n"
+            ));
+        }
         if !st.ssh_allow_all.is_empty() {
             out.push_str(&format!(
                 "  {:<32} -> {}\n",
@@ -2314,6 +2330,7 @@ impl Node {
                 };
                 PeerStatus {
                     name: r.info.name.clone(),
+                    login_user: r.info.login_user.clone(),
                     version: r.info.version.clone(),
                     id: id.hex(),
                     ip: overlay_ip(&id),
@@ -2874,6 +2891,25 @@ impl Node {
     }
 
     /// `meshvpn rename NEW`: new name for this node; identity, IP and permissions stay.
+    /// `meshvpn ssh default-user`: the account others log in as by default.
+    pub fn set_login_user(&self, user: Option<String>) -> Result<String> {
+        if let Some(u) = &user
+            && !crate::proto::valid_user(u)
+        {
+            bail!("invalid user name {u:?}");
+        }
+        let mut cfg = Config::load(&self.dir)?;
+        cfg.ssh_default_user = user.clone();
+        cfg.save(&self.dir)?;
+        let mut st = self.state.lock().unwrap();
+        st.login_user = user.clone();
+        self.announce(&mut st);
+        Ok(match user {
+            Some(u) => format!("others now log in here as {u} by default (console, desktop)"),
+            None => "default login removed".into(),
+        })
+    }
+
     pub fn rename(&self, new: &str) -> Result<String> {
         let name = crate::config::sanitize_name(new);
         let mut st = self.state.lock().unwrap();

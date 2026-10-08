@@ -255,8 +255,10 @@ and you get a full-screen terminal desktop:
 
 * **Tab 0** lists all nodes: online state, path, latency, GPUs, version and tags, and details of the selected node
   (OS, CPU, memory, disk, GPUs, LAN).
-* **Enter** opens a shell on the selected node in a new tab (as plain `ssh` would: your SSH config and user apply),
-  **u** as another user.
+* **Enter** opens a shell on the selected node in a new tab, as the node's default user: set it on the node with
+  `sudo meshvpn ssh default-user ubuntu` (nodes joined with `--ssh-allow-all ubuntu` announce `ubuntu` by themselves).
+  A `User` in `~/.ssh/config` for the host wins; **u** logs in as another account, and the console remembers that
+  choice for the node.
 * **Switch tabs** with Alt+0…9 and Alt+←/→, or tmux-style with Ctrl+B and then `0…9`, `n`, `p`, `w` (close).
 * **d** prints a link to the node's graphical desktop (next section).
 * **Shift+PgUp** scrolls back; selecting and copying text works as usual.

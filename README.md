@@ -271,6 +271,11 @@ local shell for this machine), **u** as another user, **d** prints a desktop lin
 Switch with **Alt+0..9**, **Alt+←/→**, or **Ctrl+B** and then `0..9`, `n`, `p`, `w` (close), `d` - like tmux.
 **Shift+PgUp** scrolls back; text selection works as usual in your terminal.
 
+**Which account?** Each node announces its default login: set it with `sudo meshvpn ssh default-user ubuntu` on the
+node (a node joined with `--ssh-allow-all ubuntu` announces `ubuntu` by itself). The console logs in with that,
+unless `~/.ssh/config` has a `User` for the host or you chose another account there with **u** - the console
+remembers that per node. `meshvpn desktop` uses the same default.
+
 ## AI agents and multi-node work
 
 meshvpn is built so that people and AI agents can work with many machines at once, including training models across
