@@ -282,6 +282,13 @@ meshvpn is built so that people and AI agents can work with many machines at onc
 nodes. Every command takes `--json` (errors too), and exit codes are stable: 0 ok, 1 error, 2 usage, 3 meshvpn not
 running, 4 needs root, 5 not found. Nodes are selected with **selectors**: `all`, `tag:<tag>`, node names or mesh IPs.
 
+**Instructions for agents:** `meshvpn guide` prints how to work with meshvpn - the rules (`--json`, selectors, what
+to ask a human first, cleaning up reservations and jobs), the commands for each task, and the network right now
+(this node, the other nodes, tags, free GPUs). Point your agent at it, e.g. in `AGENTS.md`/`CLAUDE.md`: *"Run
+`meshvpn guide` before working with other machines."* For Claude Code, install it as a skill:
+`mkdir -p ~/.claude/skills/meshvpn && meshvpn guide --skill > ~/.claude/skills/meshvpn/SKILL.md`. MCP clients get the
+same instructions automatically when they connect.
+
 **MCP server:** connect an agent directly with `claude mcp add meshvpn -- meshvpn mcp` (any MCP client works). Tools:
 `list_nodes`, `exec`, `copy_to_nodes`, `copy_from_nodes`, `network_matrix`, `training_env`, `launch`, `job_status`,
 `job_stop`, `list_jobs`, `gpu_list`, `gpu_reserve`, `gpu_release`, `share`, `fetch`, `list_objects`, `set_tags`,

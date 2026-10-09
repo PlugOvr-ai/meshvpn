@@ -5,6 +5,7 @@ mod control;
 mod desktop;
 mod doctor;
 mod gpu;
+mod guide;
 mod hosts;
 mod inventory;
 mod keys;
@@ -33,7 +34,12 @@ use keys::{Identity, overlay_ip};
 /// A decentralized mesh VPN. No coordination server: nodes find each other by gossip,
 /// relay for each other, and can live behind a reverse SSH tunnel.
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(
+    version,
+    about,
+    long_about = None,
+    after_help = "AI agents: run `meshvpn guide` first - how to work with the network, and what is in it right now."
+)]
 struct Cli {
     /// Directory holding config and state [default: /etc/meshvpn as root, else
     /// ~/.config/meshvpn for a rootless install, or /etc/meshvpn if only that exists].
@@ -228,6 +234,12 @@ enum Cmd {
     Ssh {
         #[command(subcommand)]
         cmd: Option<SshCmd>,
+    },
+    /// How to work with meshvpn, for AI agents: the rules, the commands, and the network right now.
+    /// `--skill` prints it as a Claude Code skill (save as ~/.claude/skills/meshvpn/SKILL.md).
+    Guide {
+        #[arg(long)]
+        skill: bool,
     },
     /// The mesh in your terminal: all nodes, and shells on them as tabs (also plain `meshvpn`).
     Console {
@@ -1317,6 +1329,18 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::SftpServer => sshserver::sftp_server()?,
         Cmd::Console { user } => console::run(&dir, user)?,
+        Cmd::Guide { skill } => {
+            if skill {
+                print!("{}", guide::skill());
+            } else if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "context": guide::context(&dir), "guide": guide::GUIDE })
+                );
+            } else {
+                println!("{}\n{}", guide::context(&dir), guide::GUIDE);
+            }
+        }
         Cmd::Desktop {
             cmd,
             node,
@@ -2583,6 +2607,59 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split(' ').map(String::from).collect()
+    }
+
+    /// Splits a shell command line (quotes, no expansion).
+    fn shell_words(line: &str) -> Vec<String> {
+        let (mut words, mut cur, mut quote, mut any) = (vec![], String::new(), None, false);
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => cur.push(c),
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    any = true;
+                }
+                (None, ' ') => {
+                    if any || !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                    any = false;
+                }
+                (None, c) => cur.push(c),
+            }
+        }
+        if any || !cur.is_empty() {
+            words.push(cur);
+        }
+        words
+    }
+
+    #[test]
+    fn agent_guide_commands_parse() {
+        // Every command in the guide's code blocks must be valid for this CLI.
+        let mut in_code = false;
+        let mut checked = 0;
+        for line in guide::GUIDE.lines() {
+            if line.starts_with("```") {
+                in_code = !in_code;
+                continue;
+            }
+            let line = line.split(" # ").next().unwrap().trim();
+            if !in_code || !line.starts_with("meshvpn ") {
+                continue;
+            }
+            let line = line
+                .replace("<id>", "abc123")
+                .replace("<name>", "data")
+                .replace("<what for>", "test");
+            let words = shell_words(&line);
+            if let Err(e) = Cli::try_parse_from(&words) {
+                panic!("guide command doesn't parse: {line}\n{e}");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 20, "only {checked} commands found in the guide");
     }
 
     #[test]

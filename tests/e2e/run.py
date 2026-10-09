@@ -592,6 +592,11 @@ def test_mcp(lab):
     out = ctl.sh("meshvpn mcp", user="agent", input="\n".join(json.dumps(m) for m in msgs) + "\n")
     r = {m["id"]: m for m in map(json.loads, out.splitlines())}
     check(r[1]["result"]["serverInfo"]["name"] == "meshvpn", "initialize")
+    instr = r[1]["result"]["instructions"]
+    check("You are on node **ctl**" in instr and "tag:gpu" in instr, f"instructions with the live state: {instr[-600:]}")
+    guide = ctl.sh("meshvpn guide", user="agent")
+    check("# meshvpn for agents" in guide and "**ctl**" in guide and "1 online" in guide, guide[:500])
+    check(ctl.sh("meshvpn guide --skill", user="agent").startswith("---\nname: meshvpn\n"), "skill format")
     names = [t["name"] for t in r[2]["result"]["tools"]]
     check({"list_nodes", "exec", "launch", "gpu_reserve", "fetch", "doctor"} <= set(names), f"tools: {names}")
     check([n["name"] for n in json.loads(r[3]["result"]["content"][0]["text"])] == ["g1"], "list_nodes tag:gpu")

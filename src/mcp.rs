@@ -462,7 +462,7 @@ fn handle(dir: &Path, msg: &Value) -> Option<Value> {
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "meshvpn", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "meshvpn connects machines into a private mesh network. Use list_nodes to find machines and GPUs (select them with names, tag:<tag> or all), exec / copy_to_nodes / copy_from_nodes to work on them, network_matrix and training_env for distributed training, share/fetch to distribute datasets and checkpoints."
+                "instructions": crate::guide::mcp_instructions(dir)
             }))
         }
         "ping" => Ok(json!({})),
