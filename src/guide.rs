@@ -20,7 +20,7 @@ their GPUs and start distributed jobs - from the node you are on, over SSH login
   without a command. Use `exec`, `cp` and `jobs` instead.
 - Ask the human first before anything that changes the network or other people's access:
   `ban`, `forget`, `admin`, `invite`, `ssh allow/deny/default-user`, `rename`, `update`, `install`,
-  `uninstall`, `join`, `init`, `desktop stop`. Don't edit /etc/meshvpn by hand.
+  `uninstall`, `join`, `init`, `connect`, `desktop stop`. Don't edit /etc/meshvpn by hand.
 - Clean up what you start: release GPU reservations (`gpu release`), stop jobs you no longer need
   (`jobs stop`). Other people share these machines.
 - Commands that need root say so (exit 4). Don't retry them with sudo unless the human allows it.

@@ -1,4 +1,4 @@
-//! Local control socket used by `meshvpn status` / `meshvpn add-peer`.
+//! Local control socket used by `meshvpn status` / `meshvpn connect`.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

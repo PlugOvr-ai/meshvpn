@@ -2427,6 +2427,20 @@ impl Node {
                         if *ip == self.my_ip { " and this node" } else { "" }
                     ));
                 }
+                let alone = !self.cfg.bootstrap.is_empty()
+                    && st.links.is_empty()
+                    && st.rejected.is_none()
+                    && !st.records.keys().any(|id| self.is_online(&st, id));
+                if alone && self.started.elapsed() > Duration::from_secs(30) {
+                    let me = st
+                        .my_endpoints
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "<this node's address>".into());
+                    w.push(format!(
+                        "cannot reach any node of the network. If they can reach this node but not the other way                          round (this node is on the internet, they are behind a firewall), run on one of them:                          meshvpn connect {me}"
+                    ));
+                }
                 w
             },
             version: crate::update::CURRENT.into(),

@@ -512,6 +512,34 @@ def test_gpu_reservations(lab):
 
 
 @test
+def test_connect_outside(lab):
+    """A node on the internet joins a firewalled network: the network connects to it (meshvpn connect)."""
+    corp = lab.network("corp", internal=True)
+    pub = lab.network("pub")
+    hub = lab.node("hub", [corp, pub])  # inside, but may connect out
+    a = lab.node("a", [corp])
+    edge = lab.node("edge", [pub])
+    edge_ip = edge.net_ip(pub)
+    # The firewall: nothing from the internet gets into the hub, answers to its own connections do.
+    hub.sh(f"iptables -A INPUT -s {edge_ip} -m conntrack --ctstate NEW -j DROP")
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    a.mv(f"join {invite(hub)} --name a")
+    a.up()
+    wait(lambda: hub.online("a"), "a online")
+    edge.mv(f"join {invite(hub)} --name edge --endpoint {edge_ip}:7870")
+    edge.up()
+    wait(lambda: any("meshvpn connect" in w for w in edge.status().get("warnings", [])),
+         "edge says how to connect it", 60)
+    check(not hub.online("edge"), "edge should not get in by itself")
+    hub.mv(f"connect {edge_ip}")
+    wait(lambda: hub.online("edge") and edge.online("hub"), "edge admitted and linked", 60)
+    wait(lambda: a.online("edge") and edge.online("a"), "a and edge learn about each other", 60)
+    check(ping(a, "edge.mesh") and ping(edge, "a.mesh"), "a <-> edge through the hub")
+    check(not any("meshvpn connect" in w for w in edge.status().get("warnings", [])), "warning should be gone")
+
+
+@test
 def test_share_fetch(lab):
     """Peer-to-peer datasets: fetch from several holders, intact, resume, repair, members only."""
     net, (a, b, c) = mesh(lab, ["a", "b", "c"])

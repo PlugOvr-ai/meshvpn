@@ -99,8 +99,25 @@ Requirements: `ssh` must log in without a password as root, or pass `--ssh-ident
 `--ssh-port`, `--ssh-public-host` (if others reach the jump host by a different name), `--ssh-no-socks`.
 
 **The tunnel is already managed by someone else** (e.g. autossh): join with `--no-outbound --endpoint jump:7871`, then
-on any node in the network run `sudo meshvpn add-peer jump.example.com:7871`. The address is remembered, and gossip tells
+on any node in the network run `sudo meshvpn connect jump.example.com:7871`. The address is remembered, and gossip tells
 every other node about it.
+
+## A node on the internet, the others behind a firewall
+
+Joining works by the new node dialing the addresses in the invite. When the network sits behind a corporate firewall,
+a node on the internet can't reach those - but the network can reach it. Let the connection start from inside:
+
+```sh
+# on the public node
+sudo meshvpn join <invite> --name edge --endpoint 203.0.113.7:7870
+sudo meshvpn up
+# on any node of the network (port 7870 is the default)
+sudo meshvpn connect 203.0.113.7
+```
+
+The address is remembered, and every other node learns about the public node and reaches it directly or through the
+node that connected. Until then `meshvpn status` on the public node says that it can't reach the network and prints
+this command. Note that a node on the internet can reach every service the other nodes offer on the mesh.
 
 ## Devices without internet access
 
@@ -331,7 +348,7 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
 | `sudo meshvpn rename <name>` | Give this node a new name. It becomes `<name>.mesh` on every node within seconds; its IP, SSH permissions and links stay. Names already taken are refused |
-| `sudo meshvpn add-peer host:port` | Connect to a node at an address, e.g. an inbound-only node |
+| `sudo meshvpn connect host[:port]` | Connect the network to a node it can reach but that can't reach it (alias: `add-peer`) |
 
 ### Admins and invites
 
@@ -421,7 +438,7 @@ binaries for every architecture, `.deb`/`.rpm` packages and checksums, and attac
 
 The end-to-end behavior was tested with three rootless network namespaces: a public node, a NAT'd node without a
 listener, and a node whose firewall only allows SSH to a jump host. That covered direct links, relayed traffic, SSH
-tunnel restarts, hub restarts and `add-peer` for inbound-only nodes.
+tunnel restarts, hub restarts and `connect` for inbound-only nodes.
 
 ## License
 

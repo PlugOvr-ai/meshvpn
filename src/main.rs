@@ -212,8 +212,14 @@ enum Cmd {
         #[arg(long)]
         online: bool,
     },
-    /// Connect to a node at HOST:PORT (e.g. a firewalled node's reverse tunnel port).
-    AddPeer { addr: String },
+    /// Connect the network to a node at HOST[:PORT] that can't reach it by itself, e.g. a node on
+    /// the internet when the others are behind a firewall (run this on one of them), or a
+    /// firewalled node's reverse tunnel port. Remembered across restarts.
+    #[command(alias = "add-peer")]
+    Connect {
+        /// HOST or HOST:PORT (default port 7870).
+        addr: String,
+    },
     /// Remove offline nodes (e.g. old identities of re-installed machines) from the whole network.
     Forget {
         /// Name or id (prefix) of the node.
@@ -1231,10 +1237,8 @@ fn real_main(cli: Cli) -> Result<i32> {
                 print_status(&st);
             }
         }
-        Cmd::AddPeer { addr } => {
-            if !addr.contains(':') {
-                bail!("expected HOST:PORT, e.g. jump.example.com:{DEFAULT_PORT}");
-            }
+        Cmd::Connect { addr } => {
+            let addr = with_default_port(&addr);
             tokio::runtime::Runtime::new()?.block_on(control::request(
                 &dir,
                 &control::Request::AddPeer { addr: addr.clone() },
@@ -1682,8 +1686,8 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
         println!();
         println!("This node does not connect out. On any existing node run:");
         match cfg.static_endpoints().first() {
-            Some(e) => println!("  sudo meshvpn add-peer {e}"),
-            None => println!("  sudo meshvpn add-peer <public HOST:PORT that reaches this node>"),
+            Some(e) => println!("  sudo meshvpn connect {e}"),
+            None => println!("  sudo meshvpn connect <public HOST:PORT that reaches this node>"),
         }
     }
 }
@@ -2106,6 +2110,21 @@ fn local_ip() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("1.1.1.1:80").ok()?;
     Some(s.local_addr().ok()?.ip())
+}
+
+/// `host` -> `host:7870`; `host:port`, `[v6]:port` and `ip:port` stay as they are.
+fn with_default_port(addr: &str) -> String {
+    let has_port = match addr.rsplit_once(':') {
+        Some((host, port)) => port.parse::<u16>().is_ok() && (!host.contains(':') || host.ends_with(']')),
+        None => false,
+    };
+    if has_port {
+        addr.to_string()
+    } else if addr.contains(':') && !addr.starts_with('[') {
+        format!("[{addr}]:{DEFAULT_PORT}")
+    } else {
+        format!("{addr}:{DEFAULT_PORT}")
+    }
 }
 
 fn print_status(st: &node::Status) {
@@ -2633,6 +2652,16 @@ mod tests {
             words.push(cur);
         }
         words
+    }
+
+    #[test]
+    fn connect_adds_the_default_port() {
+        assert_eq!(with_default_port("edge.example.com"), "edge.example.com:7870");
+        assert_eq!(with_default_port("203.0.113.7"), "203.0.113.7:7870");
+        assert_eq!(with_default_port("203.0.113.7:443"), "203.0.113.7:443");
+        assert_eq!(with_default_port("2001:db8::1"), "[2001:db8::1]:7870");
+        assert_eq!(with_default_port("[2001:db8::1]:443"), "[2001:db8::1]:443");
+        assert!(Cli::try_parse_from(["meshvpn", "add-peer", "h:1"]).is_ok());
     }
 
     #[test]
