@@ -5,6 +5,9 @@
 
 use super::*;
 
+/// Reservations last at most this long without a renewal (30 days).
+const MAX_LEASE_MS: u64 = 30 * 24 * 3600 * 1000;
+
 impl Node {
     fn prune_leases(st: &mut State) -> bool {
         let before = st.leases.len();
@@ -71,7 +74,7 @@ impl Node {
             id: id.iter().map(|b| format!("{b:02x}")).collect(),
             gpus: picked,
             holder,
-            expires: now_ms() + ttl_ms,
+            expires: now_ms().saturating_add(ttl_ms.min(MAX_LEASE_MS)),
         };
         st.leases.push(lease.clone());
         self.announce(&mut st);
@@ -103,7 +106,7 @@ impl Node {
             .iter_mut()
             .find(|l| l.id == id)
             .ok_or_else(|| anyhow!("reservation {id} not found on {my_name} (expired?)"))?;
-        lease.expires = now_ms() + ttl_ms;
+        lease.expires = now_ms().saturating_add(ttl_ms.min(MAX_LEASE_MS));
         let lease = lease.clone();
         self.announce(&mut st);
         drop(st);

@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -401,16 +401,18 @@ pub async fn fetch(
         let mut todo = VecDeque::new();
         let mut reused = 0;
         for (fi, f) in man.files.iter().enumerate() {
-            let path = root.join(&f.path);
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
+            let path = inside(&root, &f.path)?;
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .mode(0o600)
                 .open(&path)?;
+            if !file.metadata()?.is_file() {
+                bail!("{} is not a regular file", path.display());
+            }
             let had = file.metadata()?.len();
             file.set_len(f.size)?;
             let mut buf = vec![0u8; man.chunk_size as usize];
@@ -484,6 +486,7 @@ pub async fn fetch(
                             let wrote = tokio::task::spawn_blocking(move || {
                                 std::fs::OpenOptions::new()
                                     .write(true)
+                                    .custom_flags(libc::O_NOFOLLOW)
                                     .open(path)?
                                     .write_all_at(&data, off)
                             })
@@ -519,7 +522,15 @@ pub async fn fetch(
     // Done: set modes and owner, and serve it from now on.
     for f in &manifest.files {
         let path = dest.join(&f.path);
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(f.mode));
+        // Never setuid/setgid/sticky or writable by others, whatever the sender says; through the
+        // file itself, so a symlink swapped in meanwhile isn't followed.
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(safe_mode(f.mode)));
+        }
         if let Some(uid) = owner {
             chown_tree(&dest, &path, uid);
         }
@@ -542,6 +553,23 @@ pub async fn fetch(
     Ok(r)
 }
 
+/// The file mode applied to fetched files: permission bits only, not writable by group/others.
+pub(crate) fn safe_mode(mode: u32) -> u32 {
+    mode & 0o755
+}
+
+/// `root/rel` with its parent directories created, refusing to leave `root` (a canonical path)
+/// through symlinks already in the tree.
+fn inside(root: &Path, rel: &str) -> Result<PathBuf> {
+    let path = root.join(rel);
+    let dir = path.parent().ok_or_else(|| anyhow!("bad path {rel}"))?;
+    std::fs::create_dir_all(dir)?;
+    if !dir.canonicalize()?.starts_with(root) {
+        bail!("{rel} leads outside {}", root.display());
+    }
+    Ok(path)
+}
+
 /// Gives `path` and its new parent directories below `dest` to `uid`.
 fn chown_tree(dest: &Path, path: &Path, uid: u32) {
     let gid = unsafe {
@@ -553,7 +581,28 @@ fn chown_tree(dest: &Path, path: &Path, uid: u32) {
         if !cur.starts_with(dest) {
             break;
         }
-        let _ = std::os::unix::fs::chown(cur, Some(uid), Some(gid));
+        let _ = std::os::unix::fs::lchown(cur, Some(uid), Some(gid));
         p = cur.parent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetched_files_stay_inside_and_tame() {
+        assert_eq!(safe_mode(0o4755), 0o755);
+        assert_eq!(safe_mode(0o2777), 0o755);
+        assert_eq!(safe_mode(0o644), 0o644);
+        let dir = std::env::temp_dir().join(format!("meshvpn-inside-{}", std::process::id()));
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert!(inside(&root, "a/b/c.txt").is_ok());
+        // A symlink planted in the destination doesn't lead out of it.
+        std::os::unix::fs::symlink(&dir, root.join("out")).unwrap();
+        assert!(inside(&root, "out/x.txt").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

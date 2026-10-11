@@ -39,6 +39,8 @@ const REANNOUNCE: Duration = Duration::from_secs(30);
 const ONLINE_WINDOW: Duration = Duration::from_secs(95);
 /// Links that are silent this long are dead (we ping every TICK).
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
+/// The most test data per peer one measurement sends (requests may come from any node or user).
+const MAX_MEASURE_BYTES: u64 = 256 << 20;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -166,11 +168,15 @@ struct State {
     bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
     /// `meshvpn ssh default-user` (overrides the derived default).
     login_user: Option<String>,
+    /// Mesh addresses claimed by more than one node (see rebuild).
+    ip_conflicts: Vec<(Ipv4Addr, Vec<NodeId>)>,
     /// Throughput tests over the data path being received: id -> (first, bytes, last).
     bench_ip_rx: HashMap<u64, (Instant, u64, Instant)>,
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
     bench_ip_done: HashMap<u64, (f32, Instant)>,
     measure_seen: HashSet<u64>,
+    /// A measurement of ours is running (one at a time, whoever asks).
+    measuring: bool,
     measured: u64,
     udp_paths: HashMap<NodeId, udp::UdpPath>,
     udp_probing: HashMap<NodeId, udp::Probing>,
@@ -542,6 +548,33 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     }
     std::fs::remove_file(crate::control::socket_path(&dir)).ok();
     Ok(())
+}
+
+/// Mesh addresses of `ids`, and the contested ones. Addresses are 22 bits of a hash of the node
+/// id: a member could grind an identity with someone else's address. A contested address belongs
+/// to nobody (no traffic is routed to it or accepted from it) until one of the claimants is banned
+/// or forgotten.
+#[allow(clippy::type_complexity)]
+fn assign_ips<'a>(
+    ids: impl Iterator<Item = &'a NodeId>,
+    my_ip: Ipv4Addr,
+) -> (HashMap<Ipv4Addr, NodeId>, Vec<(Ipv4Addr, Vec<NodeId>)>) {
+    let mut by_ip: HashMap<Ipv4Addr, Vec<NodeId>> = HashMap::new();
+    for id in ids {
+        by_ip.entry(overlay_ip(id)).or_default().push(*id);
+    }
+    let mut conflicts = vec![];
+    let mut ip_map = HashMap::new();
+    for (ip, mut owners) in by_ip {
+        if ip == my_ip || owners.len() > 1 {
+            owners.sort();
+            conflicts.push((ip, owners));
+        } else {
+            ip_map.insert(ip, owners[0]);
+        }
+    }
+    conflicts.sort();
+    (ip_map, conflicts)
 }
 
 impl Node {
@@ -1502,15 +1535,21 @@ impl Node {
 
     /// Rebuilds the IP map and the routing table.
     fn rebuild(&self, st: &mut State) {
-        let mut ids: Vec<&NodeId> = st.records.keys().collect();
-        ids.sort();
-        let mut ip_map = HashMap::new();
-        for id in ids {
-            let ip = overlay_ip(id);
-            if ip != self.my_ip {
-                ip_map.entry(ip).or_insert(*id);
+        let (ip_map, conflicts) = assign_ips(st.records.keys(), self.my_ip);
+        if conflicts != st.ip_conflicts {
+            for (ip, owners) in &conflicts {
+                let names: Vec<String> = owners
+                    .iter()
+                    .map(|id| format!("{} ({id})", st.records.get(id).map_or("?", |r| r.info.name.as_str())))
+                    .collect();
+                warn!(
+                    "address conflict: {ip} is claimed by {}{} - no traffic to or from it until one is banned or forgotten",
+                    names.join(", "),
+                    if *ip == self.my_ip { " and this node" } else { "" }
+                );
             }
         }
+        st.ip_conflicts = conflicts;
         st.ip_map = ip_map;
         st.id_prefix = st
             .records
@@ -1652,8 +1691,8 @@ impl Node {
         };
         let nonce: [u8; 24] = f[66..90].try_into().ok()?;
         let pkt = cipher.decrypt(&XNonce::from(nonce), &f[1 + DATA_HDR..]).ok()?;
-        // Anti-spoofing: the inner source address must belong to the sender.
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[12..16] != overlay_ip(&src).octets() {
+        // Anti-spoofing: the inner source address must belong to the sender (and only to it).
+        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[12..16] != overlay_ip(&src).octets() || !self.owns_ip(&src) {
             return None;
         }
         Some(pkt)
@@ -1674,6 +1713,12 @@ impl Node {
                 let _ = tx.send(crate::userspace::Cmd::Packet(pkt));
             }
         }
+    }
+
+    /// `id` is the only node with its mesh address (see rebuild).
+    pub(crate) fn owns_ip(&self, id: &NodeId) -> bool {
+        let st = self.state.lock().unwrap();
+        st.ip_map.get(&overlay_ip(id)) == Some(id)
     }
 
     pub fn my_ip(&self) -> Ipv4Addr {
@@ -2238,7 +2283,7 @@ impl Node {
         }
         let mut text = String::new();
         for (name, ip, key) in entries {
-            let Some(key) = key.filter(|k| k.starts_with("ssh-") && !k.contains('\n')) else {
+            let Some(key) = key.filter(|k| crate::proto::valid_host_key(k)) else {
                 continue;
             };
             // Plain names only where /etc/hosts maps them to the mesh (else they may be LAN hosts).
@@ -2369,7 +2414,21 @@ impl Node {
             } else {
                 self.socks.clone()
             },
-            warnings: range_conflicts(&self.cfg.interface),
+            warnings: {
+                let mut w = range_conflicts(&self.cfg.interface);
+                for (ip, owners) in &st.ip_conflicts {
+                    let names: Vec<String> = owners
+                        .iter()
+                        .map(|id| st.records.get(id).map_or_else(|| id.short(), |r| r.info.name.clone()))
+                        .collect();
+                    w.push(format!(
+                        "address conflict: {ip} is claimed by {}{} - unreachable until one is banned (meshvpn ban) or forgotten",
+                        names.join(" and "),
+                        if *ip == self.my_ip { " and this node" } else { "" }
+                    ));
+                }
+                w
+            },
             version: crate::update::CURRENT.into(),
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
@@ -2818,10 +2877,16 @@ impl Node {
             st.measure_seen.clear();
         }
         self.broadcast(&st, &frame(T_MEASURE, &serde_json::to_vec(&req).unwrap()), from);
-        drop(st);
-        if req.nodes.contains(&self.ident.id) {
+        if req.nodes.contains(&self.ident.id) && !st.measuring {
+            st.measuring = true;
             let others: Vec<NodeId> = req.nodes.iter().copied().filter(|n| *n != self.ident.id).collect();
-            tokio::spawn(self.clone().measure(Some(others), req.bytes.min(1 << 30)));
+            let node = self.clone();
+            tokio::spawn(async move {
+                node.clone()
+                    .measure(Some(others), req.bytes.min(MAX_MEASURE_BYTES))
+                    .await;
+                node.state.lock().unwrap().measuring = false;
+            });
         }
     }
 
@@ -3206,6 +3271,28 @@ fn primary_ip() -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contested_addresses_belong_to_nobody() {
+        // Grind ids until two share an address (22 bits: a few thousand tries).
+        let mut seen: HashMap<Ipv4Addr, NodeId> = HashMap::new();
+        let (a, b) = loop {
+            let id = crate::keys::Key32(crate::keys::random32());
+            if let Some(other) = seen.insert(overlay_ip(&id), id) {
+                break (other, id);
+            }
+        };
+        let c = crate::keys::Key32(crate::keys::random32());
+        let mine = crate::keys::Key32(crate::keys::random32());
+        let (map, conflicts) = assign_ips([a, b, c].iter(), overlay_ip(&mine));
+        assert_eq!(map.get(&overlay_ip(&c)), Some(&c));
+        assert!(!map.contains_key(&overlay_ip(&a)));
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, overlay_ip(&a));
+        // Someone claiming our own address gets nothing either.
+        let (map, conflicts) = assign_ips([c].iter(), overlay_ip(&c));
+        assert!(map.is_empty() && conflicts.len() == 1);
+    }
 
     #[test]
     fn derives_public_keys_but_never_prompts() {

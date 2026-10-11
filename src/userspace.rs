@@ -184,9 +184,19 @@ fn new_socket() -> tcp::Socket<'static> {
     s
 }
 
-/// Is a service listening on `port` here (on all addresses or loopback)? Otherwise the stack
-/// answers the SYN with a reset, so the other side sees "connection refused" right away.
+/// Is a service listening on `port` here (on all addresses or loopback)?
 pub fn listening_locally(port: u16) -> bool {
+    listening(port, true)
+}
+
+/// Is a service listening on `port` on all addresses? Only those are reachable from the mesh,
+/// as in kernel mode: a service bound to 127.0.0.1 (such as meshvpn's own SOCKS proxy) is
+/// meant to be local. Otherwise the stack answers the SYN with a reset ("connection refused").
+pub fn listening_on_all(port: u16) -> bool {
+    listening(port, false)
+}
+
+fn listening(port: u16, loopback_too: bool) -> bool {
     let want = format!(":{port:04X}");
     ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|f| {
         std::fs::read_to_string(f).unwrap_or_default().lines().skip(1).any(|l| {
@@ -197,10 +207,10 @@ pub fn listening_locally(port: u16) -> bool {
             let Some((addr, p)) = local.split_once(':') else {
                 return false;
             };
-            let any_or_loopback = addr.chars().all(|c| c == '0')
-                || addr.ends_with("7F") // 127.x.x.x (little endian)
+            let any = addr.chars().all(|c| c == '0');
+            let loopback = addr.ends_with("7F") // 127.x.x.x (little endian)
                 || addr == "00000000000000000000000001000000"; // ::1
-            *st == "0A" && format!(":{p}") == want && any_or_loopback
+            *st == "0A" && format!(":{p}") == want && (any || (loopback_too && loopback))
         })
     })
 }
@@ -253,7 +263,8 @@ impl Stack {
             Cmd::Packet(p) => {
                 if let Some(key @ (_, _, port)) = syn(&p)
                     && !self.seen_syns.contains_key(&key)
-                    && (listening_locally(port) || (port == 22 && self.node.ssh_builtin_userspace()))
+                    // SSH also when sshd only listens on loopback (it authenticates anyway).
+                    && (listening_on_all(port) || (port == 22 && (self.node.ssh_builtin_userspace() || listening_locally(22))))
                 {
                     // Accept on any port: open a listener just in time for this connection.
                     let mut s = new_socket();

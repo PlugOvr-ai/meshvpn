@@ -196,7 +196,7 @@ async fn handle(mut stream: TcpStream, target: &Target, token: &str) -> Result<(
             .map(|(_, v)| v.trim().to_string())
     };
     if !path.starts_with("/ws") {
-        let body = PAGE.replace("__TITLE__", &target.label());
+        let body = PAGE.replace("__TITLE__", &html_escape(&target.label()));
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
              Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
@@ -371,5 +371,22 @@ async fn ws_read(
                 }
             }
         }
+    }
+}
+
+/// Text for an HTML page.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn titles_are_escaped() {
+        assert_eq!(super::html_escape("a<script>&\"'"), "a&lt;script&gt;&amp;&quot;&#39;");
     }
 }

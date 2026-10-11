@@ -260,6 +260,24 @@ pub fn valid_user(u: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c))
 }
 
+/// A host key as published for known_hosts: `<type> <base64>` of a type sshd uses.
+pub fn valid_host_key(k: &str) -> bool {
+    let mut parts = k.split(' ');
+    let (Some(t), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    [
+        "ssh-ed25519",
+        "ssh-rsa",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+    ]
+    .contains(&t)
+        && (16..=4096).contains(&b.len())
+        && b.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+}
+
 pub fn valid_ssh_key(k: &str) -> bool {
     const TYPES: &[&str] = &[
         "ssh-ed25519",
@@ -367,6 +385,24 @@ impl SignedInfo {
                 .any(|o| !valid_object_id(&o.id) || !clean_text(&o.name))
         {
             bail!("invalid objects");
+        }
+        // Shown on terminals and compared as a version.
+        if info.version.len() > 32
+            || !info
+                .version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".+-".contains(c))
+        {
+            bail!("invalid version");
+        }
+        // Goes into ssh command lines as `user@host`: anything but a plain user name could be
+        // read as an option by ssh.
+        if info.login_user.as_ref().is_some_and(|u| !valid_user(u)) {
+            bail!("invalid login user");
+        }
+        // Written to the known hosts file.
+        if info.ssh_host_key.as_ref().is_some_and(|k| !valid_host_key(k)) {
+            bail!("invalid ssh host key");
         }
         // These end up in sshd's authorized keys: accept nothing but plain keys.
         if info.ssh_keys.len() > 64
@@ -522,6 +558,27 @@ mod tests {
             key: "ssh-rsa AAAA\nevil".into(),
         }];
         assert!(SignedInfo::sign(&i, &id).verify("n1").is_err());
+    }
+
+    #[test]
+    fn record_fields_are_validated() {
+        let id = ident();
+        let check = |f: &dyn Fn(&mut NodeInfo)| {
+            let mut i = info(&id, "alpha");
+            f(&mut i);
+            SignedInfo::sign(&i, &id).verify("n1").is_ok()
+        };
+        assert!(check(&|i| i.version = "0.13.4".into()));
+        assert!(!check(&|i| i.version = "1.0\u{1b}[2J".into()));
+        assert!(check(&|i| i.login_user = Some("ubuntu".into())));
+        assert!(!check(&|i| i.login_user = Some("-oProxyCommand=sh".into())));
+        assert!(!check(&|i| i.login_user = Some("a;b".into())));
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+        assert!(check(&|i| i.ssh_host_key = Some(key.into())));
+        assert!(!check(&|i| i.ssh_host_key = Some(format!("{key}\n* ssh-rsa AAAA"))));
+        assert!(!check(
+            &|i| i.ssh_host_key = Some("@cert-authority * ssh-ed25519 AAAA".into())
+        ));
     }
 
     #[test]

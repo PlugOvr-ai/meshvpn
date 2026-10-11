@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::warn;
 
@@ -149,7 +149,8 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
         tokio::spawn(async move {
             let (r, mut w) = stream.into_split();
             let mut line = String::new();
-            if BufReader::new(r).read_line(&mut line).await.is_err() {
+            // Any local user may connect: one request line, at most 1 MB.
+            if BufReader::new(r.take(1 << 20)).read_line(&mut line).await.is_err() {
                 return;
             }
             let resp = match serde_json::from_str::<Request>(&line) {

@@ -374,6 +374,14 @@ def test_userspace(lab):
     check(wait(lambda: "hello-box" in hub.sh("curl -s -m5 http://box.mesh:8080/", ok=False).stdout, "http into the box", 20), "")
     p = hub.sh("curl -s -m5 http://box.mesh:9999/", ok=False)
     check(p.returncode == 7, f"closed port should be refused (curl 7), got {p.returncode}")
+    # Services only for the box itself stay private, the SOCKS proxy included.
+    box.sh("(cd /srv && python3 -m http.server 8081 --bind 127.0.0.1 >/dev/null 2>&1 &)")
+    time.sleep(1)
+    check("hello-box" in box.sh("curl -s -m5 http://127.0.0.1:8081/"), "loopback service runs")
+    p = hub.sh("curl -s -m5 http://box.mesh:8081/", ok=False)
+    check(p.returncode != 0 and "hello-box" not in p.stdout, "a 127.0.0.1-only service must not be reachable")
+    p = hub.sh("curl -s -m5 -x socks5h://box.mesh:1055 http://hub.mesh:8000/", ok=False)
+    check("hello-hub" not in p.stdout, "the box's SOCKS proxy must not be reachable from the mesh")
     out = hub.sh("for i in $(seq 10); do curl -s -m8 http://box.mesh:8080/ & done; wait", ok=False).stdout
     check(out.count("hello-box") == 10, f"parallel requests in: {out.count('hello-box')}/10")
     out = box.sh("curl -s -m5 -x socks5h://127.0.0.1:1055 http://hub.mesh:8000/")
@@ -507,12 +515,15 @@ def test_gpu_reservations(lab):
 def test_share_fetch(lab):
     """Peer-to-peer datasets: fetch from several holders, intact, resume, repair, members only."""
     net, (a, b, c) = mesh(lab, ["a", "b", "c"])
-    a.sh("mkdir -p /data/ds/train && head -c 30000000 /dev/urandom > /data/ds/train/s0 && echo x > /data/ds/labels")
+    a.sh("mkdir -p /data/ds/train && head -c 30000000 /dev/urandom > /data/ds/train/s0 && echo x > /data/ds/labels"
+         " && cp /bin/true /data/ds/tool && chmod 4777 /data/ds/tool")
     want = sha(a, "/data/ds")
     oid = a.mvj("share /data/ds")["id"]
     wait(lambda: any(o["id"] == oid for o in b.mvj("objects")), "b sees the object", 30)
     r = b.mvj(f"fetch {oid} /srv")
     check(sha(b, "/srv/ds") == want, "fetch on b corrupted")
+    mode = b.sh("stat -c %a /srv/ds/tool").strip()
+    check(mode == "755", f"fetched files must not be setuid or writable by others: {mode}")
     wait(lambda: len([o for o in c.mvj("objects") if o["id"] == oid][0]["holders"]) == 2, "b serves it too", 30)
     r = c.mvj(f"fetch {oid} /srv")
     check(len(r["from"]) == 2, f"c should fetch from both holders: {r['from']}")

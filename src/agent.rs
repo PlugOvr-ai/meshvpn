@@ -294,7 +294,8 @@ impl Remote {
 
     /// `user@node.mesh`, or just `node.mesh` without a user (ssh's own config decides).
     fn destination(&self, node: &NodeView) -> String {
-        if self.user.is_empty() {
+        // Never let a user name turn into an ssh option (it may come from the network).
+        if self.user.is_empty() || !crate::proto::valid_user(&self.user) {
             format!("{}.mesh", node.name)
         } else {
             format!("{}@{}.mesh", self.user, node.name)
@@ -541,27 +542,36 @@ pub fn download(targets: &[NodeView], remote: &Remote, source: &str, dest: &str)
         let result = (|| -> Result<RunResult> {
             let mut child = fetch.spawn()?;
             let out = child.stdout.take().ok_or_else(|| anyhow!("no output"))?;
-            let tar = Command::new("tar")
-                .arg("-C")
-                .arg(&dir)
-                .arg("-xf")
-                .arg("-")
-                .stdin(out)
-                .stderr(Stdio::piped())
-                .spawn()?;
-            let mut remote_err = String::new();
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_string(&mut remote_err);
-            }
+            let err = child.stderr.take();
+            let remote_err = std::thread::spawn(move || {
+                let mut s = String::new();
+                if let Some(mut e) = err {
+                    let _ = e.by_ref().take(MAX_OUTPUT as u64).read_to_string(&mut s);
+                    let _ = std::io::copy(&mut e, &mut std::io::sink());
+                }
+                s
+            });
+            // Unpacked here rather than by the system tar: nothing outside `dir`, and no owners or
+            // setuid bits from the other node, also when this runs as root.
+            let mut archive = tar::Archive::new(out);
+            archive.set_preserve_permissions(false);
+            archive.set_preserve_ownerships(false);
+            archive.set_unpack_xattrs(false);
+            let unpacked = archive.unpack(&dir);
+            let mut out = archive.into_inner();
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
             let fetched = child.wait()?;
-            let unpacked = tar.wait_with_output()?;
-            let ok = fetched.success() && unpacked.status.success();
+            let remote_err = remote_err.join().unwrap_or_default();
+            let ok = fetched.success() && unpacked.is_ok();
             Ok(RunResult {
                 node: n.name.clone(),
                 ok,
                 exit_code: fetched.code(),
                 stdout: String::new(),
-                stderr: format!("{remote_err}{}", String::from_utf8_lossy(&unpacked.stderr)),
+                stderr: match unpacked {
+                    Ok(()) => remote_err,
+                    Err(e) => format!("{remote_err}unpacking: {e}"),
+                },
                 duration_ms: started.elapsed().as_millis() as u64,
             })
         })();

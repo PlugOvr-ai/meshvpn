@@ -490,8 +490,8 @@ impl Node {
         };
         let nonce: [u8; 24] = d[9..33].try_into().ok()?;
         let pkt = cipher.decrypt(&XNonce::from(nonce), &d[33..]).ok()?;
-        // Anti-spoofing: the inner source address must belong to the sender.
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[12..16] != overlay_ip(&src).octets() {
+        // Anti-spoofing: the inner source address must belong to the sender (and only to it).
+        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[12..16] != overlay_ip(&src).octets() || !self.owns_ip(&src) {
             return None;
         }
         // Authentic: the path is alive (and follows the peer if its NAT mapping changed).
