@@ -25,7 +25,28 @@ apk add --no-cache build-base meson ninja pkgconf xorgproto xtrans font-util-dev
     nettle-static libbsd-dev libbsd-static libmd xkeyboard-config font-dejavu curl xz tar >/dev/null
 
 mkdir -p /src && cd /src
-fetch() { [ -f "$(basename "$1")" ] || curl -fsSLO "$1"; tar xf "$(basename "$1")"; }
+# Sources from x.org, else Alpine's copy of them; either way they must match these checksums.
+SUMS="
+74d0e4dfa3d39ad8939e99bda37f5967aba528211076828464d2777d477fc0fb  libXau-$LIBXAU.tar.xz
+7b02c3d405236e0d86806b1de9d6868fe60c313628b38350b032914aa4fd14c6  libfontenc-$LIBFONTENC.tar.xz
+8b7b82fdeba48769b69433e8e3fbb984a5f6bf368b0d5f47abeec49de3e58efb  libXfont2-$LIBXFONT2.tar.xz
+a9b63eea997abb9ee6a8b4fbb515831c841f471af845a09de443b28003874bec  libxkbfile-$LIBXKBFILE.tar.xz
+0a288114e5f44e31987042c79aecff1ffad53a8154b8ec971c24a69a80f81f77  xkbcomp-$XKBCOMP.tar.xz
+ca6b38181685d7d7c935d0597cfe35ee8df4d0fbf8ac63301541e037e8b08f07  xorg-server-$XSERVER.tar.xz"
+fetch() {
+    f="$(basename "$1")"
+    if [ ! -f "$f" ]; then
+        for i in 1 2 3; do
+            for url in "$1" "https://distfiles.alpinelinux.org/distfiles/v3.22/$f"; do
+                curl -fsSL --retry 2 -o "$f.part" "$url" && mv "$f.part" "$f" && break 2
+                rm -f "$f.part"
+            done
+            sleep $((i * 10))
+        done
+    fi
+    echo "$SUMS" | grep " $f\$" | sha256sum -c - >/dev/null || { echo "checksum mismatch: $f" >&2; exit 1; }
+    tar xf "$f"
+}
 fetch "https://www.x.org/releases/individual/lib/libXau-$LIBXAU.tar.xz"
 fetch "https://www.x.org/releases/individual/lib/libfontenc-$LIBFONTENC.tar.xz"
 fetch "https://www.x.org/releases/individual/lib/libXfont2-$LIBXFONT2.tar.xz"
