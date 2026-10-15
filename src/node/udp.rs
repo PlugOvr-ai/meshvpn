@@ -491,7 +491,7 @@ impl Node {
         let nonce: [u8; 24] = d[9..33].try_into().ok()?;
         let pkt = cipher.decrypt(&XNonce::from(nonce), &d[33..]).ok()?;
         // Anti-spoofing: the inner source address must belong to the sender (and only to it).
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[12..16] != overlay_ip(&src).octets() || !self.owns_ip(&src) {
+        if !self.source_ok(&src, &pkt) {
             return None;
         }
         // Authentic: the path is alive (and follows the peer if its NAT mapping changed).
@@ -515,6 +515,7 @@ pub(super) async fn bind(cfg: &Config) -> Option<Arc<UdpSocket>> {
         Ok(s) => s,
         Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await.ok()?,
     };
+    super::exit::mark_socket(std::os::fd::AsRawFd::as_raw_fd(&sock));
     Some(Arc::new(sock))
 }
 
@@ -544,6 +545,7 @@ mod tests {
             leases: vec![],
             ssh_host_key: None,
             login_user: None,
+            exit: false,
         };
         let c: Vec<String> = Node::peer_candidates(&info).iter().map(|a| a.to_string()).collect();
         assert!(c.contains(&"192.168.10.3:7870".to_string()));

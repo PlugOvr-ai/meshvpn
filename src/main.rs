@@ -82,6 +82,12 @@ enum Cmd {
         #[arg(long, default_value = "24h")]
         expires: String,
     },
+    /// Exit nodes: send this machine's internet traffic through another node, or offer this
+    /// node's internet connection to the network.
+    Exit {
+        #[command(subcommand)]
+        cmd: ExitCmd,
+    },
     /// GPUs across the network: list them, reserve them for a job, release them.
     Gpu {
         #[command(subcommand)]
@@ -333,6 +339,24 @@ enum NetCmd {
         #[arg(long, default_value_t = 29500)]
         port: u16,
     },
+}
+
+#[derive(Subcommand)]
+enum ExitCmd {
+    /// Nodes that offer their internet connection, and which one this node uses.
+    List,
+    /// Offer this node's internet connection to the network (kernel mode). Others reach only
+    /// public internet addresses through it, not this node's LAN.
+    Offer {
+        /// Stop offering it.
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Send this machine's internet traffic through NODE (userspace mode: the SOCKS proxy's).
+    /// LANs and the mesh stay direct; SSH sessions from outside keep working.
+    Use { node: String },
+    /// Send internet traffic out directly again.
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -602,6 +626,56 @@ fn exit_code(msg: &str) -> i32 {
 }
 
 /// Prints a plain message, or `{"ok": true, "message": ...}` with --json.
+fn exit_cmd(dir: &Path, cmd: ExitCmd, json: bool) -> Result<i32> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let req = match cmd {
+        ExitCmd::List => {
+            let st = agent::status(dir)?;
+            let exits: Vec<&node::PeerStatus> = st.peers.iter().filter(|p| p.exit).collect();
+            if json {
+                let list: Vec<serde_json::Value> = exits
+                    .iter()
+                    .map(|p| serde_json::json!({"name": p.name, "online": p.online, "path": p.path}))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({"offering": st.exit_offer, "using": st.exit_via, "exits": list})
+                );
+                return Ok(0);
+            }
+            if st.exit_offer {
+                println!("This node offers its internet connection (exit node).");
+            }
+            match &st.exit_via {
+                Some(n) => println!("Internet traffic goes through {n}."),
+                None => println!("Internet traffic goes out directly."),
+            }
+            if exits.is_empty() {
+                println!("No other node offers its internet connection (meshvpn exit offer on that node).");
+            } else {
+                println!("\nExit nodes:");
+                for p in exits {
+                    println!(
+                        "  {:<20} {}",
+                        p.name,
+                        if p.online { p.path.as_str() } else { "offline" }
+                    );
+                }
+                println!("\nUse one: sudo meshvpn exit use <node>");
+            }
+            return Ok(0);
+        }
+        ExitCmd::Offer { stop } => control::Request::ExitOffer { on: !stop },
+        ExitCmd::Use { node } => control::Request::ExitUse { node: Some(node) },
+        ExitCmd::Off => control::Request::ExitUse { node: None },
+    };
+    require_owner()?;
+    if let control::Response::Message { text } = rt.block_on(control::request(dir, &req))? {
+        say(json, &text);
+    }
+    Ok(0)
+}
+
 fn say(json: bool, text: &str) {
     if json {
         println!("{}", serde_json::json!({ "ok": true, "message": text }));
@@ -671,6 +745,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             print_invite(&dir, &cfg, uses, parse_duration_ms(&expires)?, json)?;
         }
         Cmd::Gpu { cmd } => return gpu_cmd(&dir, cmd, json),
+        Cmd::Exit { cmd } => return exit_cmd(&dir, cmd, json),
         Cmd::Admin { cmd } => {
             let req = match cmd {
                 AdminCmd::Status => control::Request::AdminStatus,
@@ -2169,6 +2244,12 @@ fn print_status(st: &node::Status) {
     }
     if let Some(o) = &st.outbound_via {
         println!("  outgoing via: {o}");
+    }
+    if let Some(e) = &st.exit_via {
+        println!("  internet via: {e} (exit node; meshvpn exit off)");
+    }
+    if st.exit_offer {
+        println!("  exit node:    offers its internet connection to the network");
     }
     println!();
     if st.peers.is_empty() {

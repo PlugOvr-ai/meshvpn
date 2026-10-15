@@ -509,6 +509,9 @@ pub fn start(node_ip: Ipv4Addr, prefix: u8, mtu: usize) -> (StackTx, impl FnOnce
             iface.update_ip_addrs(|a| {
                 let _ = a.push(IpCidr::new(IpAddress::Ipv4(node_ip), prefix));
             });
+            // Everything outside the mesh goes to the node too, which sends it to an exit node
+            // if one is set (and drops it otherwise). No link layer: the gateway is nominal.
+            let _ = iface.routes_mut().add_default_ipv4_route(node_ip);
             let mut stack = Stack {
                 node,
                 my_ip: node_ip,
@@ -627,6 +630,26 @@ async fn socks_client(mut c: TcpStream, node: &Node, stack: &StackTx) -> Result<
                 client: c,
             });
             Ok(())
+        }
+        None if node.exit_active() => {
+            // Through the exit node: resolved here, connected from the mesh address.
+            let target = format!("{}:{port}", host.trim_end_matches('.'));
+            let dst = tokio::net::lookup_host(&target).await.ok().and_then(|mut a| {
+                a.find_map(|a| match a.ip() {
+                    std::net::IpAddr::V4(ip) => Some(ip),
+                    _ => None,
+                })
+            });
+            match dst {
+                Some(dst) => {
+                    let _ = stack.send(Cmd::Connect { dst, port, client: c });
+                    Ok(())
+                }
+                None => {
+                    socks_reply(c, false).await;
+                    Ok(())
+                }
+            }
         }
         None => {
             let target = format!("{}:{port}", host.trim_end_matches('.'));

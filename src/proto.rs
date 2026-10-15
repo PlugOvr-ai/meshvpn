@@ -158,6 +158,9 @@ pub struct NodeInfo {
     /// The account to log in as by default (`meshvpn ssh default-user`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_user: Option<String>,
+    /// Offers its internet connection to the mesh (an exit node).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit: bool,
 }
 
 /// GPUs of a node reserved for someone until `expires` (ms since epoch).
@@ -522,6 +525,7 @@ mod tests {
             leases: vec![],
             ssh_host_key: None,
             login_user: None,
+            exit: false,
             version: String::new(),
         }
     }

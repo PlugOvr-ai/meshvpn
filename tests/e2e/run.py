@@ -540,6 +540,93 @@ def test_connect_outside(lab):
 
 
 @test
+def test_exit_node(lab):
+    """Exit nodes: internet through another node (kernel and userspace clients), never into its LAN."""
+    net = lab.network("net", internal=True)  # the clients' network: no internet
+    inet = lab.network("inet", subnet="11.11.11.0/24")  # stands in for the internet
+    lan = lab.network("lan", internal=True)  # the exit's own LAN
+    gw = lab.node("gw", [net, inet, lan], sysctls=["net.ipv4.ip_forward=1"])
+    client = lab.node("client", [net])
+    box = lab.node("box", [net], caps=False)
+    web = lab.node("web", [inet], install=False)
+    printer = lab.node("printer", [lan], install=False)
+    for n in (web, printer):
+        n.sh(f"mkdir -p /srv && echo hello-{n.name} > /srv/index.html && "
+             "(cd /srv && python3 -m http.server 8000 >/tmp/http.log 2>&1 &)")
+    web_ip, printer_ip, gw_inet = web.net_ip(inet), printer.net_ip(lan), gw.net_ip(inet)
+    gw.mv(f"init --name gw --endpoint {gw.c}:7870")
+    gw.up()
+    for n in (client, box):
+        n.mv(f"join {invite(gw)} --name {n.name}")
+        n.up()
+        wait(lambda n=n: gw.online(n.name), f"{n.name} online")
+    get = lambda n, url, proxy="": n.sh(f"curl -s -m5 {proxy} {url}", ok=False).stdout  # noqa: E731
+    check("hello-web" not in get(client, f"http://{web_ip}:8000/"), "client should have no internet yet")
+    p = client.mv("exit use gw", ok=False)
+    check(p.returncode != 0 and "exit offer" in p.stdout + p.stderr, f"gw doesn't offer yet: {p.stdout}{p.stderr}")
+    gw.mv("exit offer")
+    wait(lambda: any(e["name"] == "gw" for e in client.mvj("exit list")["exits"]), "client sees the exit", 30)
+    client.mv("exit use gw")
+    check("gw" in (client.status().get("exit_via") or ""), "status shows the exit")
+    check("hello-web" in get(client, f"http://{web_ip}:8000/"), "internet through the exit")
+    check(gw_inet in web.sh("cat /tmp/http.log"), "the web server should see the exit's address")
+    check("hello-printer" not in get(client, f"http://{printer_ip}:8000/"), "the exit's LAN must stay closed")
+    check(ping(client, "gw.mesh") and ping(gw, "client.mesh"), "the mesh keeps working")
+    # userspace client: through the SOCKS proxy
+    box.mv("exit use gw")
+    check("hello-web" in get(box, f"http://{web_ip}:8000/", "-x socks5h://127.0.0.1:1055"), "SOCKS through the exit")
+    check("hello-printer" not in get(box, f"http://{printer_ip}:8000/", "-x socks5h://127.0.0.1:1055"),
+          "the exit's LAN must stay closed to SOCKS too")
+    # off again, and nothing left behind
+    client.mv("exit off")
+    check("hello-web" not in get(client, f"http://{web_ip}:8000/"), "exit off should end it")
+    check("7869" not in client.sh("ip rule"), "routing rules left behind")
+    client.mv("exit use gw")
+    client.stop()
+    check("7869" not in client.sh("ip rule") and "meshvpn-exit" not in client.sh("iptables-save"),
+          "stopping meshvpn should clean up")
+    gw.mv("exit offer --stop")
+    check("meshvpn-exit" not in gw.sh("iptables-save"), "exit rules left behind")
+
+
+@test
+def test_exit_routed(lab):
+    """An exit client whose links and incoming connections use its default route: they stay off the exit."""
+    wan1 = lab.network("wan1", internal=True, subnet="10.231.1.0/24")
+    wan2 = lab.network("wan2", internal=True, subnet="10.231.2.0/24")
+    inet = lab.network("inet", subnet="11.11.12.0/24")
+    rtr = lab.node("rtr", [wan1, wan2], install=False, sysctls=["net.ipv4.ip_forward=1"])
+    gw = lab.node("gw", [wan2, inet], sysctls=["net.ipv4.ip_forward=1"])
+    client = lab.node("client", [wan1])
+    outsider = lab.node("outsider", [wan2], install=False, net_admin=True)
+    web = lab.node("web", [inet], install=False)
+    web.sh("mkdir -p /srv && echo hello-web > /srv/index.html && (cd /srv && python3 -m http.server 8000 >/dev/null 2>&1 &)")
+    client.sh("mkdir -p /srv && echo hello-client > /srv/index.html && (cd /srv && python3 -m http.server 8080 >/dev/null 2>&1 &)")
+    # client -> rtr -> everything else: its only way out is the default route
+    client.sh(f"ip route replace default via {rtr.net_ip(wan1)}")
+    for n in (gw, outsider):
+        n.sh(f"ip route replace 10.231.1.0/24 via {rtr.net_ip(wan2)}")
+    gw.mv(f"init --name gw --endpoint {gw.net_ip(wan2)}:7870")
+    gw.up()
+    client.mv(f"join {invite(gw)} --name client")
+    client.up()
+    wait(lambda: gw.online("client"), "client online through the router")
+    gw.mv("exit offer")
+    wait(lambda: client.mvj("exit list")["exits"], "client sees the exit", 30)
+    client.mv("exit use gw")
+    web_url = f"http://{web.net_ip(inet)}:8000/"
+    check("hello-web" in client.sh(f"curl -s -m5 {web_url}", ok=False).stdout, "internet through the exit")
+    out = outsider.sh(f"curl -s -m5 http://{client.net_ip(wan1)}:8080/", ok=False).stdout
+    check("hello-client" in out, "connections from outside must still be answered")
+    # A fresh start dials the exit node's link with the exit route already in place.
+    client.stop()
+    client.up()
+    wait(lambda: gw.online("client") and client.online("gw"), "link comes back with the exit active", 60)
+    check("hello-web" in client.sh(f"curl -s -m5 {web_url}", ok=False).stdout, "internet through the exit after restart")
+    check(ping(client, "gw.mesh"), "mesh after restart")
+
+
+@test
 def test_share_fetch(lab):
     """Peer-to-peer datasets: fetch from several holders, intact, resume, repair, members only."""
     net, (a, b, c) = mesh(lab, ["a", "b", "c"])

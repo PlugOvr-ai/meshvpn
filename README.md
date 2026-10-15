@@ -119,6 +119,28 @@ The address is remembered, and every other node learns about the public node and
 node that connected. Until then `meshvpn status` on the public node says that it can't reach the network and prints
 this command. Note that a node on the internet can reach every service the other nodes offer on the mesh.
 
+## Internet through another node (exit nodes)
+
+One node offers its internet connection, others send their internet traffic through it - e.g. to
+appear with an office's address, or to give machines without internet access a way out:
+
+```sh
+sudo meshvpn exit offer          # on the node with the internet connection (kernel mode)
+sudo meshvpn exit use office     # on the nodes that should use it
+meshvpn exit list                # who offers it, which one is used
+sudo meshvpn exit off            # back to direct
+```
+
+* All internet traffic of the machine goes through the exit. LANs, Docker networks and the mesh stay
+  direct, and so do meshvpn's own connections and replies to connections from outside (an SSH
+  session from the internet keeps working).
+* In userspace mode, connections through the SOCKS proxy go through the exit.
+* The exit forwards only to public internet addresses - never into its own LAN or to cloud metadata
+  addresses. It needs `iptables`; in a container, start it with `--sysctl net.ipv4.ip_forward=1`.
+* DNS keeps using the machine's resolver, and IPv6 isn't carried (the mesh is IPv4).
+* While the exit node is offline there is no internet (status shows a warning), so nothing leaks
+  out directly. The setting survives restarts.
+
 ## Devices without internet access
 
 If a device can't reach the internet at all, but you can SSH into it from a jump host (e.g. through its existing reverse
@@ -348,6 +370,7 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
 | `sudo meshvpn rename <name>` | Give this node a new name. It becomes `<name>.mesh` on every node within seconds; its IP, SSH permissions and links stay. Names already taken are refused |
+| `sudo meshvpn exit offer` / `exit use <node>` / `exit off` | Internet through another node (exit nodes) |
 | `sudo meshvpn connect host[:port]` | Connect the network to a node it can reach but that can't reach it (alias: `add-peer`) |
 
 ### Admins and invites

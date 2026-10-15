@@ -252,6 +252,12 @@ pub struct Config {
     /// Unset: the --ssh-allow-all account if there is exactly one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_default_user: Option<String>,
+    /// Offer this node's internet connection to the mesh (`meshvpn exit offer`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_offer: bool,
+    /// Send internet traffic through this node (hex id; `meshvpn exit use`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node: Option<String>,
     /// Local accounts that every node of the network (any of its users) may log in as
     /// without a password - e.g. for cluster machines everybody works on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -285,6 +291,8 @@ impl Config {
             claim: None,
             ssh_allow_all: vec![],
             ssh_default_user: None,
+            exit_offer: false,
+            exit_node: None,
             socks_proxy: None,
             no_outbound: false,
             ssh_tunnel: None,

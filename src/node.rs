@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
@@ -22,6 +22,7 @@ use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
 
 mod admin;
+mod exit;
 mod gpu;
 mod udp;
 
@@ -168,6 +169,10 @@ struct State {
     bench_wait: HashMap<u64, tokio::sync::oneshot::Sender<f32>>,
     /// `meshvpn ssh default-user` (overrides the derived default).
     login_user: Option<String>,
+    /// We offer our internet connection to the mesh.
+    exit_offer: bool,
+    /// Our internet traffic goes through this node.
+    exit_via: Option<NodeId>,
     /// Mesh addresses claimed by more than one node (see rebuild).
     ip_conflicts: Vec<(Ipv4Addr, Vec<NodeId>)>,
     /// Throughput tests over the data path being received: id -> (first, bytes, last).
@@ -297,6 +302,12 @@ pub struct Status {
     /// Recently refused logins to the built-in SSH server (newest last).
     #[serde(default)]
     pub ssh_refused: Vec<String>,
+    /// This node offers its internet connection (exit node).
+    #[serde(default)]
+    pub exit_offer: bool,
+    /// Internet traffic goes through this node.
+    #[serde(default)]
+    pub exit_via: Option<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -327,6 +338,9 @@ pub struct PeerStatus {
     /// meshvpn version the node runs (from its record; empty for very old nodes).
     #[serde(default)]
     pub version: String,
+    /// Offers its internet connection (exit node).
+    #[serde(default)]
+    pub exit: bool,
     pub id: String,
     pub ip: Ipv4Addr,
     pub online: bool,
@@ -416,6 +430,8 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
         st.login_user = node.cfg.ssh_default_user.clone();
+        st.exit_offer = node.cfg.exit_offer;
+        st.exit_via = node.cfg.exit_node.as_deref().and_then(|h| NodeId::from_hex(h).ok());
         st.trusted_admins = node.cfg.trusted_admins.clone();
         st.leases = saved.leases.clone();
         st.my_claim = node.own_claim();
@@ -533,6 +549,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         });
     }
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
+    node.exit_start();
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -540,6 +557,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
         _ = term.recv() => {}
     }
     info!("shutting down");
+    node.exit_stop();
     node.save_state();
     if node.cfg.manage_hosts
         && let Err(e) = crate::hosts::write(None)
@@ -644,6 +662,7 @@ impl Node {
                 .clone()
                 .or_else(|| (st.ssh_allow_all.len() == 1).then(|| st.ssh_allow_all[0].clone())),
             measured: st.measured,
+            exit: st.exit_offer,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
             } else {
@@ -1633,7 +1652,7 @@ impl Node {
     fn outgoing(&self, dst_ip: Ipv4Addr, pkt: &[u8]) -> Option<Outgoing> {
         let direct = {
             let mut st = self.state.lock().unwrap();
-            let dst = *st.ip_map.get(&dst_ip)?;
+            let dst = st.ip_map.get(&dst_ip).copied().or_else(|| self.exit_for(&st, dst_ip))?;
             st.udp_paths
                 .get(&dst)
                 .is_some_and(|p| p.usable())
@@ -1647,7 +1666,7 @@ impl Node {
         }
         let (dst, tx, cipher) = {
             let mut st = self.state.lock().unwrap();
-            let dst = *st.ip_map.get(&dst_ip)?;
+            let dst = st.ip_map.get(&dst_ip).copied().or_else(|| self.exit_for(&st, dst_ip))?;
             let hop = st.routes.get(&dst).copied()?;
             let tx = st.links.get(&hop).map(|l| l.tx.clone())?;
             let cipher = self.cipher_for(&mut st, &dst)?;
@@ -1692,7 +1711,7 @@ impl Node {
         let nonce: [u8; 24] = f[66..90].try_into().ok()?;
         let pkt = cipher.decrypt(&XNonce::from(nonce), &f[1 + DATA_HDR..]).ok()?;
         // Anti-spoofing: the inner source address must belong to the sender (and only to it).
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[12..16] != overlay_ip(&src).octets() || !self.owns_ip(&src) {
+        if !self.source_ok(&src, &pkt) {
             return None;
         }
         Some(pkt)
@@ -1703,6 +1722,11 @@ impl Node {
         // Throughput tests end here instead of in the kernel.
         if pkt.len() >= 20 + 21 && pkt[9] == BENCH_PROTO && pkt[20..24] == *BENCH_MAGIC {
             self.handle_ip_bench(&pkt);
+            return;
+        }
+        // Only for us - or for the internet if we are an exit. Never into the LANs behind us
+        // (the kernel would forward them wherever IP forwarding is on).
+        if !self.may_deliver(&pkt) {
             return;
         }
         match &self.io {
@@ -1805,7 +1829,21 @@ impl Node {
                     if targets.is_empty() {
                         bail!("{addr} only resolves to mesh addresses");
                     }
-                    Ok(TcpStream::connect(&targets[..]).await?)
+                    // Marked: links stay off an exit node's default route.
+                    let mut last = None;
+                    for a in targets {
+                        let s = if a.is_ipv4() {
+                            TcpSocket::new_v4()?
+                        } else {
+                            TcpSocket::new_v6()?
+                        };
+                        exit::mark_socket(std::os::fd::AsRawFd::as_raw_fd(&s));
+                        match s.connect(a).await {
+                            Ok(s) => return Ok(s),
+                            Err(e) => last = Some(e),
+                        }
+                    }
+                    Err(last.map_or_else(|| anyhow!("no address"), anyhow::Error::from))
                 }
             }
         };
@@ -2377,6 +2415,7 @@ impl Node {
                     name: r.info.name.clone(),
                     login_user: r.info.login_user.clone(),
                     version: r.info.version.clone(),
+                    exit: r.info.exit,
                     id: id.hex(),
                     ip: overlay_ip(&id),
                     online: self.is_online(&st, &id),
@@ -2438,11 +2477,16 @@ impl Node {
                         .cloned()
                         .unwrap_or_else(|| "<this node's address>".into());
                     w.push(format!(
-                        "cannot reach any node of the network. If they can reach this node but not the other way                          round (this node is on the internet, they are behind a firewall), run on one of them:                          meshvpn connect {me}"
+                        "cannot reach any node of the network. If they can reach this node but not the other way \
+                         round (this node is on the internet, they are behind a firewall), run on one of them: \
+                         meshvpn connect {me}"
                     ));
                 }
+                w.extend(self.exit_status(&st).1);
                 w
             },
+            exit_offer: st.exit_offer,
+            exit_via: self.exit_status(&st).0,
             version: crate::update::CURRENT.into(),
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
@@ -3277,6 +3321,7 @@ fn derive_public_key(private: &str) -> Option<String> {
 /// The address of the interface used for the default route (no packets are sent).
 fn primary_ip() -> Option<IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    exit::mark_socket(std::os::fd::AsRawFd::as_raw_fd(&s)); // not the exit node's route
     s.connect("1.1.1.1:80").ok()?;
     let ip = s.local_addr().ok()?.ip();
     (!ip.is_loopback() && !ip.is_unspecified() && !is_overlay(ip)).then_some(ip)

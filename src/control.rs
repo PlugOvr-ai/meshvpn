@@ -47,6 +47,14 @@ pub enum Request {
     Rename {
         name: String,
     },
+    /// `meshvpn exit offer [--stop]`.
+    ExitOffer {
+        on: bool,
+    },
+    /// `meshvpn exit use <node>` / `meshvpn exit off` (None).
+    ExitUse {
+        node: Option<String>,
+    },
     /// `meshvpn ssh default-user`: None clears it.
     LoginUser {
         user: Option<String>,
@@ -287,6 +295,18 @@ pub async fn serve(node: Arc<Node>, path: PathBuf) {
                     Ok((ticket, admins)) => Response::Message {
                         text: serde_json::json!({ "ticket": ticket, "admins": admins }).to_string(),
                     },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::ExitOffer { on }) => match node.set_exit_offer(on) {
+                    Ok(text) => Response::Message { text },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+                Ok(Request::ExitUse { node: via }) => match node.set_exit_via(via) {
+                    Ok(text) => Response::Message { text },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },
