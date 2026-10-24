@@ -466,7 +466,7 @@ fn start_xvfb(bundle: &Bundle, xauth: &Path) -> Result<(std::process::Child, u32
                 return Err(std::io::Error::last_os_error());
             }
             // Ends with the session, however that ends.
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            crate::sys::die_with_parent();
             Ok(())
         });
     }

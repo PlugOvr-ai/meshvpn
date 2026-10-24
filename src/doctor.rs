@@ -54,18 +54,7 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 fn daemons() -> Vec<(i32, String)> {
     let mut out = vec![];
     let my_net = std::fs::read_link("/proc/self/ns/net").ok();
-    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|p| p.parse::<i32>().ok()) else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        let args: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
+    for (pid, args) in crate::sys::processes() {
         let is = args
             .first()
             .is_some_and(|a| Path::new(a).file_name().is_some_and(|n| n == "meshvpn"));

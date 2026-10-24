@@ -499,8 +499,8 @@ impl Invite {
 }
 
 pub fn default_node_name() -> String {
-    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_else(|_| "node".into());
-    sanitize_name(&raw)
+    let raw = crate::sys::hostname();
+    sanitize_name(if raw.is_empty() { "node" } else { &raw })
 }
 
 /// Names end up in DNS-like host names, so keep them to `[a-z0-9-]`.

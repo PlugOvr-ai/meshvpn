@@ -19,6 +19,7 @@ mod share;
 mod ssh;
 mod sshd;
 mod sshserver;
+mod sys;
 mod tui;
 mod update;
 mod userspace;
@@ -2374,6 +2375,9 @@ fn install(dir: &Path) -> Result<()> {
         PathBuf::from(BIN_PATH)
     };
     let dir = std::path::absolute(dir)?;
+    if cfg!(target_os = "macos") {
+        return install_launchd(&dir, &bin);
+    }
     if !systemd_running() {
         for (pid, cmd) in stop_other_daemons() {
             println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
@@ -2410,6 +2414,65 @@ fn install(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+const LAUNCHD_LABEL: &str = "ai.plugovr.meshvpn";
+const LAUNCHD_PLIST: &str = "/Library/LaunchDaemons/ai.plugovr.meshvpn.plist";
+
+fn launchctl(args: &[&str]) -> Result<std::process::Output> {
+    let out = std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("running launchctl")?;
+    if !out.status.success() {
+        bail!(
+            "launchctl {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out)
+}
+
+/// macOS: a launch daemon that starts at boot and is restarted when it stops.
+fn install_launchd(dir: &Path, bin: &Path) -> Result<()> {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>--dir</string><string>{}</string><string>up</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>3</integer>
+  <key>StandardOutPath</key><string>/var/log/meshvpn.log</string>
+  <key>StandardErrorPath</key><string>/var/log/meshvpn.log</string>
+</dict>
+</plist>
+"#,
+        esc(&bin.display().to_string()),
+        esc(&dir.display().to_string())
+    );
+    let target = format!("system/{LAUNCHD_LABEL}");
+    let _ = launchctl(&["bootout", &target]);
+    for (pid, cmd) in stop_other_daemons() {
+        println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
+    }
+    std::fs::write(LAUNCHD_PLIST, plist)?;
+    launchctl(&["bootstrap", "system", LAUNCHD_PLIST])?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let running = launchctl(&["print", &target])
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("state = running"))
+        .unwrap_or(false);
+    if !running {
+        bail!("the meshvpn service did not start - see: tail /var/log/meshvpn.log");
+    }
+    println!("meshvpn is running and will start at boot.");
+    println!("  status: meshvpn status   logs: tail -f /var/log/meshvpn.log");
+    Ok(())
+}
+
 /// `meshvpn [options] up`, started from any path.
 fn is_daemon_cmdline(args: &[String]) -> bool {
     let is_meshvpn = args
@@ -2422,37 +2485,20 @@ fn is_daemon_cmdline(args: &[String]) -> bool {
 fn stop_other_daemons() -> Vec<(i32, String)> {
     let me = std::process::id() as i32;
     let mut stopped = vec![];
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return stopped;
-    };
-    for e in entries.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|p| p.parse::<i32>().ok()) else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue;
-        };
-        let args: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        if !is_daemon_cmdline(&args) {
+    for (pid, args) in sys::processes() {
+        if pid == me || !is_daemon_cmdline(&args) {
             continue;
         }
         if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
             continue; // another user's (rootless) meshvpn
         }
         for _ in 0..50 {
-            if !Path::new(&format!("/proc/{pid}")).exists() {
+            if !sys::alive(pid) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        if Path::new(&format!("/proc/{pid}")).exists() {
+        if sys::alive(pid) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
@@ -2466,7 +2512,10 @@ fn uninstall(dir: &Path) -> Result<()> {
         return uninstall_user(dir);
     }
     require_root()?;
-    if systemd_running() {
+    if cfg!(target_os = "macos") {
+        let _ = launchctl(&["bootout", &format!("system/{LAUNCHD_LABEL}")]);
+        std::fs::remove_file(LAUNCHD_PLIST).ok();
+    } else if systemd_running() {
         let _ = systemctl(&["disable", "--now", "meshvpn"]);
     } else {
         remove_cron_entry();

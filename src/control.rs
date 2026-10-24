@@ -127,7 +127,11 @@ pub enum Response {
 /// checked per request with the caller's credentials.
 pub fn socket_path(dir: &Path) -> PathBuf {
     if dir == Path::new("/etc/meshvpn") {
-        PathBuf::from("/run/meshvpn.sock")
+        PathBuf::from(if cfg!(target_os = "linux") {
+            "/run/meshvpn.sock"
+        } else {
+            "/var/run/meshvpn.sock"
+        })
     } else {
         let path = dir.join("meshvpn.sock");
         // Unix socket paths are limited to ~108 bytes; a deep directory gets one in /tmp.
