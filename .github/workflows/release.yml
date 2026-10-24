@@ -81,7 +81,7 @@ jobs:
       - name: Set version from tag
         run: |
           version="${TAG#v}"
-          sed -i '' "1,/^version = .*/s//version = \"$version\"/" Cargo.toml
+          sed -i '' "1,/^version = /s/^version = .*/version = \"$version\"/" Cargo.toml
           grep -m1 '^version' Cargo.toml
       - name: Build
         run: |
