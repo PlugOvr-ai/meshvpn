@@ -5,6 +5,7 @@
 #   tests\windows\smoke.ps1 target\release\meshvpn.exe
 param([Parameter(Mandatory = $true)][string]$Binary)
 $ErrorActionPreference = "Stop"
+# Variable names are case-insensitive in PowerShell: $B is the binary, nothing else.
 $B = (Resolve-Path $Binary).Path
 $DB = Join-Path $env:TEMP "meshvpn-b"
 
@@ -30,7 +31,7 @@ function Json { (& $B --json @args | Out-String) | ConvertFrom-Json }
 
 Remove-Item -Recurse -Force C:\ProgramData\meshvpn, $DB -ErrorAction SilentlyContinue
 Mesh init --name wina --endpoint 127.0.0.1:7870
-$a = Start-Process $B -ArgumentList "up" -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\a.log" -RedirectStandardError "$env:TEMP\a.err"
+$procA = Start-Process $B -ArgumentList "up" -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\a.log" -RedirectStandardError "$env:TEMP\a.err"
 WaitFor "wina running" { & $B status *> $null; $LASTEXITCODE -eq 0 }
 $invite = (Json invite).invite
 Mesh --dir $DB join $invite --name winb --listen 0.0.0.0:47871 --userspace
@@ -38,7 +39,7 @@ Mesh --dir $DB join $invite --name winb --listen 0.0.0.0:47871 --userspace
 $cfg = Join-Path $DB "config.toml"
 $lines = Get-Content $cfg | Where-Object { $_ -notmatch "^manage_hosts" }
 Set-Content $cfg (@("manage_hosts = false") + $lines)
-$b = Start-Process $B -ArgumentList "--dir", "`"$DB`"", "up" -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\b.log" -RedirectStandardError "$env:TEMP\b.err"
+$procB = Start-Process $B -ArgumentList "--dir", "`"$DB`"", "up" -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\b.log" -RedirectStandardError "$env:TEMP\b.err"
 function Online { @((Json status).peers | Where-Object { $_.name -eq "winb" -and $_.online }).Count -gt 0 }
 WaitFor "winb online" { Online }
 
@@ -68,7 +69,7 @@ Mesh status
 Mesh --json nodes | Out-Null
 
 # The task: replaces the hand-started daemon
-Stop-Process -Id $a.Id -Force
+Stop-Process -Id $procA.Id -Force
 Start-Sleep 2
 Mesh install
 WaitFor "wina back as a task" { Online }
@@ -78,5 +79,5 @@ Mesh uninstall
 schtasks /Query /TN meshvpn 2>$null | Out-Null
 if ($LASTEXITCODE -eq 0) { Fail "task still there after uninstall" }
 
-Stop-Process -Id $b.Id, $http.Id -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $procB.Id, $http.Id -Force -ErrorAction SilentlyContinue
 Write-Host "Windows smoke test passed"

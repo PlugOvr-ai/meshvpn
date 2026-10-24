@@ -60,6 +60,13 @@ if [ -n "$ROOTLESS" ]; then
     MESH_DIR="${MESHVPN_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/meshvpn}"
     DIR_ARGS="--dir $MESH_DIR"
     case "$MESH_DIR" in *" "*) die "MESHVPN_DIR must not contain spaces" ;; esac
+elif [ "$OS" = Darwin ]; then
+    # /usr/local/bin often belongs to the user (Homebrew), and sshd only runs a meshvpn nobody
+    # else can change: a root-owned directory, linked into the PATH.
+    BIN_DIR="${MESHVPN_BIN_DIR:-/opt/meshvpn/bin}"
+    MESH_DIR="/etc/meshvpn"
+    DIR_ARGS=""
+    [ "$(id -u)" -eq 0 ] || SUDO="sudo"
 else
     BIN_DIR="${MESHVPN_BIN_DIR:-/usr/local/bin}"
     MESH_DIR="/etc/meshvpn"
@@ -156,6 +163,9 @@ fi
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 $SUDO mkdir -p "$BIN_DIR"
 $SUDO install -m 0755 "$TMP/meshvpn" "$BIN_DIR/meshvpn"
+if [ "$OS" = Darwin ] && [ "$BIN_DIR" != /usr/local/bin ]; then
+    $SUDO mkdir -p /usr/local/bin && $SUDO ln -sf "$BIN_DIR/meshvpn" /usr/local/bin/meshvpn
+fi
 if [ -n "$PROXY" ]; then
     # meshvpn reads this when the variables are missing (systemd service, sudo).
     printf 'https_proxy=%s\nhttp_proxy=%s\nno_proxy=%s\n' "$PROXY" "$PROXY" "$NOPROXY" \
