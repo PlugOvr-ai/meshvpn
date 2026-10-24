@@ -63,7 +63,7 @@ ping -c 2 -t 10 macb.mesh >/dev/null || fail "names: macb.mesh"
 # from macb through the mesh, with the key macb publishes and maca's rule.
 if sudo systemsetup -setremotelogin on >/dev/null 2>&1 || sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; then
     [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
-    sudo "$B" ssh allow "$(id -un)@macb"
+    sudo "$B" ssh allow "$(id -un)@macb" --as "$(id -un)"
     sudo "$B" --dir "$DB" install >/dev/null 2>&1 || true  # (no-op for a --dir node; re-announces keys on restart)
     who="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
         -o "ProxyCommand=sudo $B --dir $DB nc %h %p" "$(id -un)@maca.mesh" whoami 2>&1 || true)"

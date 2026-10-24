@@ -22,15 +22,15 @@ function WaitFor($what, [scriptblock]$check) {
     }
     Fail "timed out: $what"
 }
-function Mv { & $B @args; if ($LASTEXITCODE -ne 0) { Fail "meshvpn $args (exit $LASTEXITCODE)" } }
+function Mesh { & $B @args; if ($LASTEXITCODE -ne 0) { Fail "meshvpn $args (exit $LASTEXITCODE)" } }
 function Json { (& $B --json @args | Out-String) | ConvertFrom-Json }
 
 Remove-Item -Recurse -Force C:\ProgramData\meshvpn, $DB -ErrorAction SilentlyContinue
-Mv init --name wina --endpoint 127.0.0.1:7870
+Mesh init --name wina --endpoint 127.0.0.1:7870
 $a = Start-Process $B -ArgumentList "up" -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\a.log" -RedirectStandardError "$env:TEMP\a.err"
 WaitFor "wina running" { & $B status *> $null; $LASTEXITCODE -eq 0 }
 $invite = (Json invite).invite
-Mv --dir $DB join $invite --name winb --listen 0.0.0.0:47871 --userspace
+Mesh --dir $DB join $invite --name winb --listen 0.0.0.0:47871 --userspace
 # One hosts block on this machine is enough.
 $cfg = Join-Path $DB "config.toml"
 $lines = Get-Content $cfg | Where-Object { $_ -notmatch "^manage_hosts" }
@@ -59,18 +59,18 @@ WaitFor "TCP out of the mesh into Wintun" { (curl.exe -fsS -m 5 -x socks5h://127
 ping -n 2 -w 5000 winb.mesh | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "names: winb.mesh" }
 
-Mv status
+Mesh status
 & $B doctor
-Mv --json nodes | Out-Null
+Mesh --json nodes | Out-Null
 
 # The task: replaces the hand-started daemon
 Stop-Process -Id $a.Id -Force
 Start-Sleep 2
-Mv install
+Mesh install
 WaitFor "wina back as a task" { ((Json status).peers | Where-Object { $_.name -eq "winb" -and $_.online }) -ne $null }
 schtasks /Query /TN meshvpn | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "no scheduled task" }
-Mv uninstall
+Mesh uninstall
 schtasks /Query /TN meshvpn 2>$null | Out-Null
 if ($LASTEXITCODE -eq 0) { Fail "task still there after uninstall" }
 
