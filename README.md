@@ -33,6 +33,30 @@ To install and join a network in one step (this also starts the service):
 curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
 ```
 
+**macOS** (Apple Silicon and Intel): the same command. meshvpn runs as a launch daemon and creates a `utunN`
+interface.
+
+**Windows 10/11** (x86_64): in an administrator PowerShell:
+
+```powershell
+irm https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.ps1 | iex
+```
+
+It installs to `C:\Program Files\meshvpn` with the [Wintun](https://www.wintun.net) driver, keeps its configuration
+in `C:\ProgramData\meshvpn` and runs as a task that starts at boot. Run meshvpn's commands without `sudo`, in an
+administrator terminal for the ones that change something.
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Mesh, names (`<node>.mesh`), status, `connect` | ✓ | ✓ | ✓ |
+| `ssh` to nodes, `exec`, `cp`, `launch`, GPUs, `share` / `fetch` | ✓ | ✓ | ✓ |
+| Browser desktop of other nodes (`meshvpn desktop <node>`) | ✓ | ✓ | ✓ |
+| Service at boot | systemd | launchd | Task Scheduler |
+| Userspace mode (no network interface) | ✓ | ✓ | ✓ |
+| Logins *into* this machine (sshd integration, built-in SSH server) | ✓ | sshd | – |
+| Desktop sessions *on* this machine | ✓ | – | – |
+| Exit nodes, terminal console, rootless install | ✓ | – | – |
+
 **Behind a proxy**, the installer uses it automatically. `sudo` drops your environment, so besides `https_proxy` /
 `http_proxy` it also checks `/etc/environment`, `/etc/profile.d`, apt's and dnf/yum's proxy settings and the GNOME proxy
 setting of the user who ran `sudo`. The proxy is saved in `/etc/meshvpn/proxy.env` (root-only), so the service's

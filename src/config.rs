@@ -13,7 +13,10 @@ pub const DEFAULT_SOCKS_PORT: u16 = 1081;
 const INVITE_PREFIX: &str = "mesh1-";
 
 /// Where a root install keeps its config (and finds its socket in /run).
+#[cfg(unix)]
 pub const SYSTEM_DIR: &str = "/etc/meshvpn";
+#[cfg(windows)]
+pub const SYSTEM_DIR: &str = r"C:\ProgramData\meshvpn";
 
 /// The config directory of a rootless install: `$XDG_CONFIG_HOME/meshvpn` or `~/.config/meshvpn`.
 pub fn user_dir() -> Option<PathBuf> {
@@ -52,6 +55,13 @@ pub fn rootless() -> bool {
 
 /// Adapts a command suggestion to the install: no sudo and user services when rootless.
 pub fn hint(text: &str) -> String {
+    // Windows: an administrator terminal instead of sudo.
+    if cfg!(windows) {
+        return text
+            .replace("try again with sudo", "run it in an administrator terminal")
+            .replace("with sudo", "in an administrator terminal")
+            .replace("sudo meshvpn", "meshvpn");
+    }
     if !rootless() {
         return text.to_string();
     }

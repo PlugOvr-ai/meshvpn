@@ -123,7 +123,11 @@ pub async fn download_binary(client: &reqwest::Client, tag: &str, target: &str) 
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&data[..]));
     for entry in tar.entries()? {
         let mut entry = entry?;
-        if entry.path()?.file_name().is_some_and(|n| n == "meshvpn") {
+        if entry
+            .path()?
+            .file_name()
+            .is_some_and(|n| n == "meshvpn" || n == "meshvpn.exe")
+        {
             let mut buf = vec![];
             entry.read_to_end(&mut buf)?;
             binary = Some(buf);
@@ -138,7 +142,11 @@ pub async fn download_binary(client: &reqwest::Client, tag: &str, target: &str) 
 pub async fn install(client: &reqwest::Client, tag: &str) -> Result<PathBuf> {
     let binary = download_binary(client, tag, TARGET).await?;
     let exe = current_exe()?;
-    let tmp = exe.with_file_name(".meshvpn.update");
+    let tmp = exe.with_file_name(if cfg!(windows) {
+        ".meshvpn.update.exe"
+    } else {
+        ".meshvpn.update"
+    });
     std::fs::write(&tmp, &binary).with_context(|| format!("writing {} (try again with sudo)", tmp.display()))?;
     crate::sys::set_mode(&tmp, 0o755)?;
     let want = tag.trim_start_matches('v');
@@ -149,6 +157,13 @@ pub async fn install(client: &reqwest::Client, tag: &str) -> Result<PathBuf> {
             let _ = std::fs::remove_file(&tmp);
             bail!("the downloaded binary does not run on this machine - not installing");
         }
+    }
+    // Windows can't replace a running .exe, but can rename it out of the way.
+    #[cfg(windows)]
+    {
+        let old = exe.with_extension("old.exe");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&exe, &old).with_context(|| format!("moving {} aside", exe.display()))?;
     }
     std::fs::rename(&tmp, &exe).with_context(|| format!("replacing {}", exe.display()))?;
     Ok(exe)

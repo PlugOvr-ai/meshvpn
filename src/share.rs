@@ -429,6 +429,8 @@ pub async fn fetch(
     owner: Option<u32>,
     holders: Vec<Holder>,
 ) -> Result<FetchReport> {
+    #[cfg(windows)]
+    let _ = owner; // files belong to whoever runs the fetch
     if holders.is_empty() {
         bail!("object {id} not found on any online node (see meshvpn objects)");
     }
@@ -662,8 +664,11 @@ mod tests {
         let root = root.canonicalize().unwrap();
         assert!(inside(&root, "a/b/c.txt").is_ok());
         // A symlink planted in the destination doesn't lead out of it.
-        std::os::unix::fs::symlink(&dir, root.join("out")).unwrap();
-        assert!(inside(&root, "out/x.txt").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, root.join("out")).unwrap();
+            assert!(inside(&root, "out/x.txt").is_err());
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

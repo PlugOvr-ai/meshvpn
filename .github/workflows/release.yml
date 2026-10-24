@@ -102,6 +102,45 @@ jobs:
           name: dist-macos
           path: dist/*
 
+  windows:
+    name: build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Set version from tag
+        shell: pwsh
+        run: |
+          $v = "$env:TAG".TrimStart("v")
+          $c = Get-Content Cargo.toml -Raw
+          $c = ([regex]'(?m)^version = ".*"').Replace($c, "version = `"$v`"", 1)
+          Set-Content Cargo.toml $c -NoNewline
+          Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1
+      - run: cargo build --release
+      - name: Wintun (the network driver; checksum of the official 0.14.1 release)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          if ((Get-FileHash wintun.zip).Hash -ne "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51") { throw "wintun checksum mismatch" }
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll target\release\
+      - name: Smoke test (two nodes, Wintun, scheduled task)
+        shell: pwsh
+        run: tests\windows\smoke.ps1 target\release\meshvpn.exe
+      - name: Package (zip for people, tar.gz for meshvpn update)
+        shell: pwsh
+        run: |
+          $t = "x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force dist, staging | Out-Null
+          Copy-Item target\release\meshvpn.exe, target\release\wintun.dll, README.md, LICENSE staging\
+          Copy-Item wintun\wintun\LICENSE.txt staging\wintun-LICENSE.txt
+          Compress-Archive staging\* dist\meshvpn-$t.zip
+          tar -czf dist\meshvpn-$t.tar.gz -C staging .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows
+          path: dist/*
+
   desktop:
     # The desktop bundle (static Xvfb etc., see desktop/build-bundle.sh), natively per arch.
     name: desktop bundle ${{ matrix.arch }}
@@ -125,7 +164,7 @@ jobs:
 
   release:
     # Published only when every end-to-end test passed.
-    needs: [build, macos, desktop, e2e]
+    needs: [build, macos, windows, desktop, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -138,9 +177,9 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          cp ../install.sh ../deploy.sh .
-          for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
-          sha256sum -- meshvpn-* *.deb *.rpm install.sh deploy.sh | grep -v '\.sha256$' > SHA256SUMS
+          cp ../install.sh ../install.ps1 ../deploy.sh .
+          for f in *.tar.gz *.zip; do sha256sum "$f" > "$f.sha256"; done
+          sha256sum -- meshvpn-* *.deb *.rpm install.sh install.ps1 deploy.sh | grep -v '\.sha256$' > SHA256SUMS
           ls -l
 
       - name: Release notes
@@ -166,6 +205,12 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo sh
           \`\`\`
 
+          **Windows 10/11** (x86_64), in an administrator PowerShell:
+
+          \`\`\`powershell
+          irm https://github.com/${{ github.repository }}/releases/download/${TAG}/install.ps1 | iex
+          \`\`\`
+
           **A device without internet access** that you can SSH into from a jump host. Run this on the jump host; nothing is installed there:
 
           \`\`\`sh
@@ -183,6 +228,7 @@ jobs:
           | \`armv7-unknown-linux-musleabihf\` / \`armhf\` | Raspberry Pi 2/3/4 (32 bit), routers, SBCs |
           | \`arm-unknown-linux-musleabihf\` | Raspberry Pi Zero / 1 |
           | \`aarch64-apple-darwin\` / \`x86_64-apple-darwin\` | Macs (Apple Silicon / Intel) |
+          | \`x86_64-pc-windows-msvc\` (.zip) | Windows 10/11 PCs (with wintun.dll) |
 
           Then: \`sudo meshvpn init\` to create a network, or \`sudo meshvpn join <invite>\` to join one.
           NOTES

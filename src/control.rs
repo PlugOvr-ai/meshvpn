@@ -191,26 +191,34 @@ async fn serve_pipe(node: Arc<Node>, path: PathBuf) {
     let name = path.to_string_lossy().into_owned();
     // SYSTEM and administrators: everything; authenticated users: read and write.
     let sddl: Vec<u16> = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)\0".encode_utf16().collect();
-    let mut sd = std::ptr::null_mut();
-    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut()) }
-        == 0
-    {
-        warn!("control pipe {name}: {}", std::io::Error::last_os_error());
-        return;
-    }
-    let mut first = true;
-    loop {
+    // Lives as long as the daemon (never freed); kept as a number so the future stays Send.
+    let sd = {
+        let mut sd = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            warn!("control pipe {name}: {}", std::io::Error::last_os_error());
+            return;
+        }
+        sd as usize
+    };
+    let create = |first: bool| {
         let mut sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd,
+            lpSecurityDescriptor: sd as *mut _,
             bInheritHandle: 0,
         };
         // The first instance must be ours: nobody else may squat the name.
-        let server = match unsafe {
+        unsafe {
             ServerOptions::new()
                 .first_pipe_instance(first)
                 .create_with_security_attributes_raw(&name, &mut sa as *mut _ as *mut _)
-        } {
+        }
+    };
+    let mut first = true;
+    loop {
+        let server = match create(first) {
             Ok(s) => s,
             Err(e) => {
                 warn!("control pipe {name}: {e}");

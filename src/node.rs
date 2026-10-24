@@ -3110,8 +3110,20 @@ pub fn check_name_free<'a>(name: &str, mut others: impl Iterator<Item = &'a Stri
 fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr) -> std::result::Result<tun::AsyncDevice, String> {
     let mut tcfg = tun::Configuration::default();
     tcfg.address(my_ip).netmask(OVERLAY_NETMASK).mtu(cfg.mtu).up();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     tcfg.tun_name(&cfg.interface);
+    // Wintun's driver comes as wintun.dll next to meshvpn.exe.
+    #[cfg(windows)]
+    {
+        let dll = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("wintun.dll")))
+            .filter(|d| d.exists())
+            .ok_or_else(|| "wintun.dll is missing - it belongs next to meshvpn.exe (reinstall meshvpn)".to_string())?;
+        tcfg.platform_config(|p| {
+            p.wintun_file(dll.as_os_str());
+        });
+    }
     #[cfg(target_os = "macos")]
     tcfg.destination(my_ip).platform_config(|p| {
         p.enable_routing(false);
@@ -3179,7 +3191,7 @@ const SSH_CLIENT_DROPIN: &str = "/etc/ssh/ssh_config.d/meshvpn.conf";
 
 /// Where the host keys of the mesh nodes are kept for ssh clients.
 fn known_hosts_path(dir: &std::path::Path) -> PathBuf {
-    if crate::config::rootless() {
+    if crate::config::rootless() || cfg!(windows) {
         dir.join("known_hosts")
     } else {
         PathBuf::from("/var/lib/meshvpn/known_hosts")
@@ -3189,6 +3201,14 @@ fn known_hosts_path(dir: &std::path::Path) -> PathBuf {
 /// An ssh client drop-in: mesh host keys are known (no "are you sure" prompts), and in
 /// userspace mode `ssh user@host.mesh` goes through meshvpn.
 fn ssh_client_config(userspace: bool) {
+    #[cfg(windows)]
+    windows_ssh_config(true, userspace);
+    #[cfg(unix)]
+    unix_ssh_client_config(userspace);
+}
+
+#[cfg(unix)]
+fn unix_ssh_client_config(userspace: bool) {
     if !std::path::Path::new("/etc/ssh/ssh_config.d").is_dir() {
         return;
     }
@@ -3212,7 +3232,45 @@ fn ssh_client_config(userspace: bool) {
 }
 
 /// `meshvpn uninstall`: remove the ssh client drop-in again.
+/// Windows' OpenSSH has no drop-in directory: a marked block in its global ssh_config.
+#[cfg(windows)]
+fn windows_ssh_config(enable: bool, userspace: bool) {
+    const FILE: &str = r"C:\ProgramData\ssh\ssh_config";
+    const BEGIN: &str = "# >>> meshvpn: host keys of the mesh nodes are known";
+    const END: &str = "# <<< meshvpn";
+    let slashes = |p: PathBuf| format!("\"{}\"", p.to_string_lossy().replace('\\', "/"));
+    let known = slashes(known_hosts_path(std::path::Path::new(crate::config::SYSTEM_DIR)));
+    let mut block = format!("{BEGIN}\nHost *.mesh\n    GlobalKnownHostsFile {known}\n");
+    if userspace && let Ok(exe) = crate::update::current_exe() {
+        block.push_str(&format!("    ProxyCommand {} nc %h %p\n", slashes(exe)));
+    }
+    block.push_str(&format!("{END}\n"));
+    let old = std::fs::read_to_string(FILE).unwrap_or_default();
+    let new = replace_block(&old, BEGIN, END, if enable { &block } else { "" });
+    if new != old {
+        let _ = std::fs::create_dir_all(r"C:\ProgramData\ssh");
+        if let Err(e) = std::fs::write(FILE, new) {
+            debug!("writing {FILE}: {e}");
+        }
+    }
+}
+
+/// `old` with the block from `begin` to `end` replaced by `block` (appended if missing).
+fn replace_block(old: &str, begin: &str, end: &str, block: &str) -> String {
+    match (old.find(begin), old.find(end)) {
+        (Some(b), Some(e)) if e > b => {
+            let stop = old[e..].find('\n').map_or(old.len(), |n| e + n + 1);
+            format!("{}{block}{}", &old[..b], &old[stop..])
+        }
+        _ if block.is_empty() => old.to_string(),
+        _ if old.is_empty() || old.ends_with('\n') => format!("{old}{block}"),
+        _ => format!("{old}\n{block}"),
+    }
+}
+
 pub fn remove_ssh_client_config() {
+    #[cfg(windows)]
+    windows_ssh_config(false, false);
     if std::fs::read_to_string(SSH_CLIENT_DROPIN).is_ok_and(|t| t.contains("Managed by meshvpn")) {
         let _ = std::fs::remove_file(SSH_CLIENT_DROPIN);
     }
@@ -3237,16 +3295,7 @@ pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
         crate::agent::sh_quote(&known_hosts_path(&dir).to_string_lossy())
     );
     let old = std::fs::read_to_string(&file).unwrap_or_default();
-    let block = if enable { block } else { String::new() };
-    let new = match (old.find(BEGIN), old.find(END)) {
-        (Some(b), Some(e)) if e > b => {
-            let end = old[e..].find('\n').map_or(old.len(), |n| e + n + 1);
-            format!("{}{block}{}", &old[..b], &old[end..])
-        }
-        _ if !enable => old.clone(),
-        _ if old.is_empty() || old.ends_with('\n') => format!("{old}{block}"),
-        _ => format!("{old}\n{block}"),
-    };
+    let new = replace_block(&old, BEGIN, END, if enable { &block } else { "" });
     if new == old {
         return;
     }
