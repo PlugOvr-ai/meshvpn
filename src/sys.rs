@@ -377,3 +377,51 @@ pub fn detach(cmd: &mut std::process::Command) {
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 }
+
+/// People's accounts on this machine (and root): (name, home directory).
+#[cfg(target_os = "linux")]
+pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    passwd
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split(':').collect();
+            let uid: u32 = f.get(2)?.parse().ok()?;
+            let home = f.get(5)?;
+            ((uid == 0 || uid >= 1000) && uid < 65534).then(|| (f[0].to_string(), home.into()))
+        })
+        .collect()
+}
+
+/// macOS keeps accounts in Directory Services, not /etc/passwd; people's homes are in /Users
+/// (uids from 501).
+#[cfg(target_os = "macos")]
+pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = vec![("root".to_string(), std::path::PathBuf::from("/var/root"))];
+    for e in std::fs::read_dir("/Users").into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Ok(cname) = std::ffi::CString::new(name.clone()) else {
+            continue;
+        };
+        let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+        if pw.is_null() || unsafe { (*pw).pw_uid } < 500 {
+            continue;
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_string_lossy().into_owned();
+        out.push((name, home.into()));
+    }
+    out
+}
+
+/// Windows: the profiles in C:\\Users (names in lower case, as on the other systems).
+#[cfg(windows)]
+pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
+    let base = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()) + "\\Users";
+    std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join(".ssh").is_dir())
+        .map(|e| (e.file_name().to_string_lossy().to_lowercase(), e.path()))
+        .collect()
+}
