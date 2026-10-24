@@ -407,7 +407,9 @@ pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
         if pw.is_null() || unsafe { (*pw).pw_uid } < 500 {
             continue;
         }
-        let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_string_lossy().into_owned();
+        let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }
+            .to_string_lossy()
+            .into_owned();
         out.push((name, home.into()));
     }
     out
