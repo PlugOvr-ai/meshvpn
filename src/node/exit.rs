@@ -18,8 +18,17 @@ const COMMENT: &str = "meshvpn-exit";
 
 /// Puts meshvpn's own traffic on the normal routing table, around an exit node's default route.
 /// Needs CAP_NET_ADMIN; without it there is no exit routing either.
+#[cfg(unix)]
+pub(crate) fn mark<S: std::os::fd::AsRawFd>(socket: &S) {
+    mark_socket(socket.as_raw_fd());
+}
+
+#[cfg(windows)]
+pub(crate) fn mark<S>(_socket: &S) {}
+
+#[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-pub(crate) fn mark_socket(fd: std::os::fd::RawFd) {
+fn mark_socket(fd: std::os::fd::RawFd) {
     #[cfg(target_os = "linux")]
     unsafe {
         let mark = FWMARK;

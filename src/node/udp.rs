@@ -515,7 +515,7 @@ pub(super) async fn bind(cfg: &Config) -> Option<Arc<UdpSocket>> {
         Ok(s) => s,
         Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await.ok()?,
     };
-    super::exit::mark_socket(std::os::fd::AsRawFd::as_raw_fd(&sock));
+    super::exit::mark(&sock);
     Some(Arc::new(sock))
 }
 

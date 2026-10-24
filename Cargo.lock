@@ -1716,6 +1716,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1964,6 +1974,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "flate2",
+ "if-addrs",
  "jpeg-encoder",
  "libc",
  "png",
@@ -1985,6 +1996,7 @@ dependencies = [
  "tracing-subscriber",
  "tun",
  "vt100",
+ "windows-sys 0.61.2",
  "x11rb",
  "x25519-dalek",
 ]

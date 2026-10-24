@@ -15,7 +15,7 @@ static SSH_PIDS: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
 pub fn kill_all() {
     for pid in SSH_PIDS.lock().unwrap().take().unwrap_or_default() {
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        crate::sys::terminate(pid as i32);
     }
 }
 
@@ -72,6 +72,7 @@ pub async fn supervise(label: String, args: Vec<String>) {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Take ssh down with us, even if we are killed hard.
+        #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
                 crate::sys::die_with_parent();

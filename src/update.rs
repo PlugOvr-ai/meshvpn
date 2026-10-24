@@ -3,7 +3,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -141,7 +140,7 @@ pub async fn install(client: &reqwest::Client, tag: &str) -> Result<PathBuf> {
     let exe = current_exe()?;
     let tmp = exe.with_file_name(".meshvpn.update");
     std::fs::write(&tmp, &binary).with_context(|| format!("writing {} (try again with sudo)", tmp.display()))?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    crate::sys::set_mode(&tmp, 0o755)?;
     let want = tag.trim_start_matches('v');
     let out = std::process::Command::new(&tmp).arg("--version").output();
     match out {

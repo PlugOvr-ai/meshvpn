@@ -1,4 +1,6 @@
 #!/bin/bash
+# The logs belong to the runner user, the daemons run as root.
+# shellcheck disable=SC2024
 # meshvpn on macOS (CI: a GitHub macOS runner, with sudo). Two nodes on this machine: "maca" in
 # kernel mode (a utun interface) and "macb" in userspace mode. Traffic in both directions goes
 # through the utun, so this checks the macOS network interface, routes, /etc/hosts and launchd.
@@ -25,7 +27,7 @@ sudo "$B" init --name maca --endpoint 127.0.0.1:7870
 (sudo "$B" up > /tmp/a.log 2>&1 &)
 wait_for "maca running" sudo "$B" status
 INVITE="$(sudo "$B" --json invite | python3 -c 'import json,sys; print(json.load(sys.stdin)["invite"])')"
-sudo "$B" --dir "$DB" join "$INVITE" --name macb --listen 0.0.0.0:7871 --userspace
+sudo "$B" --dir "$DB" join "$INVITE" --name macb --listen 0.0.0.0:47871 --userspace
 # One /etc/hosts block on this machine is enough.
 sudo python3 - "$DB/config.toml" <<'PY'
 import sys

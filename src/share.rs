@@ -14,7 +14,63 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
+/// Opening a symlink fails instead of following it.
+#[cfg(unix)]
+const NOFOLLOW: i32 = libc::O_NOFOLLOW;
+/// Windows: opens a symlink or junction itself, not its target (FILE_FLAG_OPEN_REPARSE_POINT).
+#[cfg(windows)]
+const NOFOLLOW: u32 = 0x0020_0000;
+
+/// Reads and writes at an offset, as `std::os::unix::fs::FileExt` does.
+#[cfg(windows)]
+trait FileExt {
+    fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()>;
+    fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()>;
+}
+
+#[cfg(windows)]
+impl FileExt for std::fs::File {
+    fn read_exact_at(&self, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+        use std::os::windows::fs::FileExt as _;
+        while !buf.is_empty() {
+            match self.seek_read(buf, off)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                n => {
+                    buf = &mut buf[n..];
+                    off += n as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_all_at(&self, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+        use std::os::windows::fs::FileExt as _;
+        while !buf.is_empty() {
+            let n = self.seek_write(buf, off)?;
+            buf = &buf[n..];
+            off += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// Permission bits for the manifest (Windows has none: read-only or not).
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        meta.permissions().mode() & 0o777
+    }
+    #[cfg(windows)]
+    {
+        if meta.permissions().readonly() { 0o444 } else { 0o644 }
+    }
+}
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -196,7 +252,7 @@ pub fn build(path: &Path, name: Option<String>) -> Result<Stored> {
             files.push(FileEntry {
                 path: rel,
                 size: meta.len(),
-                mode: meta.permissions().mode() & 0o777,
+                mode: file_mode(&meta),
                 chunks: hash_file(&p, meta.len())?,
             });
         }
@@ -402,14 +458,14 @@ pub async fn fetch(
         let mut reused = 0;
         for (fi, f) in man.files.iter().enumerate() {
             let path = inside(&root, &f.path)?;
-            let file = std::fs::OpenOptions::new()
+            let mut opts = std::fs::OpenOptions::new();
+            let file = opts
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(0o600)
-                .open(&path)?;
+                .custom_flags(NOFOLLOW);
+            let file = crate::sys::private(file).open(&path)?;
             if !file.metadata()?.is_file() {
                 bail!("{} is not a regular file", path.display());
             }
@@ -486,7 +542,7 @@ pub async fn fetch(
                             let wrote = tokio::task::spawn_blocking(move || {
                                 std::fs::OpenOptions::new()
                                     .write(true)
-                                    .custom_flags(libc::O_NOFOLLOW)
+                                    .custom_flags(NOFOLLOW)
                                     .open(path)?
                                     .write_all_at(&data, off)
                             })
@@ -526,11 +582,15 @@ pub async fn fetch(
         // file itself, so a symlink swapped in meanwhile isn't followed.
         if let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(NOFOLLOW)
             .open(&path)
         {
+            #[cfg(unix)]
             let _ = file.set_permissions(std::fs::Permissions::from_mode(safe_mode(f.mode)));
+            #[cfg(windows)]
+            let _ = file;
         }
+        #[cfg(unix)]
         if let Some(uid) = owner {
             chown_tree(&dest, &path, uid);
         }
@@ -571,6 +631,7 @@ fn inside(root: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 /// Gives `path` and its new parent directories below `dest` to `uid`.
+#[cfg(unix)]
 fn chown_tree(dest: &Path, path: &Path, uid: u32) {
     let gid = unsafe {
         let pw = libc::getpwuid(uid);

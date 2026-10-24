@@ -36,7 +36,7 @@ fn user_base() -> Option<PathBuf> {
 
 /// Where `setup` installs: the machine-wide place as root, else the user's.
 fn install_base() -> Result<PathBuf> {
-    if unsafe { libc::geteuid() } == 0 && !crate::config::rootless() {
+    if crate::sys::is_root() && !crate::config::rootless() {
         Ok(PathBuf::from(SYSTEM))
     } else {
         user_base().ok_or_else(|| anyhow!("HOME is not set"))
@@ -56,7 +56,7 @@ pub fn find() -> Option<Bundle> {
 /// `meshvpn desktop setup --xfce`: Xfce from the system's package manager - a real desktop
 /// (panel with the applications menu, file manager, terminal) instead of the built-in one.
 pub fn install_xfce() -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !crate::sys::is_root() {
         bail!("installing Xfce needs root (the system's package manager) - try again with sudo, or ask an admin");
     }
     let has = |c: &str| {

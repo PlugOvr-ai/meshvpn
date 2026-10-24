@@ -3,7 +3,6 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::keys::{b64, random32, unb64};
@@ -29,7 +28,7 @@ pub fn user_dir() -> Option<PathBuf> {
 /// use their own rootless install if they have one, else the machine's system install (so
 /// `meshvpn status` works without sudo), and set up a new rootless install if neither exists.
 pub fn default_dir() -> PathBuf {
-    if unsafe { libc::geteuid() } == 0 {
+    if crate::sys::is_root() {
         return PathBuf::from(SYSTEM_DIR);
     }
     match user_dir() {
@@ -42,7 +41,7 @@ static ROOTLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 /// Decided once at startup: a non-root user working with a directory other than the system one.
 pub fn set_rootless(dir: &Path) {
-    let rootless = unsafe { libc::geteuid() } != 0 && dir != Path::new(SYSTEM_DIR);
+    let rootless = !crate::sys::is_root() && dir != Path::new(SYSTEM_DIR);
     ROOTLESS.store(rootless, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -392,11 +391,7 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut f = crate::sys::private(std::fs::OpenOptions::new().write(true).create(true).truncate(true))
         .open(&tmp)
         .map_err(|e| permission_hint(e, &tmp))?;
     f.write_all(data)?;
@@ -407,7 +402,7 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 
 pub fn create_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| permission_hint(e, dir))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok();
+    crate::sys::set_mode(dir, 0o700).ok();
     Ok(())
 }
 

@@ -65,22 +65,7 @@ fn now_ms() -> u64 {
 /// tailscale0, which silently breaks all incoming mesh traffic.
 pub fn range_conflicts(own_iface: &str) -> Vec<String> {
     let mut out = vec![];
-    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
-        return out;
-    }
-    let mut cur = addrs;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_addr.is_null() || unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET {
-            continue;
-        }
-        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
+    for (name, ip, _) in crate::sys::ipv4_interfaces() {
         if name == own_iface || !is_overlay(IpAddr::V4(ip)) {
             continue;
         }
@@ -94,7 +79,6 @@ pub fn range_conflicts(own_iface: &str) -> Vec<String> {
             "interface {name} ({ip}) uses the same address range as meshvpn (100.64.0.0/10){hint}"
         ));
     }
-    unsafe { libc::freeifaddrs(addrs) };
     out
 }
 
@@ -551,10 +535,23 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
     node.exit_start();
 
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut close = tokio::signal::windows::ctrl_close()?;
+        let mut shutdown = tokio::signal::windows::ctrl_shutdown()?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = close.recv() => {}
+            _ = shutdown.recv() => {}
+        }
     }
     info!("shutting down");
     node.exit_stop();
@@ -1837,7 +1834,7 @@ impl Node {
                         } else {
                             TcpSocket::new_v6()?
                         };
-                        exit::mark_socket(std::os::fd::AsRawFd::as_raw_fd(&s));
+                        exit::mark(&s);
                         match s.connect(a).await {
                             Ok(s) => return Ok(s),
                             Err(e) => last = Some(e),
@@ -2337,13 +2334,12 @@ impl Node {
         }
         let path = known_hosts_path(&self.dir);
         let write = || -> std::io::Result<()> {
-            use std::os::unix::fs::PermissionsExt;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, &text)?;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+            crate::sys::set_mode(&tmp, 0o644)?;
             std::fs::rename(&tmp, &path)
         };
         match write() {
@@ -2581,13 +2577,25 @@ impl Node {
 
     /// Replaces this process with the (new) binary, keeping pid and arguments.
     fn restart(&self, exe: PathBuf) {
-        use std::os::unix::process::CommandExt;
         self.save_state();
         crate::ssh::kill_all();
         std::fs::remove_file(crate::control::socket_path(&self.dir)).ok();
-        let err = std::process::Command::new(&exe)
+        #[cfg(unix)]
+        let err = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .exec()
+        };
+        // Windows: no exec - start the new binary and make room for it.
+        #[cfg(windows)]
+        let err = match std::process::Command::new(&exe)
             .args(std::env::args_os().skip(1))
-            .exec();
+            .spawn()
+        {
+            Ok(_) => std::process::exit(0),
+            Err(e) => e,
+        };
         // exec only returns on failure; let the service manager restart us.
         warn!("restarting {}: {err}", exe.display());
         std::process::exit(1);
@@ -3140,8 +3148,7 @@ fn permission_problem(msg: &str) -> bool {
 fn tun_unavailable(msg: &str) -> bool {
     let missing = msg.contains("No such file") || msg.contains("No such device") || msg.contains("os error 2");
     // Not root on a normal machine is a mistake (sudo forgotten), not a reason to switch modes.
-    let root_or_container =
-        unsafe { libc::geteuid() } == 0 || crate::userspace::in_container() || crate::config::rootless();
+    let root_or_container = crate::sys::is_root() || crate::userspace::in_container() || crate::config::rootless();
     missing || (permission_problem(msg) && root_or_container)
 }
 
@@ -3214,7 +3221,6 @@ pub fn remove_ssh_client_config() {
 /// Rootless: the same for this user, as a marked block in ~/.ssh/config (system files are off
 /// limits). Kept up to date when the binary or directory moves.
 pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
-    use std::os::unix::fs::PermissionsExt;
     const BEGIN: &str = "# >>> meshvpn (rootless userspace mode): ssh to *.mesh goes through meshvpn";
     const END: &str = "# <<< meshvpn";
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
@@ -3245,10 +3251,10 @@ pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
         return;
     }
     let _ = std::fs::create_dir_all(&ssh_dir);
-    let _ = std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700));
+    let _ = crate::sys::set_mode(&ssh_dir, 0o700);
     match std::fs::write(&file, new) {
         Ok(()) => {
-            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+            let _ = crate::sys::set_mode(&file, 0o600);
             if enable {
                 info!("ssh to <node>.mesh goes through meshvpn ({})", file.display());
             }
@@ -3345,7 +3351,7 @@ fn derive_public_key(private: &str) -> Option<String> {
 /// The address of the interface used for the default route (no packets are sent).
 fn primary_ip() -> Option<IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    exit::mark_socket(std::os::fd::AsRawFd::as_raw_fd(&s)); // not the exit node's route
+    exit::mark(&s); // not the exit node's route
     s.connect("1.1.1.1:80").ok()?;
     let ip = s.local_addr().ok()?.ip();
     (!ip.is_loopback() && !ip.is_unspecified() && !is_overlay(ip)).then_some(ip)

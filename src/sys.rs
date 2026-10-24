@@ -130,3 +130,250 @@ pub fn sysctl_u64(name: &str) -> u64 {
         _ => 0,
     }
 }
+
+/// Root (Unix) or an elevated administrator (Windows).
+pub fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        win::elevated()
+    }
+}
+
+/// The account this process runs as.
+pub fn user_name() -> Option<String> {
+    #[cfg(unix)]
+    unsafe {
+        let pw = libc::getpwuid(libc::geteuid());
+        (!pw.is_null()).then(|| std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("USERNAME").ok().filter(|u| !u.is_empty())
+    }
+}
+
+/// Unix permission bits; nothing on Windows (files inherit the folder's access list).
+#[cfg_attr(windows, allow(unused_variables))]
+pub fn set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
+}
+
+/// Creates new files readable by the owner only (Unix).
+#[cfg_attr(windows, allow(unused_variables))]
+pub fn private(opts: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
+/// Asks process `pid` to stop (SIGTERM; Windows: ends it).
+pub fn terminate(pid: i32) -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid, libc::SIGTERM) == 0
+    }
+    #[cfg(windows)]
+    {
+        win::end_process(pid as u32)
+    }
+}
+
+/// Ends process `pid` (SIGKILL).
+pub fn kill(pid: i32) -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid, libc::SIGKILL) == 0
+    }
+    #[cfg(windows)]
+    {
+        win::end_process(pid as u32)
+    }
+}
+
+#[cfg(windows)]
+pub fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default().to_lowercase()
+}
+
+/// Windows: meshvpn daemons run as a scheduled task and are managed through it.
+#[cfg(windows)]
+pub fn processes() -> Vec<(i32, Vec<String>)> {
+    vec![]
+}
+
+#[cfg(windows)]
+pub fn alive(pid: i32) -> bool {
+    win::running(pid as u32)
+}
+
+#[cfg(windows)]
+pub fn kernel_release() -> String {
+    // "Microsoft Windows [Version 10.0.22631.4317]"
+    std::process::Command::new("cmd")
+        .args(["/c", "ver"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let t = String::from_utf8_lossy(&o.stdout).into_owned();
+            let v = t.split("Version ").nth(1)?;
+            Some(v.trim().trim_end_matches(']').to_string())
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+pub fn load1() -> f32 {
+    0.0
+}
+
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    pub fn token_elevated(process: HANDLE) -> bool {
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut len = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                &mut e as *mut _ as *mut _,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            );
+            CloseHandle(token);
+            ok != 0 && e.TokenIsElevated != 0
+        }
+    }
+
+    pub fn elevated() -> bool {
+        token_elevated(unsafe { GetCurrentProcess() })
+    }
+
+    /// Process `pid` runs elevated (an administrator's).
+    pub fn pid_elevated(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let e = token_elevated(h);
+            CloseHandle(h);
+            e
+        }
+    }
+
+    pub fn end_process(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let ok = TerminateProcess(h, 1) != 0;
+            CloseHandle(h);
+            ok
+        }
+    }
+
+    pub fn running(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            ok && code == STILL_ACTIVE as u32
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use win::pid_elevated;
+
+/// IPv4 addresses of this machine's interfaces: (interface, address, prefix length).
+#[cfg(unix)]
+pub fn ipv4_interfaces() -> Vec<(String, std::net::Ipv4Addr, u8)> {
+    let mut out = vec![];
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        return out;
+    }
+    let mut cur = addrs;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null()
+            || ifa.ifa_netmask.is_null()
+            || unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET
+        {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let ip = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let nm = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) };
+        let ip = std::net::Ipv4Addr::from(u32::from_be(ip.sin_addr.s_addr));
+        let prefix = u32::from_be(nm.sin_addr.s_addr).count_ones() as u8;
+        out.push((name, ip, prefix));
+    }
+    unsafe { libc::freeifaddrs(addrs) };
+    out
+}
+
+#[cfg(windows)]
+pub fn ipv4_interfaces() -> Vec<(String, std::net::Ipv4Addr, u8)> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(a) => Some((i.name, a.ip, u32::from(a.netmask).count_ones() as u8)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs `cmd` independent of the terminal (and console window) that started it.
+pub fn detach(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+}

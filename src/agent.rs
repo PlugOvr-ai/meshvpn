@@ -235,19 +235,14 @@ impl Remote {
     /// The account running this (the one behind sudo, if any) - not $USER, which is often
     /// missing (containers, services).
     pub fn default_user() -> String {
-        let uid = unsafe { libc::geteuid() };
-        if uid == 0
+        if crate::sys::is_root()
             && let Ok(u) = std::env::var("SUDO_USER")
         {
             return u;
         }
-        let pw = unsafe { libc::getpwuid(uid) };
-        if !pw.is_null() {
-            return unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }
-                .to_string_lossy()
-                .into_owned();
-        }
-        std::env::var("USER").unwrap_or_else(|_| "root".into())
+        crate::sys::user_name()
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "root".into())
     }
 
     /// A shell command on `node`: locally for this machine, over ssh otherwise.
@@ -307,14 +302,7 @@ impl Remote {
     pub fn login_user_for(node: &NodeView) -> String {
         let configured = Self::ssh_config_user(&node.name);
         // ssh's own default is the account it runs as (root under sudo, not SUDO_USER).
-        let process_account = {
-            let pw = unsafe { libc::getpwuid(libc::geteuid()) };
-            (!pw.is_null()).then(|| {
-                unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }
-                    .to_string_lossy()
-                    .into_owned()
-            })
-        };
+        let process_account = crate::sys::user_name();
         if Some(&configured) != process_account.as_ref() {
             return configured; // a User line in the ssh config
         }
