@@ -138,18 +138,49 @@ fn platform() -> (String, String, u64, u64) {
     (os, cpu_model, total, avail.min(total))
 }
 
-/// Collects the inventory (blocking; call from a background thread).
-pub fn collect(userspace: bool) -> Inventory {
-    let (os, cpu_model, mem_total_mb, mem_avail_mb) = platform();
+#[cfg(windows)]
+fn platform() -> (String, String, u64, u64) {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let os = clean(&format!("Windows {}", crate::sys::kernel_release()));
+    let cpu_model = clean(&std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default());
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return (os, cpu_model, 0, 0);
+    }
+    (os, cpu_model, m.ullTotalPhys / 1_048_576, m.ullAvailPhys / 1_048_576)
+}
+
+/// Size and free space of the system disk in GB.
+#[cfg(unix)]
+fn disk() -> (u64, u64) {
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-    let (disk_total_gb, disk_free_gb) = if unsafe { libc::statvfs(c"/".as_ptr(), &mut vfs) } == 0 {
+    if unsafe { libc::statvfs(c"/".as_ptr(), &mut vfs) } == 0 {
         // The field types differ between 32 and 64 bit platforms.
         #[allow(clippy::useless_conversion)]
         let gb = |blocks| u64::from(blocks) * u64::from(vfs.f_frsize) / 1_000_000_000;
         (gb(vfs.f_blocks), gb(vfs.f_bavail))
     } else {
         (0, 0)
-    };
+    }
+}
+
+#[cfg(windows)]
+fn disk() -> (u64, u64) {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let drive: Vec<u16> = format!("{drive}\\\0").encode_utf16().collect();
+    let (mut avail, mut total) = (0u64, 0u64);
+    if unsafe { GetDiskFreeSpaceExW(drive.as_ptr(), &mut avail, &mut total, std::ptr::null_mut()) } == 0 {
+        return (0, 0);
+    }
+    (total / 1_000_000_000, avail / 1_000_000_000)
+}
+
+/// Collects the inventory (blocking; call from a background thread).
+pub fn collect(userspace: bool) -> Inventory {
+    let (os, cpu_model, mem_total_mb, mem_avail_mb) = platform();
+    let (disk_total_gb, disk_free_gb) = disk();
     let (gpus, gpu_driver, cuda) = nvidia();
     Inventory {
         os,

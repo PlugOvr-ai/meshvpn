@@ -37,5 +37,27 @@ jobs:
       - name: Smoke test (two nodes, utun, launchd)
         run: tests/macos/smoke.sh target/release/meshvpn
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - name: Wintun (the network driver; checksum of the official 0.14.1 release)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          if ((Get-FileHash wintun.zip).Hash -ne "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51") { throw "wintun checksum mismatch" }
+          Expand-Archive wintun.zip -DestinationPath wintun
+          Copy-Item wintun\wintun\bin\amd64\wintun.dll target\release\
+      - name: Smoke test (two nodes, Wintun, scheduled task)
+        shell: pwsh
+        run: tests\windows\smoke.ps1 target\release\meshvpn.exe
+
   e2e:
     uses: ./.github/workflows/e2e.yml

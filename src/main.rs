@@ -1,3 +1,6 @@
+// Servers (desktop, SSH sessions) are Unix-only; on Windows parts of their shared code stay unused.
+#![cfg_attr(windows, allow(dead_code))]
+
 mod agent;
 mod config;
 #[cfg(unix)]
@@ -122,7 +125,11 @@ enum Cmd {
         cmd: AdminCmd,
     },
     /// Run the VPN in the foreground (needs root).
-    Up,
+    Up {
+        /// Write the log to FILE instead of the terminal (services without one, e.g. on Windows).
+        #[arg(long, value_name = "FILE")]
+        log_file: Option<PathBuf>,
+    },
     /// Check this machine's setup and say how to fix problems.
     Doctor,
     /// Show this node and its peers.
@@ -621,6 +628,7 @@ fn main() {
         Err(e) => {
             let msg = format!("{e:#}");
             let code = exit_code(&msg);
+            let msg = config::hint(&msg);
             if json {
                 println!("{}", serde_json::json!({ "ok": false, "error": msg, "code": code }));
             } else {
@@ -635,7 +643,11 @@ fn main() {
 fn exit_code(msg: &str) -> i32 {
     if msg.contains("is not running") {
         3
-    } else if msg.contains("try again with sudo") || msg.contains("needs root") || msg.contains("permission denied") {
+    } else if msg.contains("try again with sudo")
+        || msg.contains("needs root")
+        || msg.contains("needs administrator")
+        || msg.contains("permission denied")
+    {
         4
     } else if msg.contains("no node")
         || msg.contains("no rule")
@@ -830,9 +842,9 @@ fn real_main(cli: Cli) -> Result<i32> {
                 }
             }
         }
-        Cmd::Up => {
+        Cmd::Up { log_file } => {
             let cfg = Config::load(&dir)?;
-            init_logging();
+            init_logging(log_file.as_deref())?;
             tokio::runtime::Runtime::new()?.block_on(node::run(dir, cfg))?;
         }
         Cmd::Nodes {
@@ -1472,7 +1484,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
             Some(DesktopCmd::Attach { session }) => desktop::session::attach(&session)?,
             Some(DesktopCmd::Session { session }) => {
-                init_logging();
+                init_logging(None)?;
                 desktop::session::run(&session)?;
             }
             None => {
@@ -1627,13 +1639,22 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-fn init_logging() {
+fn init_logging(file: Option<&Path>) -> Result<()> {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("meshvpn=info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    let log = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+    match file {
+        Some(path) => {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            log.with_ansi(false).with_writer(std::sync::Mutex::new(f)).init();
+        }
+        None => log.init(),
+    }
+    Ok(())
 }
 
 fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Vec<String>) -> Result<Config> {
@@ -2357,6 +2378,9 @@ fn require_root() -> Result<()> {
         if config::rootless() {
             bail!("this needs root (it changes the system, which a rootless install can't) - try again with sudo");
         }
+        if cfg!(windows) {
+            bail!("this needs administrator rights - run it in an administrator terminal");
+        }
         bail!("this needs root - try again with sudo");
     }
     Ok(())
@@ -2387,6 +2411,9 @@ fn install(dir: &Path) -> Result<()> {
     }
     require_root()?;
     Config::load(dir)?; // fail early with a helpful message
+    if cfg!(windows) {
+        return install_windows(&std::path::absolute(dir)?);
+    }
     // Installed by a package manager or install.sh: use it where it is. Otherwise (e.g. run
     // from a download folder) copy it somewhere permanent first.
     let exe = std::env::current_exe()?.canonicalize()?;
@@ -2434,6 +2461,101 @@ fn install(dir: &Path) -> Result<()> {
     println!("meshvpn is running and will start at boot.");
     println!("  status: meshvpn status   logs: journalctl -u meshvpn -f");
     Ok(())
+}
+
+#[cfg(windows)]
+fn schtasks(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("schtasks")
+        .args(args)
+        .output()
+        .context("running schtasks")?;
+    if !out.status.success() {
+        bail!(
+            "schtasks {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Windows: a task that starts meshvpn at boot as SYSTEM and restarts it after failures. The
+/// binary (with wintun.dll) lives in Program Files.
+#[cfg(windows)]
+fn install_windows(dir: &Path) -> Result<()> {
+    let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    let home = PathBuf::from(program_files).join("meshvpn");
+    let exe = std::env::current_exe()?;
+    let bin = home.join("meshvpn.exe");
+    if exe.parent() != Some(home.as_path()) {
+        std::fs::create_dir_all(&home)?;
+        let _ = schtasks(&["/End", "/TN", "meshvpn"]);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::copy(&exe, &bin).with_context(|| format!("copying meshvpn to {}", bin.display()))?;
+        let dll = exe.with_file_name("wintun.dll");
+        if dll.exists() {
+            std::fs::copy(&dll, home.join("wintun.dll"))?;
+        }
+    }
+    if !home.join("wintun.dll").exists() {
+        bail!(
+            "wintun.dll is missing next to {} - download the full Windows release",
+            bin.display()
+        );
+    }
+    let log = dir.join("meshvpn.log");
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>meshvpn decentralized mesh VPN</Description></RegistrationInfo>
+  <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{}</Command>
+      <Arguments>--dir "{}" up --log-file "{}"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        esc(&bin.display().to_string()),
+        esc(&dir.display().to_string()),
+        esc(&log.display().to_string())
+    );
+    // Task Scheduler wants UTF-16 with a byte order mark.
+    let file = std::env::temp_dir().join("meshvpn-task.xml");
+    let mut bytes = vec![0xff, 0xfe];
+    bytes.extend(xml.encode_utf16().flat_map(|u| u.to_le_bytes()));
+    std::fs::write(&file, bytes)?;
+    let _ = schtasks(&["/End", "/TN", "meshvpn"]);
+    let created = schtasks(&["/Create", "/TN", "meshvpn", "/XML", &file.to_string_lossy(), "/F"]);
+    let _ = std::fs::remove_file(&file);
+    created?;
+    schtasks(&["/Run", "/TN", "meshvpn"])?;
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if control::is_running(dir) {
+            println!("meshvpn is running and will start at boot.");
+            println!("  status: meshvpn status   log: {}", log.display());
+            return Ok(());
+        }
+    }
+    bail!("the meshvpn task did not start - see {}", log.display())
+}
+
+#[cfg(unix)]
+fn install_windows(_dir: &Path) -> Result<()> {
+    unreachable!("Windows only")
 }
 
 const LAUNCHD_LABEL: &str = "ai.plugovr.meshvpn";
@@ -2534,6 +2656,11 @@ fn uninstall(dir: &Path) -> Result<()> {
         return uninstall_user(dir);
     }
     require_root()?;
+    #[cfg(windows)]
+    {
+        let _ = schtasks(&["/End", "/TN", "meshvpn"]);
+        let _ = schtasks(&["/Delete", "/TN", "meshvpn", "/F"]);
+    }
     if cfg!(target_os = "macos") {
         let _ = launchctl(&["bootout", &format!("system/{LAUNCHD_LABEL}")]);
         std::fs::remove_file(LAUNCHD_PLIST).ok();

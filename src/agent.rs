@@ -248,8 +248,9 @@ impl Remote {
     /// A shell command on `node`: locally for this machine, over ssh otherwise.
     pub(crate) fn command(&self, node: &NodeView, script: &str) -> Command {
         if node.is_self {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(script);
+            let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+            let mut c = Command::new(shell);
+            c.arg(flag).arg(script);
             return c;
         }
         let mut c = Command::new("ssh");

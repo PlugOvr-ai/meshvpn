@@ -6,7 +6,10 @@ use std::net::Ipv4Addr;
 
 use crate::keys::NodeId;
 
+#[cfg(unix)]
 const HOSTS: &str = "/etc/hosts";
+#[cfg(windows)]
+const HOSTS: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const BEGIN: &str = "# BEGIN meshvpn (managed automatically, do not edit)";
 const END: &str = "# END meshvpn";
 
@@ -53,6 +56,11 @@ pub fn write(block: Option<&str>) -> Result<()> {
                 .args(["-HUP", "mDNSResponder"])
                 .status();
         }
+        #[cfg(windows)]
+        let _ = std::process::Command::new("ipconfig")
+            .arg("/flushdns")
+            .stdout(std::process::Stdio::null())
+            .status();
     }
     Ok(())
 }
