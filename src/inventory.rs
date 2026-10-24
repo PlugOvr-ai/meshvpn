@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::proto::{Gpu, Inventory};
 
+#[cfg(target_os = "linux")]
 fn read(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -18,6 +19,7 @@ fn clean(s: &str) -> String {
         .to_string()
 }
 
+#[cfg(target_os = "linux")]
 fn meminfo_mb(text: &str, key: &str) -> u64 {
     text.lines()
         .find(|l| l.starts_with(key))
@@ -91,8 +93,9 @@ fn nvidia() -> (Vec<Gpu>, String, String) {
     (gpus, driver, cuda)
 }
 
-/// Collects the inventory (blocking; call from a background thread).
-pub fn collect(userspace: bool) -> Inventory {
+/// OS name, CPU model, total and available memory (MB).
+#[cfg(target_os = "linux")]
+fn platform() -> (String, String, u64, u64) {
     let os = read("/etc/os-release")
         .lines()
         .find_map(|l| l.strip_prefix("PRETTY_NAME="))
@@ -106,6 +109,38 @@ pub fn collect(userspace: bool) -> Inventory {
         .map(|(_, v)| clean(v))
         .unwrap_or_default();
     let meminfo = read("/proc/meminfo");
+    (
+        os,
+        cpu_model,
+        meminfo_mb(&meminfo, "MemTotal:"),
+        meminfo_mb(&meminfo, "MemAvailable:"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn platform() -> (String, String, u64, u64) {
+    use crate::sys::{sysctl_string, sysctl_u64};
+    let version = run("sw_vers", &["-productVersion"]).unwrap_or_default();
+    let os = clean(&format!("macOS {}", version.trim()));
+    let cpu_model = clean(&sysctl_string("machdep.cpu.brand_string"));
+    let total = sysctl_u64("hw.memsize") / 1_048_576;
+    // Free + inactive + purgeable pages are available, as Activity Monitor counts them.
+    let page = sysctl_u64("hw.pagesize").max(4096);
+    let vm = run("vm_stat", &[]).unwrap_or_default();
+    let pages = |key: &str| -> u64 {
+        vm.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.trim_end_matches('.').parse().ok())
+            .unwrap_or(0)
+    };
+    let avail = (pages("Pages free:") + pages("Pages inactive:") + pages("Pages purgeable:")) * page / 1_048_576;
+    (os, cpu_model, total, avail.min(total))
+}
+
+/// Collects the inventory (blocking; call from a background thread).
+pub fn collect(userspace: bool) -> Inventory {
+    let (os, cpu_model, mem_total_mb, mem_avail_mb) = platform();
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
     let (disk_total_gb, disk_free_gb) = if unsafe { libc::statvfs(c"/".as_ptr(), &mut vfs) } == 0 {
         // The field types differ between 32 and 64 bit platforms.
@@ -119,18 +154,14 @@ pub fn collect(userspace: bool) -> Inventory {
     Inventory {
         os,
         arch: std::env::consts::ARCH.into(),
-        kernel: clean(read("/proc/sys/kernel/osrelease").trim()),
+        kernel: clean(&crate::sys::kernel_release()),
         cpu_model,
         cpu_cores: std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1),
-        load1: read("/proc/loadavg")
-            .split_whitespace()
-            .next()
-            .and_then(|l| l.parse().ok())
-            .unwrap_or(0.0),
-        mem_total_mb: meminfo_mb(&meminfo, "MemTotal:"),
-        mem_avail_mb: meminfo_mb(&meminfo, "MemAvailable:"),
+        load1: crate::sys::load1(),
+        mem_total_mb,
+        mem_avail_mb,
         disk_total_gb,
         disk_free_gb,
         gpus,

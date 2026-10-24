@@ -179,7 +179,7 @@ fn lookup(name: &str) -> Option<Account> {
     let mut groups = vec![0 as libc::gid_t; 64];
     loop {
         let mut n = groups.len() as libc::c_int;
-        let rc = unsafe { libc::getgrouplist(cname.as_ptr(), pw.pw_gid, groups.as_mut_ptr(), &mut n) };
+        let rc = unsafe { libc::getgrouplist(cname.as_ptr(), pw.pw_gid as _, groups.as_mut_ptr() as *mut _, &mut n) };
         if rc >= 0 {
             groups.truncate(n.max(0) as usize);
             break;
@@ -620,7 +620,7 @@ fn command(
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if pty && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            if pty && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if switch
@@ -737,7 +737,15 @@ pub(crate) fn openpty(cols: u16, rows: u16) -> std::io::Result<(OwnedFd, OwnedFd
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let rc = unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws) };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &ws as *const _ as *mut _,
+        )
+    };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
     }

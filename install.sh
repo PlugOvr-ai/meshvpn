@@ -31,15 +31,20 @@ if [ "${1:-}" = "--user" ] || [ "${1:-}" = "--rootless" ]; then
     shift
 fi
 
-[ "$(uname -s)" = "Linux" ] || die "meshvpn currently supports Linux only (found $(uname -s))."
-
-case "$(uname -m)" in
-    x86_64 | amd64) TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64 | arm64) TARGET="aarch64-unknown-linux-musl" ;;
-    armv7* | armv8l) TARGET="armv7-unknown-linux-musleabihf" ;;
-    armv6*) TARGET="arm-unknown-linux-musleabihf" ;;
-    *) die "no prebuilt binary for CPU architecture $(uname -m) - build from source: cargo install --git https://github.com/$REPO" ;;
+OS="$(uname -s)"
+case "$OS/$(uname -m)" in
+    Linux/x86_64 | Linux/amd64) TARGET="x86_64-unknown-linux-musl" ;;
+    Linux/aarch64 | Linux/arm64) TARGET="aarch64-unknown-linux-musl" ;;
+    Linux/armv7* | Linux/armv8l) TARGET="armv7-unknown-linux-musleabihf" ;;
+    Linux/armv6*) TARGET="arm-unknown-linux-musleabihf" ;;
+    Darwin/x86_64) TARGET="x86_64-apple-darwin" ;;
+    Darwin/arm64) TARGET="aarch64-apple-darwin" ;;
+    Linux/* | Darwin/*) die "no prebuilt binary for CPU architecture $(uname -m) - build from source: cargo install --git https://github.com/$REPO" ;;
+    *) die "this installer is for Linux and macOS (found $OS)" ;;
 esac
+if [ "$OS" = Darwin ] && [ -n "$ROOTLESS" ]; then
+    die "on macOS meshvpn needs root (it creates a network interface) - run the installer with sudo"
+fi
 
 if [ -n "$ROOTLESS" ] && [ "$(id -u)" -eq 0 ]; then
     die "--user is for installing without root - as root, run the installer without it"
@@ -142,6 +147,8 @@ fetch "$BASE/$ARCHIVE.sha256" "$TMP/$ARCHIVE.sha256" || die "download failed: $B
 
 if command -v sha256sum >/dev/null 2>&1; then
     (cd "$TMP" && sha256sum -c "$ARCHIVE.sha256" >/dev/null) || die "checksum mismatch - download corrupted?"
+elif command -v shasum >/dev/null 2>&1; then
+    (cd "$TMP" && shasum -a 256 -c "$ARCHIVE.sha256" >/dev/null) || die "checksum mismatch - download corrupted?"
 else
     say "(sha256sum not found, skipping checksum verification)"
 fi
@@ -182,7 +189,7 @@ if [ -n "$ROOTLESS" ]; then
     exit 0
 fi
 
-[ -c /dev/net/tun ] || say "note: no /dev/net/tun here (e.g. a container without NET_ADMIN) - meshvpn runs in userspace mode: other nodes reach the services here, programs here reach the mesh via socks5h://127.0.0.1:1055 (ssh to *.mesh works directly)."
+[ "$OS" = Darwin ] || [ -c /dev/net/tun ] || say "note: no /dev/net/tun here (e.g. a container without NET_ADMIN) - meshvpn runs in userspace mode: other nodes reach the services here, programs here reach the mesh via socks5h://127.0.0.1:1055 (ssh to *.mesh works directly)."
 command -v ssh >/dev/null 2>&1 || say "note: install openssh-client if this machine should use a reverse SSH tunnel."
 
 # Optional: set the machine up right away, e.g. `sh -s -- join mesh1-...`.
@@ -194,7 +201,8 @@ if [ $# -gt 0 ]; then
             $SUDO "$BIN_DIR/meshvpn" install
             ;;
     esac
-elif [ -f /etc/systemd/system/meshvpn.service ] && $SUDO test -f /etc/meshvpn/config.toml; then
+elif { [ -f /etc/systemd/system/meshvpn.service ] || [ -f /Library/LaunchDaemons/ai.plugovr.meshvpn.plist ]; } \
+    && $SUDO test -f /etc/meshvpn/config.toml; then
     # Already set up: restart the service on the new version (this also stops a meshvpn
     # that was started by hand and would block the network interface).
     $SUDO "$BIN_DIR/meshvpn" install

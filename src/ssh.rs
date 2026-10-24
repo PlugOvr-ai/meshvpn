@@ -74,7 +74,7 @@ pub async fn supervise(label: String, args: Vec<String>) {
         // Take ssh down with us, even if we are killed hard.
         unsafe {
             cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                crate::sys::die_with_parent();
                 Ok(())
             });
         }

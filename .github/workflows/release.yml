@@ -69,6 +69,39 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
 
+  macos:
+    # Built natively on a Mac (both architectures), after the macOS smoke test.
+    name: build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Set version from tag
+        run: |
+          version="${TAG#v}"
+          sed -i '' "1,/^version = .*/s//version = \"$version\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+      - name: Build
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+      - name: Smoke test (two nodes, utun, launchd)
+        run: tests/macos/smoke.sh target/aarch64-apple-darwin/release/meshvpn
+      - name: Package archives
+        run: |
+          mkdir -p dist
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            rm -rf staging && mkdir staging
+            cp target/$t/release/meshvpn README.md LICENSE staging/
+            tar -czf dist/meshvpn-$t.tar.gz -C staging .
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos
+          path: dist/*
+
   desktop:
     # The desktop bundle (static Xvfb etc., see desktop/build-bundle.sh), natively per arch.
     name: desktop bundle ${{ matrix.arch }}
@@ -92,7 +125,7 @@ jobs:
 
   release:
     # Published only when every end-to-end test passed.
-    needs: [build, desktop, e2e]
+    needs: [build, macos, desktop, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -127,6 +160,12 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
           \`\`\`
 
+          **macOS** (Apple Silicon and Intel; the same installer):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo sh
+          \`\`\`
+
           **A device without internet access** that you can SSH into from a jump host. Run this on the jump host; nothing is installed there:
 
           \`\`\`sh
@@ -143,6 +182,7 @@ jobs:
           | \`aarch64-unknown-linux-musl\` / \`arm64\` | Raspberry Pi 3/4/5 (64 bit), ARM servers |
           | \`armv7-unknown-linux-musleabihf\` / \`armhf\` | Raspberry Pi 2/3/4 (32 bit), routers, SBCs |
           | \`arm-unknown-linux-musleabihf\` | Raspberry Pi Zero / 1 |
+          | \`aarch64-apple-darwin\` / \`x86_64-apple-darwin\` | Macs (Apple Silicon / Intel) |
 
           Then: \`sudo meshvpn init\` to create a network, or \`sudo meshvpn join <invite>\` to join one.
           NOTES

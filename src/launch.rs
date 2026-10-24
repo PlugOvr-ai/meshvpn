@@ -340,7 +340,7 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                crate::sys::die_with_parent();
                 Ok(())
             });
         }

@@ -40,7 +40,7 @@ pub fn now_ms() -> u64 {
 
 /// The account behind this request, for the reservation's holder text.
 pub fn default_holder(note: Option<&str>) -> String {
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let host = crate::sys::hostname();
     let who = format!("{}@{}", Remote::default_user(), host.trim());
     match note {
         Some(n) => format!("{n} ({who})"),

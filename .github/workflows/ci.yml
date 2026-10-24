@@ -21,7 +21,21 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - name: Lint shell scripts
-        run: shellcheck install.sh deploy.sh
+        run: shellcheck install.sh deploy.sh tests/macos/smoke.sh
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - name: Smoke test (two nodes, utun, launchd)
+        run: tests/macos/smoke.sh target/release/meshvpn
 
   e2e:
     uses: ./.github/workflows/e2e.yml

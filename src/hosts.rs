@@ -45,6 +45,14 @@ pub fn write(block: Option<&str>) -> Result<()> {
     if kept != current {
         // Written in place: /etc/hosts is often a bind mount (containers).
         std::fs::write(HOSTS, kept)?;
+        // macOS caches name lookups, /etc/hosts included.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("dscacheutil").arg("-flushcache").status();
+            let _ = std::process::Command::new("killall")
+                .args(["-HUP", "mDNSResponder"])
+                .status();
+        }
     }
     Ok(())
 }

@@ -366,7 +366,7 @@ pub struct PeerStatus {
 
 // ---------------------------------------------------------------------------------------------
 
-pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
+pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     let ident = Identity::from_config(&cfg)?;
     let keys = cfg.all_keys()?;
     let my_ip = overlay_ip(&ident.id);
@@ -378,7 +378,7 @@ pub async fn run(dir: PathBuf, cfg: Config) -> Result<()> {
     if cfg.userspace == Userspace::Always {
         userspace_reason = Some("userspace = \"always\" in the config".to_string());
     } else {
-        match create_tun(&cfg, my_ip) {
+        match create_tun(&mut cfg, my_ip) {
             Ok(t) => tun_dev = Some(t),
             Err(msg) if cfg.userspace == Userspace::Auto && tun_unavailable(&msg) => userspace_reason = Some(msg),
             Err(msg) => return Err(tun_error(&cfg, &msg)),
@@ -3098,14 +3098,38 @@ pub fn check_name_free<'a>(name: &str, mut others: impl Iterator<Item = &'a Stri
     Ok(())
 }
 
-fn create_tun(cfg: &Config, my_ip: Ipv4Addr) -> std::result::Result<tun::AsyncDevice, String> {
+/// The TUN device; `cfg.interface` becomes its real name (macOS picks `utunN` itself).
+fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr) -> std::result::Result<tun::AsyncDevice, String> {
     let mut tcfg = tun::Configuration::default();
-    tcfg.tun_name(&cfg.interface)
-        .address(my_ip)
-        .netmask(OVERLAY_NETMASK)
-        .mtu(cfg.mtu)
-        .up();
-    tun::create_as_async(&tcfg).map_err(|e| e.to_string())
+    tcfg.address(my_ip).netmask(OVERLAY_NETMASK).mtu(cfg.mtu).up();
+    #[cfg(target_os = "linux")]
+    tcfg.tun_name(&cfg.interface);
+    #[cfg(target_os = "macos")]
+    tcfg.destination(my_ip).platform_config(|p| {
+        p.enable_routing(false);
+    });
+    let dev = tun::create_as_async(&tcfg).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        use tun::AbstractDevice;
+        cfg.interface = dev.tun_name().map_err(|e| e.to_string())?;
+        // The whole mesh through this interface (a point-to-point link only routes its peer).
+        let net = format!("{}/{}", Ipv4Addr::new(100, 64, 0, 0), OVERLAY_PREFIX);
+        let _ = std::process::Command::new("route")
+            .args(["-q", "-n", "delete", "-net", &net])
+            .output();
+        let out = std::process::Command::new("route")
+            .args(["-q", "-n", "add", "-net", &net, "-interface", &cfg.interface])
+            .output()
+            .map_err(|e| format!("route: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "route add {net}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    Ok(dev)
 }
 
 fn permission_problem(msg: &str) -> bool {
