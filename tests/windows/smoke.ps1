@@ -10,6 +10,9 @@ $DB = Join-Path $env:TEMP "meshvpn-b"
 
 function Fail($what) {
     Write-Host "FAIL: $what"
+    Write-Host "==> meshvpn --json status"
+    & $B --json status
+    Write-Host "(exit $LASTEXITCODE)"
     foreach ($f in "$env:TEMP\a.log", "$env:TEMP\a.err", "$env:TEMP\b.log", "$env:TEMP\b.err", "C:\ProgramData\meshvpn\meshvpn.log") {
         if (Test-Path $f) { Write-Host "==> $f"; Get-Content $f -Tail 40 }
     }
@@ -36,7 +39,8 @@ $cfg = Join-Path $DB "config.toml"
 $lines = Get-Content $cfg | Where-Object { $_ -notmatch "^manage_hosts" }
 Set-Content $cfg (@("manage_hosts = false") + $lines)
 $b = Start-Process $B -ArgumentList "--dir", "`"$DB`"", "up" -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\b.log" -RedirectStandardError "$env:TEMP\b.err"
-WaitFor "winb online" { ((Json status).peers | Where-Object { $_.name -eq "winb" -and $_.online }) -ne $null }
+function Online { @((Json status).peers | Where-Object { $_.name -eq "winb" -and $_.online }).Count -gt 0 }
+WaitFor "winb online" { Online }
 
 $st = Json status
 $bip = (Json --dir $DB status).ip
@@ -67,7 +71,7 @@ Mesh --json nodes | Out-Null
 Stop-Process -Id $a.Id -Force
 Start-Sleep 2
 Mesh install
-WaitFor "wina back as a task" { ((Json status).peers | Where-Object { $_.name -eq "winb" -and $_.online }) -ne $null }
+WaitFor "wina back as a task" { Online }
 schtasks /Query /TN meshvpn | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "no scheduled task" }
 Mesh uninstall
