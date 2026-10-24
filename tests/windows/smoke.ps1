@@ -85,3 +85,4 @@ if ($LASTEXITCODE -eq 0) { Fail "task still there after uninstall" }
 Stop-Process -Id $procB.Id, $http.Id -Force -ErrorAction SilentlyContinue
 Remove-NetFirewallRule -DisplayName "meshvpn smoke test" -ErrorAction SilentlyContinue
 Write-Host "Windows smoke test passed"
+exit 0

@@ -3341,14 +3341,9 @@ pub fn is_everyone(who: &str) -> bool {
 /// Public keys (`~/.ssh/id_*.pub`) of this machine's login accounts.
 fn local_ssh_keys() -> Vec<crate::proto::SshKey> {
     let mut out = vec![];
-    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-    for line in passwd.lines() {
-        let f: Vec<&str> = line.split(':').collect();
-        let (Some(user), Some(uid), Some(home)) = (f.first(), f.get(2), f.get(5)) else {
-            continue;
-        };
-        let Ok(uid) = uid.parse::<u32>() else { continue };
-        if (uid != 0 && uid < 1000) || uid >= 65534 || !crate::proto::valid_user(user) {
+    for (user, home) in crate::sys::login_users() {
+        let (user, home) = (user.as_str(), home.to_string_lossy());
+        if !crate::proto::valid_user(user) {
             continue;
         }
         for name in ["id_ed25519", "id_ecdsa", "id_rsa", "id_ed25519_sk", "id_ecdsa_sk"] {
