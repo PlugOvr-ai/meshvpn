@@ -54,6 +54,9 @@ ping -n 2 -w 5000 $bip | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail "ping winb through Wintun" }
 New-Item -ItemType Directory -Force "$env:TEMP\www" | Out-Null
 Set-Content "$env:TEMP\www\index.html" "hello-win"
+# Windows Defender Firewall blocks connections into the machine from a new network (meshvpn
+# leaves it alone); allow the test server, as a user would for a service they share.
+New-NetFirewallRule -DisplayName "meshvpn smoke test" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow | Out-Null
 $http = Start-Process python -ArgumentList "-m", "http.server", "8000", "--directory", "$env:TEMP\www" -PassThru -NoNewWindow
 WaitFor "the web server" { (curl.exe -fsS -m 2 http://127.0.0.1:8000/) -match "hello-win" }
 netstat -an -p TCP | Select-String "LISTENING" | Select-String ":8000 "
@@ -80,4 +83,5 @@ schtasks /Query /TN meshvpn 2>$null | Out-Null
 if ($LASTEXITCODE -eq 0) { Fail "task still there after uninstall" }
 
 Stop-Process -Id $procB.Id, $http.Id -Force -ErrorAction SilentlyContinue
+Remove-NetFirewallRule -DisplayName "meshvpn smoke test" -ErrorAction SilentlyContinue
 Write-Host "Windows smoke test passed"
