@@ -44,7 +44,9 @@ irm https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.ps1 |
 
 It installs to `C:\Program Files\meshvpn` with the [Wintun](https://www.wintun.net) driver, keeps its configuration
 in `C:\ProgramData\meshvpn` and runs as a task that starts at boot. Run meshvpn's commands without `sudo`, in an
-administrator terminal for the ones that change something.
+administrator terminal for the ones that change something. Windows Defender Firewall keeps blocking connections *into*
+the machine from the mesh, as from any new network; to offer a service to the other nodes, allow its port, e.g.
+`New-NetFirewallRule -DisplayName "meshvpn: my app" -Direction Inbound -Protocol TCP -LocalPort 8000 -RemoteAddress 100.64.0.0/10 -Action Allow`.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|

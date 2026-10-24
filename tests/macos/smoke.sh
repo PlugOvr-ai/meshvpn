@@ -67,6 +67,8 @@ ping -c 2 -t 10 macb.mesh >/dev/null || fail "names: macb.mesh"
 if sudo systemsetup -setremotelogin on >/dev/null 2>&1 || sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null; then
     [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
     sudo "$B" ssh allow "$(id -un)@macb" --as "$(id -un)"
+    # macb announces the new key with its next record (every 30 s)
+    for _ in $(seq 60); do sudo "$B" ssh-authorized-keys "$(id -un)" | grep -q macb && break; sleep 1; done
     who="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
         -o "ProxyCommand=sudo $B --dir $DB nc %h %p" "$(id -un)@maca.mesh" whoami 2>&1 || true)"
     echo "ssh login into the Mac: $who"
