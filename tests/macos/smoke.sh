@@ -7,7 +7,9 @@
 #
 #   tests/macos/smoke.sh target/release/meshvpn
 set -euo pipefail
-B="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+# Where install.sh puts it: sshd only runs a root-owned binary in a protected directory.
+sudo install -m 0755 "$1" /usr/local/bin/meshvpn
+B=/usr/local/bin/meshvpn
 DB=/tmp/meshvpn-b
 fail() { echo "FAIL: $*"; sudo tail -40 /tmp/a.log /tmp/b.log 2>/dev/null; exit 1; }
 wait_for() { # $1 = description, $2... = command
