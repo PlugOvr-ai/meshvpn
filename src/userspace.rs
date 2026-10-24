@@ -196,6 +196,7 @@ pub fn listening_on_all(port: u16) -> bool {
     listening(port, false)
 }
 
+#[cfg(target_os = "linux")]
 fn listening(port: u16, loopback_too: bool) -> bool {
     let want = format!(":{port:04X}");
     ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|f| {
@@ -212,6 +213,48 @@ fn listening(port: u16, loopback_too: bool) -> bool {
                 || addr == "00000000000000000000000001000000"; // ::1
             *st == "0A" && format!(":{p}") == want && (any || (loopback_too && loopback))
         })
+    })
+}
+
+/// macOS and Windows: from `netstat`'s list of listening TCP sockets.
+#[cfg(not(target_os = "linux"))]
+fn listening(port: u16, loopback_too: bool) -> bool {
+    let args: &[&str] = if cfg!(windows) {
+        &["-an", "-p", "TCP"]
+    } else {
+        &["-an", "-p", "tcp"]
+    };
+    let Ok(out) = std::process::Command::new("netstat").args(args).output() else {
+        return false;
+    };
+    listening_in_netstat(&String::from_utf8_lossy(&out.stdout), port, loopback_too)
+}
+
+/// `tcp4  0  0  *.8000  *.*  LISTEN` (macOS) or `TCP  0.0.0.0:8000  0.0.0.0:0  LISTENING`
+/// (Windows), IPv6 likewise.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn listening_in_netstat(text: &str, port: u16, loopback_too: bool) -> bool {
+    text.lines().any(|l| {
+        let cols: Vec<&str> = l.split_whitespace().collect();
+        if !cols.iter().any(|c| c.starts_with("LISTEN"))
+            || !cols.first().is_some_and(|c| c.to_lowercase().starts_with("tcp"))
+        {
+            return false;
+        }
+        let Some(local) = cols.iter().skip(1).find(|c| c.contains('.') || c.contains(':')) else {
+            return false;
+        };
+        // The port follows the last '.' (macOS) or ':' (Windows).
+        let Some(cut) = local.rfind(['.', ':']) else {
+            return false;
+        };
+        let (addr, p) = (&local[..cut], &local[cut + 1..]);
+        if p.parse::<u16>() != Ok(port) {
+            return false;
+        }
+        let any = matches!(addr, "*" | "0.0.0.0" | "[::]" | "::");
+        let loopback = addr.starts_with("127.") || matches!(addr, "::1" | "[::1]");
+        any || (loopback_too && loopback)
     })
 }
 
@@ -700,4 +743,29 @@ pub async fn netcat(proxy: &str, host: &str, port: u16) -> Result<()> {
     };
     tokio::join!(up, down);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn listeners_from_netstat() {
+        let mac = "Active Internet connections (including servers)\n\
+                   Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)\n\
+                   tcp4       0      0  *.8000                 *.*                    LISTEN\n\
+                   tcp4       0      0  127.0.0.1.1055         *.*                    LISTEN\n\
+                   tcp6       0      0  *.22                   *.*                    LISTEN\n\
+                   tcp4       0      0  10.0.0.5.51000         1.2.3.4.443            ESTABLISHED\n";
+        let win = "  Proto  Local Address          Foreign Address        State\n\
+                   TCP    0.0.0.0:8000           0.0.0.0:0              LISTENING\n\
+                   TCP    127.0.0.1:1055         0.0.0.0:0              LISTENING\n\
+                   TCP    [::]:22                [::]:0                 LISTENING\n";
+        for t in [mac, win] {
+            assert!(super::listening_in_netstat(t, 8000, false));
+            assert!(super::listening_in_netstat(t, 22, false));
+            assert!(!super::listening_in_netstat(t, 1055, false));
+            assert!(super::listening_in_netstat(t, 1055, true));
+            assert!(!super::listening_in_netstat(t, 9999, true));
+        }
+        assert!(!super::listening_in_netstat(mac, 51000, true));
+    }
 }

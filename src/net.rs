@@ -46,6 +46,15 @@ fn virtual_interface(name: &str) -> bool {
         "ham",
         "nebula",
         "dummy",
+        // macOS
+        "utun",
+        "awdl",
+        "llw",
+        "anpi",
+        "bridge",
+        // Windows
+        "vEthernet",
+        "meshvpn",
     ];
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
@@ -53,37 +62,16 @@ fn virtual_interface(name: &str) -> bool {
 /// `ip/prefix` of this machine's physical networks, with the interface name.
 pub fn local_lans() -> Vec<(String, Ipv4Addr, u8)> {
     let mut out = vec![];
-    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
-        return out;
-    }
-    let mut cur = addrs;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_addr.is_null()
-            || ifa.ifa_netmask.is_null()
-            || unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET
-        {
-            continue;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
+    for (name, ip, prefix) in crate::sys::ipv4_interfaces() {
         if virtual_interface(&name) {
             continue;
         }
-        let ip = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-        let nm = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) };
-        let ip = Ipv4Addr::from(u32::from_be(ip.sin_addr.s_addr));
-        let prefix = u32::from_be(nm.sin_addr.s_addr).count_ones() as u8;
         // Shared CGNAT space (100.64/10) is how VPNs number their nodes, not a LAN.
         if ip.is_loopback() || ip.is_link_local() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64) {
             continue;
         }
         out.push((name, ip, prefix));
     }
-    unsafe { libc::freeifaddrs(addrs) };
     out
 }
 

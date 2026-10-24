@@ -37,7 +37,7 @@ fn check(name: &'static str, level: Level, detail: impl Into<String>, fix: Optio
 }
 
 fn root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    crate::sys::is_root()
 }
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {

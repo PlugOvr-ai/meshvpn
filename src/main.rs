@@ -1,6 +1,16 @@
 mod agent;
 mod config;
+#[cfg(unix)]
 mod console;
+#[cfg(windows)]
+mod console {
+    pub fn run(_dir: &std::path::Path, _user: Option<String>) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "the terminal console isn't available on Windows yet - use `meshvpn status`, `ssh <user>@<node>.mesh` \
+             or `meshvpn desktop <node>`"
+        )
+    }
+}
 mod control;
 mod desktop;
 mod doctor;
@@ -17,7 +27,19 @@ mod node;
 mod proto;
 mod share;
 mod ssh;
+#[cfg(unix)]
 mod sshd;
+/// Windows: no sshd integration (logins go to the Linux and macOS nodes).
+#[cfg(windows)]
+mod sshd {
+    pub const DROPIN: &str = "";
+
+    pub fn enable_if_installed() -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    pub fn disable() {}
+}
 mod sshserver;
 mod sys;
 mod tui;
@@ -1710,7 +1732,7 @@ fn print_node_summary(cfg: &Config) -> Result<()> {
 
 fn print_next_steps(dir: &Path, cfg: &Config) {
     println!();
-    if std::os::unix::net::UnixStream::connect(control::socket_path(dir)).is_ok() {
+    if control::is_running(dir) {
         println!("meshvpn is still running with the previous configuration. Restart it:");
         println!(
             "{}",
@@ -2331,7 +2353,7 @@ const UNIT_PATH: &str = "/etc/systemd/system/meshvpn.service";
 const BIN_PATH: &str = "/usr/local/bin/meshvpn";
 
 fn require_root() -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !sys::is_root() {
         if config::rootless() {
             bail!("this needs root (it changes the system, which a rootless install can't) - try again with sudo");
         }
@@ -2489,7 +2511,7 @@ fn stop_other_daemons() -> Vec<(i32, String)> {
         if pid == me || !is_daemon_cmdline(&args) {
             continue;
         }
-        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        if !sys::terminate(pid) {
             continue; // another user's (rootless) meshvpn
         }
         for _ in 0..50 {
@@ -2499,7 +2521,7 @@ fn stop_other_daemons() -> Vec<(i32, String)> {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if sys::alive(pid) {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            sys::kill(pid);
             std::thread::sleep(std::time::Duration::from_millis(300));
         }
         stopped.push((pid, args.join(" ")));
@@ -2688,13 +2710,7 @@ fn install_background(dir: &Path, bin: &Path, log: &Path) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out);
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        c.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    sys::detach(&mut c);
     c.spawn().context("starting meshvpn")?;
     let mut running = false;
     for _ in 0..30 {

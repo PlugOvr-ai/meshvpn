@@ -105,7 +105,7 @@ impl Job {
         let mut job: Job =
             serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("job {id} not found"))?)?;
         // A launcher that died without saying so.
-        if job.state == "running" && unsafe { libc::kill(job.pid as i32, 0) } != 0 {
+        if job.state == "running" && !crate::sys::alive(job.pid as i32) {
             job.state = "lost".into();
         }
         Ok(job)
@@ -321,6 +321,7 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
             libc::SIGTERM,
             on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
+        #[cfg(unix)]
         libc::signal(
             libc::SIGHUP,
             on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
@@ -337,6 +338,7 @@ pub fn run(dir: &Path, opts: &Opts, job_dir: Option<PathBuf>, quiet: bool) -> Re
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // If the launcher dies (even kill -9), its ssh connections close and the watchers on
         // the nodes stop the job.
+        #[cfg(unix)]
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
@@ -485,13 +487,7 @@ pub fn detach(dir: &Path, args: &[String]) -> Result<Job> {
         .stdin(Stdio::null())
         .stdout(launcher_log.try_clone()?)
         .stderr(launcher_log);
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
-            libc::setsid(); // survive the terminal / agent session that started it
-            Ok(())
-        });
-    }
+    crate::sys::detach(&mut cmd); // survive the terminal / agent session that started it
     let child = cmd.spawn()?;
     // Wait until the launcher has written the job (or failed while preparing).
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -503,7 +499,7 @@ pub fn detach(dir: &Path, args: &[String]) -> Result<Job> {
                 job_dir.join("launcher.log").display()
             );
         }
-        if unsafe { libc::kill(child.id() as i32, 0) } != 0 {
+        if !crate::sys::alive(child.id() as i32) {
             let log = std::fs::read_to_string(job_dir.join("launcher.log")).unwrap_or_default();
             let _ = std::fs::remove_dir_all(&job_dir);
             bail!("{}", log.trim().trim_start_matches("error: "));
@@ -518,7 +514,7 @@ pub fn stop(id: &str) -> Result<Job> {
     if job.state != "running" {
         bail!("job {id} is not running ({})", job.state);
     }
-    unsafe { libc::kill(job.pid as i32, libc::SIGTERM) };
+    crate::sys::terminate(job.pid as i32);
     for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(100));
         let j = Job::load(id)?;
