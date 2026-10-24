@@ -51,13 +51,15 @@ the machine from the mesh, as from any new network; to offer a service to the ot
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | Mesh, names (`<node>.mesh`), status, `connect` | ✓ | ✓ | ✓ |
-| `ssh` to nodes, `exec`, `cp`, `launch`, GPUs, `share` / `fetch` | ✓ | ✓ | ✓ |
-| Browser desktop of other nodes (`meshvpn desktop <node>`) | ✓ | ✓ | ✓ |
-| Service at boot | systemd | launchd | Task Scheduler |
 | Userspace mode (no network interface) | ✓ | ✓ | ✓ |
-| Logins *into* this machine (sshd integration, built-in SSH server) | ✓ | sshd | – |
-| Desktop sessions *on* this machine | ✓ | – | – |
-| Exit nodes, terminal console, rootless install | ✓ | – | – |
+| Service at boot | systemd | launchd | Task Scheduler |
+| SSH logins *into* this machine | ✓ | ✓ (its sshd) | – |
+| `ssh`, `exec`, `cp`, `launch`, GPUs, `share` / `fetch` from this machine | ✓ | ✓ ¹ | ✓ ¹ |
+| Browser desktop of other nodes (`meshvpn desktop <node>`) | ✓ | ✓ ¹ | ✓ ¹ |
+| Desktop sessions *on* this machine, exit nodes, terminal console, rootless install | ✓ | – | – |
+
+¹ Built and type-checked for the platform; the first rows are tested on real Macs and Windows machines in CI, these
+not yet end to end.
 
 **Behind a proxy**, the installer uses it automatically. `sudo` drops your environment, so besides `https_proxy` /
 `http_proxy` it also checks `/etc/environment`, `/etc/profile.d`, apt's and dnf/yum's proxy settings and the GNOME proxy
