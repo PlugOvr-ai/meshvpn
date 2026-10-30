@@ -52,6 +52,21 @@ struct App {
 }
 
 /// Accounts people log in with: root and regular users with a real shell.
+#[cfg(not(target_os = "linux"))]
+fn local_accounts() -> Vec<String> {
+    // macOS keeps people's accounts in Directory Services, not in /etc/passwd.
+    let mut users: Vec<String> = crate::sys::login_users()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|n| n != "root" && crate::proto::valid_user(n))
+        .collect();
+    users.sort();
+    users.push("root".into());
+    users
+}
+
+/// Accounts people log in with: root and regular users with a real shell.
+#[cfg(target_os = "linux")]
 fn local_accounts() -> Vec<String> {
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
     let mut users = vec![];
