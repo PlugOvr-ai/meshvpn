@@ -22,7 +22,10 @@ fn sshd_binary() -> Result<PathBuf> {
 
 /// sshd only runs a root-owned command that nobody else can modify.
 fn trusted_exe() -> Result<PathBuf> {
+    // The real file, not a link to it (macOS: /usr/local/bin/meshvpn -> /opt/meshvpn/bin/meshvpn,
+    // and /usr/local/bin may belong to the user).
     let exe = crate::update::current_exe()?;
+    let exe = exe.canonicalize().unwrap_or(exe);
     let mut p = exe.as_path();
     loop {
         let m = std::fs::metadata(p)?;
