@@ -177,6 +177,9 @@ struct State {
     /// First 8 bytes of node ids, for the compact UDP data format.
     id_prefix: HashMap<[u8; 8], NodeId>,
     my_udp: Vec<String>,
+    my_udp6: Vec<String>,
+    /// Our public IPv4 address as other nodes outside our networks see it (for the NAT check).
+    udp_seen: HashMap<NodeId, (SocketAddr, Instant)>,
     /// Managed networks (see node/admin.rs).
     roster: Option<(SignedDoc, Roster)>,
     claims: HashMap<NodeId, admin::Admitted>,
@@ -204,6 +207,8 @@ pub struct Node {
     pub shares: crate::share::Store,
     /// Direct UDP paths (None: disabled, or no way out over UDP).
     udp: Option<Arc<tokio::net::UdpSocket>>,
+    /// The IPv6 socket (same port; no NAT on the way, so direct paths through most firewalls).
+    udp6: Option<Arc<tokio::net::UdpSocket>>,
     /// The built-in SSH server (see sshserver.rs).
     ssh_cfg: Arc<russh::server::Config>,
     /// Kernel mode: the built-in SSH server listens on the mesh address.
@@ -292,6 +297,15 @@ pub struct Status {
     /// Internet traffic goes through this node.
     #[serde(default)]
     pub exit_via: Option<String>,
+    /// This node's IPv4 NAT as other nodes see it (None: no direct UDP paths).
+    #[serde(default)]
+    pub nat: Option<String>,
+    /// The NAT changes ports per destination: direct IPv4 paths through it don't work.
+    #[serde(default)]
+    pub nat_hard: bool,
+    /// IPv6 addresses for direct paths.
+    #[serde(default)]
+    pub ipv6: Vec<String>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -392,6 +406,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         started: Instant::now(),
         socks,
         shares: crate::share::Store::load(&dir),
+        udp6: udp::bind6(udp.as_ref()).await,
         udp,
         ssh_cfg: crate::sshserver::config(&ident_for_ssh),
         ssh_listening: std::sync::atomic::AtomicBool::new(false),
@@ -523,7 +538,9 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     tokio::spawn(node.clone().inventory_loop());
     tokio::spawn(crate::share::serve(node.clone()));
     if node.udp.is_some() {
-        tokio::spawn(node.clone().udp_loop());
+        for sock in node.udp.iter().chain(node.udp6.iter()) {
+            tokio::spawn(node.clone().udp_loop(sock.clone()));
+        }
         let n = node.clone();
         tokio::spawn(async move {
             loop {
@@ -625,6 +642,7 @@ impl Node {
         neighbors.sort();
         st.my_endpoints = self.endpoints(st);
         st.my_udp = self.udp_candidates(st);
+        st.my_udp6 = self.udp6_candidates();
         st.my_seq = now_ms().max(st.my_seq + 1);
         let info = NodeInfo {
             id: self.ident.id,
@@ -652,6 +670,7 @@ impl Node {
             },
             objects: st.objects_ad.clone(),
             udp: st.my_udp.clone(),
+            udp6: st.my_udp6.clone(),
             leases: st.leases.clone(),
             ssh_host_key: st.my_ssh_host_key.clone(),
             login_user: st
@@ -1614,7 +1633,7 @@ impl Node {
         match self.outgoing(dst_ip, pkt) {
             // Drop on congestion, like a real network.
             Some(Outgoing::Udp(addr, datagrams)) => {
-                if let Some(sock) = &self.udp {
+                if let Some(sock) = self.udp_socket(&addr) {
                     for d in datagrams {
                         let _ = sock.try_send_to(&d, addr);
                     }
@@ -1631,7 +1650,7 @@ impl Node {
     async fn send_packet_waiting(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
         match self.outgoing(dst_ip, pkt) {
             Some(Outgoing::Udp(addr, datagrams)) => {
-                if let Some(sock) = &self.udp {
+                if let Some(sock) = self.udp_socket(&addr) {
                     for d in datagrams {
                         let _ = sock.send_to(&d, addr).await;
                     }
@@ -2236,6 +2255,7 @@ impl Node {
                 if last_announce.elapsed() >= REANNOUNCE
                     || self.endpoints(&st) != st.my_endpoints
                     || self.udp_candidates(&st) != st.my_udp
+                    || self.udp6_candidates() != st.my_udp6
                 {
                     self.announce(&mut st);
                     last_announce = Instant::now();
@@ -2433,6 +2453,7 @@ impl Node {
             })
             .collect();
         peers.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
+        let (nat, ipv6) = self.nat_report(&st);
         Status {
             name: st.my_name.clone(),
             network: self.cfg.network.clone(),
@@ -2483,6 +2504,9 @@ impl Node {
             },
             exit_offer: st.exit_offer,
             exit_via: self.exit_status(&st).0,
+            nat: nat.as_ref().map(|n| n.describe()),
+            nat_hard: nat == Some(udp::NatKind::ChangesPort),
+            ipv6,
             version: crate::update::CURRENT.into(),
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),

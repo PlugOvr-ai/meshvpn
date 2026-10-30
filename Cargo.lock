@@ -1989,6 +1989,7 @@ dependencies = [
  "sha2 0.11.0",
  "smoltcp",
  "snow",
+ "socket2",
  "tar",
  "tokio",
  "toml",

@@ -427,3 +427,42 @@ pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
         .map(|e| (e.file_name().to_string_lossy().to_lowercase(), e.path()))
         .collect()
 }
+
+/// Global IPv6 addresses of this machine (2000::/3: not link-local, not ULA).
+pub fn global_ipv6() -> Vec<std::net::Ipv6Addr> {
+    let global = |ip: &std::net::Ipv6Addr| ip.segments()[0] & 0xe000 == 0x2000;
+    #[cfg(unix)]
+    {
+        let mut out = vec![];
+        let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+            return out;
+        }
+        let mut cur = addrs;
+        while !cur.is_null() {
+            let ifa = unsafe { &*cur };
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() || unsafe { (*ifa.ifa_addr).sa_family } as i32 != libc::AF_INET6 {
+                continue;
+            }
+            let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            if global(&ip) && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        unsafe { libc::freeifaddrs(addrs) };
+        out
+    }
+    #[cfg(windows)]
+    {
+        if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|i| match i.addr {
+                if_addrs::IfAddr::V6(a) if global(&a.ip) => Some(a.ip),
+                _ => None,
+            })
+            .collect()
+    }
+}

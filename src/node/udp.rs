@@ -9,7 +9,13 @@
 //!
 //! Datagrams:
 //!   probe  A1 | src id 32 | dst id 32 | timestamp 8 | nonce 8 | mac 16
-//!   ack    A2 | src id 32 | dst id 32 | timestamp 8 | nonce 8 | seen-as ip 4 + port 2 | mac 16
+//!   ack    A2 | src id 32 | dst id 32 | timestamp 8 | nonce 8 | seen-as ip 4/16 + port 2 | mac 16
+//!
+//! IPv6: a second socket on the same port. There is no NAT on the way, only stateful firewalls
+//! (home routers, mobile networks) that let answers in - and probes sent at the same time from
+//! both sides are answers for each other. So two nodes behind NATs that change ports per
+//! destination (mobile networks, CGNAT), where IPv4 hole punching fails, usually get a direct
+//! path over IPv6.
 //!   data   A3 | src id prefix 8 | nonce 24 | XChaCha20-Poly1305(packet)   (49 bytes overhead)
 //!   frag   A4 | src id prefix 8 | message 4 | index 1 | count 1 | part of a data datagram
 //!
@@ -20,7 +26,6 @@
 //! split into parts that fit any path (only towards nodes that can put them together).
 
 use super::*;
-use std::net::SocketAddrV4;
 use tokio::net::UdpSocket;
 
 const PROBE: u8 = 0xA1;
@@ -120,6 +125,48 @@ impl Node {
         out
     }
 
+    /// Our IPv6 candidates: the global addresses of this machine (no NAT to see through).
+    pub(super) fn udp6_candidates(&self) -> Vec<String> {
+        let Some(port) = self.udp6.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) else {
+            return vec![];
+        };
+        crate::sys::global_ipv6()
+            .into_iter()
+            .take(4)
+            .map(|ip| SocketAddr::new(IpAddr::V6(ip), port).to_string())
+            .collect()
+    }
+
+    /// Our NAT as other nodes see it (None without UDP), and our IPv6 candidates.
+    pub(super) fn nat_report(&self, st: &State) -> (Option<NatKind>, Vec<String>) {
+        let Some(port) = self.udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) else {
+            return (None, vec![]);
+        };
+        let observed: Vec<SocketAddr> = st
+            .udp_seen
+            .values()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(600))
+            .map(|(a, _)| *a)
+            .collect();
+        let local: Vec<Ipv4Addr> = crate::sys::ipv4_interfaces().into_iter().map(|(_, ip, _)| ip).collect();
+        (Some(nat_kind(&observed, &local, port)), st.my_udp6.clone())
+    }
+
+    /// The socket for sending to `addr`.
+    pub(super) fn udp_socket(&self, addr: &SocketAddr) -> Option<&Arc<UdpSocket>> {
+        if addr.is_ipv4() {
+            self.udp.as_ref()
+        } else {
+            self.udp6.as_ref()
+        }
+    }
+
+    fn udp_send(&self, d: &[u8], addr: SocketAddr) {
+        if let Some(sock) = self.udp_socket(&addr) {
+            let _ = sock.try_send_to(d, addr);
+        }
+    }
+
     /// The peer's candidates, plus the hosts of its TCP endpoints on its UDP port (servers
     /// behind 1:1 NAT know only their private address).
     fn peer_candidates(info: &NodeInfo) -> Vec<SocketAddr> {
@@ -138,6 +185,7 @@ impl Node {
                 }
             }
         }
+        out.extend(info.udp6.iter().filter_map(|c| c.parse::<SocketAddr>().ok()));
         out.retain(|a| !is_overlay(a.ip()) && !a.ip().is_unspecified());
         out.sort();
         out.dedup();
@@ -150,7 +198,7 @@ impl Node {
         dst: &NodeId,
         ts: u64,
         nonce: u64,
-        seen: Option<SocketAddrV4>,
+        seen: Option<SocketAddr>,
         key: &[u8; 32],
     ) -> Vec<u8> {
         self.padded_datagram(kind, dst, ts, nonce, seen, key, 0)
@@ -164,7 +212,7 @@ impl Node {
         dst: &NodeId,
         ts: u64,
         nonce: u64,
-        seen: Option<SocketAddrV4>,
+        seen: Option<SocketAddr>,
         key: &[u8; 32],
         size: usize,
     ) -> Vec<u8> {
@@ -174,8 +222,12 @@ impl Node {
         d.extend_from_slice(&dst.0);
         d.extend_from_slice(&ts.to_be_bytes());
         d.extend_from_slice(&nonce.to_be_bytes());
+        match seen {
+            Some(SocketAddr::V4(s)) => d.extend_from_slice(&s.ip().octets()),
+            Some(SocketAddr::V6(s)) => d.extend_from_slice(&s.ip().octets()),
+            None => {}
+        }
         if let Some(s) = seen {
-            d.extend_from_slice(&s.ip().octets());
             d.extend_from_slice(&s.port().to_be_bytes());
         }
         if size > d.len() + 16 {
@@ -188,7 +240,9 @@ impl Node {
 
     /// Sends probes: keepalives on live paths, punching attempts towards the others.
     pub(super) fn udp_probe_round(&self) {
-        let Some(sock) = &self.udp else { return };
+        if self.udp.is_none() {
+            return;
+        }
         let mut st = self.state.lock().unwrap();
         let now = Instant::now();
         st.udp_paths.retain(|_, p| p.last_rx.elapsed() < PATH_TIMEOUT);
@@ -228,7 +282,7 @@ impl Node {
                     p.big_next = now + BIG_RECHECK;
                     let size = self.cfg.mtu as usize + 49;
                     let d = self.padded_datagram(PROBE, &peer, now_ms(), nonce, None, &key, size);
-                    let _ = sock.try_send_to(&d, p.addr);
+                    self.udp_send(&d, p.addr);
                 }
             }
             let targets: Vec<SocketAddr> = match st.udp_paths.get(&peer) {
@@ -256,7 +310,7 @@ impl Node {
             debug!("udp: probing {peer} at {targets:?}");
             let d = self.probe_datagram(PROBE, &peer, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
             for t in targets {
-                let _ = sock.try_send_to(&d, t);
+                self.udp_send(&d, t);
             }
         }
     }
@@ -268,7 +322,7 @@ impl Node {
         cipher: &XChaCha20Poly1305,
         pkt: &[u8],
     ) -> Option<(SocketAddr, Vec<Vec<u8>>)> {
-        let sock = self.udp.as_ref()?;
+        self.udp.as_ref()?;
         let addr = {
             let mut st = self.state.lock().unwrap();
             let key = self.probe_key(&mut st, dst);
@@ -283,7 +337,7 @@ impl Node {
                 p.unanswered += 1;
                 let addr = p.addr;
                 let probe = self.probe_datagram(PROBE, dst, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
-                let _ = sock.try_send_to(&probe, addr);
+                self.udp_send(&probe, addr);
             }
             (p.addr, p.splitting())
         };
@@ -354,8 +408,7 @@ impl Node {
         Some(r.parts.into_iter().flatten().flatten().collect())
     }
 
-    pub(super) async fn udp_loop(self: Arc<Self>) {
-        let Some(sock) = self.udp.clone() else { return };
+    pub(super) async fn udp_loop(self: Arc<Self>, sock: Arc<UdpSocket>) {
         let mut buf = vec![0u8; 65536];
         loop {
             let Ok((n, from)) = sock.recv_from(&mut buf).await else {
@@ -385,9 +438,9 @@ impl Node {
 
     fn udp_control(&self, sock: &UdpSocket, d: &[u8], from: SocketAddr) {
         let ack = d[0] == ACK;
-        // Probes may be padded (full-size checks); acks never are.
-        let len = if ack { 103 } else { 97 };
-        if d.len() < len || (ack && d.len() != len) || d.len() > 2048 {
+        // Probes may be padded (full-size checks); acks never are (103 bytes, 115 with an
+        // IPv6 address).
+        if (ack && d.len() != 103 && d.len() != 115) || d.len() < 97 || d.len() > 2048 {
             return;
         }
         let len = d.len();
@@ -409,11 +462,7 @@ impl Node {
         if !ack {
             // The MAC proves the sender. The timestamp is only echoed back for the RTT, so
             // clocks that differ between machines don't matter.
-            let seen = match from {
-                SocketAddr::V4(v4) => Some(v4),
-                _ => None,
-            };
-            let reply = self.probe_datagram(ACK, &src, ts, nonce, seen, &key);
+            let reply = self.probe_datagram(ACK, &src, ts, nonce, Some(from), &key);
             let _ = sock.try_send_to(&reply, from);
             // Answer with a probe of our own right away: this opens our NAT towards them.
             if !st.udp_paths.contains_key(&src) {
@@ -435,10 +484,25 @@ impl Node {
             return;
         }
         let rtt = Duration::from_millis(now_ms().saturating_sub(ts));
-        let seen = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(d[81], d[82], d[83], d[84])),
-            u16::from_be_bytes([d[85], d[86]]),
-        );
+        let seen = if len == 115 {
+            let ip: [u8; 16] = d[81..97].try_into().unwrap();
+            SocketAddr::new(IpAddr::V6(ip.into()), u16::from_be_bytes([d[97], d[98]]))
+        } else {
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(d[81], d[82], d[83], d[84])),
+                u16::from_be_bytes([d[85], d[86]]),
+            )
+        };
+        // Which way a peer answered first doesn't matter: keep the best working one (several
+        // candidates answer while probing), so the path doesn't flip with every probe round.
+        if let Some(p) = st.udp_paths.get_mut(&src)
+            && p.addr != from
+            && p.last_rx.elapsed() < KEEPALIVE
+            && path_rank(&p.addr) <= path_rank(&from)
+        {
+            p.last_rx = Instant::now();
+            return;
+        }
         let fresh = !st.udp_paths.contains_key(&src);
         let frags = st
             .records
@@ -469,10 +533,18 @@ impl Node {
             let name = st.records.get(&src).map(|r| r.info.name.clone()).unwrap_or_default();
             info!("direct UDP path to {name} ({src}) via {from}");
         }
+        let SocketAddr::V4(_) = seen else { return }; // IPv6: no NAT, nothing to learn
+        // How a node outside our networks sees us: for the NAT check.
+        let lans = crate::net::local_lans();
+        let peer_outside = match from.ip() {
+            IpAddr::V4(f) => !lans.iter().any(|(_, ip, p)| crate::net::same_subnet(*ip, *p, f)),
+            _ => false,
+        };
+        if peer_outside {
+            st.udp_seen.insert(src, (seen, Instant::now()));
+        }
         // Remember how the world sees us (our public address behind NAT).
-        let local = crate::net::local_lans()
-            .iter()
-            .any(|(_, ip, _)| IpAddr::V4(*ip) == seen.ip());
+        let local = lans.iter().any(|(_, ip, _)| IpAddr::V4(*ip) == seen.ip());
         if !local && !is_overlay(seen.ip()) && !st.udp_reflexive.contains(&seen) {
             st.udp_reflexive.insert(0, seen);
             st.udp_reflexive.truncate(2);
@@ -505,6 +577,90 @@ impl Node {
     }
 }
 
+/// What other nodes tell about our IPv4 NAT: `observed` = our address as seen by nodes
+/// outside our networks, `local` = our own addresses, `port` = our UDP port.
+pub(crate) fn nat_kind(observed: &[SocketAddr], local: &[Ipv4Addr], port: u16) -> NatKind {
+    let Some(first) = observed.first() else {
+        return NatKind::Unknown;
+    };
+    if observed
+        .iter()
+        .all(|a| matches!(a.ip(), IpAddr::V4(ip) if local.contains(&ip)))
+    {
+        return NatKind::Public;
+    }
+    if observed.len() < 2 {
+        return NatKind::OneObservation;
+    }
+    if observed.iter().all(|a| a.port() == first.port()) {
+        NatKind::KeepsPort {
+            preserved: first.port() == port,
+        }
+    } else {
+        NatKind::ChangesPort
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum NatKind {
+    /// No node outside our networks has answered yet.
+    Unknown,
+    /// Our own address is public.
+    Public,
+    OneObservation,
+    /// The same public port for every destination: hole punching works.
+    KeepsPort {
+        preserved: bool,
+    },
+    /// A new port per destination (mobile networks, CGNAT): IPv4 hole punching fails.
+    ChangesPort,
+}
+
+impl NatKind {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            NatKind::Unknown => "not known yet (no direct path to a node outside this network so far)".into(),
+            NatKind::Public => "public address (no NAT) - other nodes can reach this one directly".into(),
+            NatKind::OneObservation => "behind NAT (one observation so far)".into(),
+            NatKind::KeepsPort { .. } => {
+                "behind NAT that keeps one port for every destination - direct paths through NAT work".into()
+            }
+            NatKind::ChangesPort => "behind NAT that changes the port per destination (typical for mobile \
+                                     networks) - direct IPv4 paths only to nodes that are reachable from outside"
+                .into(),
+        }
+    }
+}
+
+/// Which path to keep when several work: the LAN, then IPv6, then IPv4 through NATs.
+fn path_rank(a: &SocketAddr) -> u8 {
+    match a.ip() {
+        IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => 0,
+        IpAddr::V6(_) => 1,
+        IpAddr::V4(_) => 2,
+    }
+}
+
+/// The IPv6 socket, on the IPv4 socket's port (IPv6 only, so the two don't collide).
+/// Opened even without an IPv6 address yet: notebooks change networks.
+pub(super) async fn bind6(v4: Option<&Arc<UdpSocket>>) -> Option<Arc<UdpSocket>> {
+    let port = v4?.local_addr().ok()?.port();
+    let s = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .ok()?;
+    s.set_only_v6(true).ok()?;
+    s.set_nonblocking(true).ok()?;
+    let addr = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), port);
+    if s.bind(&addr.into()).is_err() && s.bind(&SocketAddr::new(addr.ip(), 0).into()).is_err() {
+        return None;
+    }
+    super::exit::mark(&s);
+    UdpSocket::from_std(s.into()).ok().map(Arc::new)
+}
+
 /// The UDP socket: the listen port if free, a random one otherwise.
 pub(super) async fn bind(cfg: &Config) -> Option<Arc<UdpSocket>> {
     if !cfg.udp || cfg.no_outbound || cfg.effective_socks().is_some() {
@@ -524,6 +680,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nat_kinds() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let local = ["192.168.1.5".parse().unwrap()];
+        assert_eq!(nat_kind(&[], &local, 7870), NatKind::Unknown);
+        assert_eq!(nat_kind(&[a("192.168.1.5:7870")], &local, 7870), NatKind::Public);
+        assert_eq!(nat_kind(&[a("80.1.2.3:7870")], &local, 7870), NatKind::OneObservation);
+        assert_eq!(
+            nat_kind(&[a("80.1.2.3:7870"), a("80.1.2.3:7870")], &local, 7870),
+            NatKind::KeepsPort { preserved: true }
+        );
+        assert_eq!(
+            nat_kind(&[a("80.1.2.3:40001"), a("80.1.2.3:51234")], &local, 7870),
+            NatKind::ChangesPort
+        );
+        assert!(path_rank(&a("192.168.1.9:7870")) < path_rank(&a("[2001:db8::1]:7870")));
+        assert!(path_rank(&a("[2001:db8::1]:7870")) < path_rank(&a("80.1.2.3:7870")));
+    }
+
+    #[test]
     fn candidates_include_port_guesses() {
         let info = NodeInfo {
             id: crate::keys::Key32([1; 32]),
@@ -540,6 +715,7 @@ mod tests {
             lan: vec![],
             perf: vec![],
             udp: vec!["192.168.10.3:7870".into(), "198.51.100.2:18972".into()],
+            udp6: vec![],
             measured: 0,
             objects: vec![],
             leases: vec![],

@@ -132,10 +132,10 @@ class Lab:
         self.prefix = f"e2e-{test.replace('_', '')}-{''.join(random.choices(string.ascii_lowercase, k=4))}"
         self.containers, self.networks = [], []
 
-    def network(self, name, internal=False, subnet=None):
+    def network(self, name, internal=False, subnet=None, ipv6_only=False):
         full = f"{self.prefix}-{name}"
         args = ["docker", "network", "create"] + (["--internal"] if internal else []) + \
-            (["--subnet", subnet] if subnet else []) + [full]
+            (["--subnet", subnet] if subnet else []) + (["--ipv6", "--ipv4=false"] if ipv6_only else []) + [full]
         run(args)
         self.networks.append(full)
         return full
@@ -624,6 +624,65 @@ def test_exit_routed(lab):
     wait(lambda: gw.online("client") and client.online("gw"), "link comes back with the exit active", 60)
     check("hello-web" in client.sh(f"curl -s -m5 {web_url}", ok=False).stdout, "internet through the exit after restart")
     check(ping(client, "gw.mesh"), "mesh after restart")
+
+
+@test
+def test_nat_ipv6(lab):
+    """Behind a NAT that changes ports (mobile networks), IPv4 hole punching fails - IPv6 through firewalls works; the NAT check tells them apart."""
+    pub = lab.network("pub", subnet="198.51.101.0/24")
+    v6 = lab.network("v6", ipv6_only=True, subnet="2001:db8:77::/64")
+    hub = lab.node("hub", [pub], ip="198.51.101.10")
+    hub2 = lab.node("hub2", [pub], ip="198.51.101.11")
+    clients = {}
+    for x, hard in (("A", True), ("B", False)):
+        lan = lab.network(f"lan{x}", internal=True)
+        r = lab.node(f"nat{x}", [pub, lan], caps=False, net_admin=True,
+                     sysctls=["net.ipv4.ip_forward=1"], install=False)
+        out_if = r.sh("ip -o -4 addr | awk '/198.51.101/ {print $2}'").strip()
+        pub_ip = r.net_ip(pub)
+        # A: a new random port for every destination (like a mobile network); B: one port kept.
+        nat = (f"iptables -t nat -A POSTROUTING -o {out_if} -j MASQUERADE --random-fully" if hard else
+               f"iptables -t nat -A POSTROUTING -o {out_if} -p udp --sport 7870 -j SNAT --to-source {pub_ip}:7870\n"
+               f"iptables -t nat -A POSTROUTING -o {out_if} -j MASQUERADE")
+        r.sh(f"""
+            {nat}
+            iptables -A INPUT -i {out_if} -m conntrack --ctstate NEW,INVALID -j DROP
+        """)
+        c = lab.node(f"client{x.lower()}", [lan, v6])
+        c.sh(f"ip route add default via {r.net_ip(lan)}")
+        # IPv6 without NAT, behind a stateful firewall like a home router's: only answers get in.
+        c.sh("""
+            ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+            ip6tables -A INPUT -i lo -j ACCEPT
+            ip6tables -A INPUT -j DROP
+        """)
+        clients[x] = c
+    hub.mv("init --name hub --endpoint 198.51.101.10:7870")
+    hub.up()
+    hub2.mv(f"join {invite(hub)} --name hub2 --endpoint 198.51.101.11:7870")
+    hub2.up()
+    for c in clients.values():
+        c.mv(f"join {invite(hub)} --name {c.name}")
+        c.up()
+    a, b = clients["A"], clients["B"]
+    wait(lambda: a.online("clientb") and a.online("hub2"), "everyone online", timeout=60)
+    wait(lambda: "[2001:db8:77:" in (a.peer("clientb") or {}).get("path", ""), "direct path over IPv6", timeout=90)
+    check(ping(a, b.ip(), 3), "ping over the IPv6 path")
+    wait(lambda: a.status().get("nat_hard"), "A's NAT recognised as changing ports", timeout=60)
+    sa = a.status()
+    check(sa["ipv6"] and "2001:db8:77:" in sa["ipv6"][0], f"A's IPv6 address: {sa['ipv6']}")
+    wait(lambda: "keeps one port" in (b.status().get("nat") or ""), "B's NAT recognised as keeping ports", timeout=60)
+    check(not b.status().get("nat_hard"), "B is not hard")
+    d = json.loads(a.mv("--json doctor", ok=False).stdout)
+    nat = [x for x in d if x["name"] == "nat"]
+    check(nat and nat[0]["level"] == "info", f"doctor's NAT check with IPv6 around: {nat}")
+    # Without IPv6 the port-changing NAT leaves only the relay: IPv4 hole punching can't get through.
+    a.sh("ip6tables -I OUTPUT -p udp -j DROP")
+    a.sh(f"ping -c 300 -i 0.2 {b.ip()} >/dev/null 2>&1 &")
+    wait(lambda: "relay" in (a.peer("clientb") or {}).get("path", ""), "falls back to the relay", timeout=60)
+    time.sleep(20)
+    check("relay" in (a.peer("clientb") or {}).get("path", ""), "no direct IPv4 path through the hard NAT")
 
 
 @test

@@ -337,7 +337,7 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             "udp",
             Level::Warn,
             "no direct UDP path to any node: traffic goes over TCP or relays (slower)",
-            Some("allow UDP 7870 in front of public nodes; behind a 'hard' NAT that rewrites ports per destination it stays relayed"),
+            Some("allow UDP 7870 in front of public nodes, or forward it on the router of a node you talk to"),
         ));
     } else if !online.is_empty() {
         c.push(check(
@@ -346,6 +346,26 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             format!("direct UDP paths to {udp} of {} online nodes", online.len()),
             None,
         ));
+    }
+    if !udp_off && let Some(nat) = &st.nat {
+        let v6 = if st.ipv6.is_empty() {
+            "no IPv6".to_string()
+        } else {
+            format!("IPv6 {}", st.ipv6.join(", "))
+        };
+        if st.nat_hard && st.ipv6.is_empty() {
+            c.push(check(
+                "nat",
+                Level::Warn,
+                format!("{nat}; {v6}"),
+                Some(
+                    "direct paths need IPv6 or a node reachable from outside: forward UDP 7870 on the router of a \
+                     node you talk to (e.g. a home router to the desktop) - other traffic is relayed",
+                ),
+            ));
+        } else {
+            c.push(check("nat", Level::Info, format!("{nat}; {v6}"), None));
+        }
     }
     if st.endpoints.is_empty() && st.socks.is_none() {
         c.push(check(

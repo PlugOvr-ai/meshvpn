@@ -142,6 +142,9 @@ pub struct NodeInfo {
     /// UDP address candidates (`ip:port`) for direct paths through NATs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub udp: Vec<String>,
+    /// IPv6 candidates (`[ip]:port`), separate so that nodes from before IPv6 accept the record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp6: Vec<String>,
     /// When this node last finished a requested measurement (ms since epoch).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub measured: u64,
@@ -361,6 +364,9 @@ impl SignedInfo {
         if info.udp.len() > 8 || info.udp.iter().any(|a| a.parse::<std::net::SocketAddrV4>().is_err()) {
             bail!("invalid udp candidates");
         }
+        if info.udp6.len() > 4 || info.udp6.iter().any(|a| a.parse::<std::net::SocketAddrV6>().is_err()) {
+            bail!("invalid udp6 candidates");
+        }
         if info.lan.len() > 16 || info.lan.iter().any(|l| crate::net::parse_cidr(l).is_none()) {
             bail!("invalid lan");
         }
@@ -520,6 +526,7 @@ mod tests {
             lan: vec![],
             perf: vec![],
             udp: vec![],
+            udp6: vec![],
             measured: 0,
             objects: vec![],
             leases: vec![],

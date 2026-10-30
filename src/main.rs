@@ -2298,6 +2298,17 @@ fn print_status(st: &node::Status) {
     if st.exit_offer {
         println!("  exit node:    offers its internet connection to the network");
     }
+    if let Some(nat) = &st.nat {
+        println!("  NAT (IPv4):   {nat}");
+        if st.ipv6.is_empty() {
+            println!("  IPv6:         none on this network");
+        } else {
+            println!(
+                "  IPv6:         {} (direct paths through firewalls)",
+                st.ipv6.join(", ")
+            );
+        }
+    }
     println!();
     if st.peers.is_empty() {
         println!("No other nodes known yet.");
