@@ -54,7 +54,8 @@ the machine from the mesh, as from any new network; to offer a service to the ot
 | Userspace mode (no network interface) | ✓ | ✓ | ✓ |
 | Service at boot | systemd | launchd | Task Scheduler |
 | SSH logins *into* this machine | ✓ | ✓ (its sshd) | – |
-| `ssh`, `exec`, `cp`, `launch`, GPUs, `share` / `fetch` from this machine | ✓ | ✓ ¹ | ✓ ¹ |
+| `ssh`, `exec`, `cp` with other nodes | ✓ | ✓ | ✓ ¹ |
+| `launch`, GPUs, `share` / `fetch` | ✓ | ✓ ¹ | ✓ ¹ |
 | Browser desktop of other nodes (`meshvpn desktop <node>`) | ✓ | ✓ ¹ | ✓ ¹ |
 | Desktop sessions *on* this machine, exit nodes, terminal console, rootless install | ✓ | – | – |
 
