@@ -1420,11 +1420,14 @@ fn real_main(cli: Cli) -> Result<i32> {
                 }
                 SshCmd::Allow { who, users } => {
                     require_owner()?;
-                    if sshd::enable_if_installed()? {
-                        println!(
+                    // The rule is saved either way; sshd may only be ready later.
+                    match sshd::enable_if_installed() {
+                        Ok(true) => println!(
                             "Enabled password-less logins from mesh nodes in sshd ({}).",
                             sshd::DROPIN
-                        );
+                        ),
+                        Ok(false) => {}
+                        Err(e) => println!("note: logins through sshd are not active yet: {e:#}"),
                     }
                     control::Request::SshAllow { who, users }
                 }

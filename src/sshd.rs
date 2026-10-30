@@ -75,7 +75,22 @@ pub fn enable_if_installed() -> Result<bool> {
     enable()
 }
 
+/// macOS: sshd only has host keys (and only runs) once Remote Login was switched on.
+fn remote_login_off() -> bool {
+    cfg!(target_os = "macos")
+        && !["ed25519", "ecdsa", "rsa"]
+            .iter()
+            .any(|t| Path::new(&format!("/etc/ssh/ssh_host_{t}_key")).exists())
+}
+
 pub fn enable() -> Result<bool> {
+    if remote_login_off() {
+        bail!(
+            "Remote Login is off on this Mac - switch it on in System Settings > General > Sharing > Remote Login \
+             (or: sudo systemsetup -setremotelogin on); meshvpn sets up sshd by itself when it starts next, or \
+             run the ssh allow command again"
+        );
+    }
     let sshd = sshd_binary()?;
     let exe = trusted_exe()?;
     let want = format!("{} ssh-authorized-keys %u", exe.display());
