@@ -219,7 +219,7 @@ marked `Host *.mesh` block in `~/.ssh/config`). It runs in userspace mode (above
 reach your services, you reach the mesh through `ssh user@node.mesh` or the SOCKS proxy. `meshvpn install` starts it as a
 **systemd user service** (to keep it running when you are logged out an admin can run `sudo loginctl enable-linger
 <user>`), or, where there is no systemd (containers), in the background with a `@reboot` crontab entry. `meshvpn status`,
-`rename`, `tags`, `share`, `invite`, `ssh allow`, `update` and `uninstall` work without sudo.
+`rename`, `tag`, `share`, `invite`, `ssh allow`, `update` and `uninstall` work without sudo.
 Password-less logins *into* the machine go to meshvpn's built-in SSH server (below), as your own user only. What a
 rootless install can't do: write `/etc/hosts` (names work through ssh and the proxy only). Only one rootless install per
 machine can use the default ports.

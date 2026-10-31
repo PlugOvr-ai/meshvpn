@@ -1,0 +1,92 @@
+<!--meta {"title": "Behind NAT and firewalls", "description": "How meshvpn finds direct paths through NAT, and how to connect machines that sit behind corporate firewalls, have only SSH out, or no internet at all. Plus exit nodes.", "nav": "tutorials"} -->
+<div class="wrap">
+<div class="page-hero"><p class="eyebrow">Tutorial · open source · 20 min</p><h1>Behind NAT and firewalls</h1>
+<p class="lead">Lab machines rarely sit on the open internet. This tutorial shows how meshvpn reaches nodes behind home routers, mobile networks, corporate firewalls and SSH-only jump hosts, and how to send internet traffic through another node.</p>
+<div class="meta-row"><span>You need: a network from <a href="{{root}}tutorials/first-network.html">Your first network</a></span><span>Works on: Linux; status and connect also on macOS and Windows</span></div></div>
+<div class="tut">
+  <nav class="tut-nav" aria-label="Steps"><p class="eyebrow">Steps</p>
+    <a href="#s1">1. How paths are found</a><a href="#s2">2. Read the NAT type</a><a href="#s3">3. Open UDP 7870</a>
+    <a href="#s4">4. Only SSH out</a><a href="#s5">5. Network behind a firewall</a><a href="#s6">6. No internet at all</a>
+    <a href="#s7">7. Exit nodes</a></nav>
+  <div class="prose">
+    <section class="step" id="s1"><p class="step-n">STEP 1</p><h2>How paths are found</h2>
+      <p>Nodes keep TCP links for control traffic, because TCP is what SSH tunnels and proxies can carry. For data, they try to open <strong>direct UDP paths</strong>:</p>
+      <ul>
+        <li>Each node publishes its address candidates: LAN addresses, its public address as other nodes see it, and IPv6 addresses.</li>
+        <li>Both sides send authenticated probes to each other. That opens a path through both NATs (hole punching).</li>
+        <li>Data then goes directly over UDP. The LAN is preferred, then IPv6, then IPv4 through NAT.</li>
+        <li>If a path stops answering, traffic falls back to TCP or to a relay through another node within seconds.</li>
+      </ul>
+      <p>Relays can't read or change the traffic: it is encrypted end to end between the two nodes.</p>
+    </section>
+
+    <section class="step" id="s2"><p class="step-n">STEP 2</p><h2>Read the NAT type</h2>
+      <p><code>meshvpn status</code> shows the path to each node and what kind of NAT this node is behind:</p>
+      <div class="code"><pre><span class="p">$ </span>meshvpn status
+<span class="o">● laptop  100.122.64.143  (ef5a9cd4 on mesh0, network "lab")
+  NAT (IPv4):   behind NAT that changes the port per destination (typical for mobile networks) - direct IPv4 paths only to nodes that are reachable from outside
+  IPv6:         2a02:3100:…:7c1 (direct paths through firewalls)
+
+NAME     IP               STATUS      RTT  PATH
+vps      100.94.140.208   online     12ms  direct UDP 178.77.77.96:7870
+labbox   100.92.238.33    online        -  relay via vps</span></pre></div>
+      <div class="table-wrap"><table>
+        <tr><th>NAT type</th><th>What it means</th></tr>
+        <tr><td>public address</td><td>No NAT. Other nodes reach this one directly.</td></tr>
+        <tr><td>keeps one port for every destination</td><td>Most home routers. Hole punching works.</td></tr>
+        <tr><td>changes the port per destination</td><td>Mobile networks and carrier-grade NAT. IPv4 hole punching fails; IPv6 or a node reachable from outside helps.</td></tr>
+      </table></div>
+      <p><code>sudo meshvpn doctor</code> warns when a node has a hard NAT and no IPv6, and tells you what to change.</p>
+    </section>
+
+    <section class="step" id="s3"><p class="step-n">STEP 3</p><h2>Open UDP 7870 where you can</h2>
+      <p>One node that others can reach from outside is enough to give every node a direct path to it. Forward <strong>UDP port 7870</strong> (and TCP 7870 for joining) on the router in front of a node, for example on a home router to the desktop, and allow it in cloud security groups.</p>
+      <p>Opening the port is safe in the sense that matters: a connection without the network key fails in the first handshake, before any traffic flows. Switch UDP off with <code>udp = false</code> in the configuration if you have to.</p>
+    </section>
+
+    <section class="step" id="s4"><p class="step-n">STEP 4</p><h2>The machine can only make SSH connections</h2>
+      <p>If a machine can reach some jump host over SSH, that is enough. meshvpn runs and supervises a reverse SSH tunnel and sends all its traffic through it:</p>
+      <div class="code"><span class="label">on the firewalled machine</span><pre><span class="p">$ </span>sudo meshvpn join mesh1-… --ssh user@jump.example.com --ssh-remote-port 7871</pre></div>
+      <p>The daemon runs this for you and reconnects with backoff:</p>
+      <div class="code"><pre><span class="o">ssh -N -R :7871:127.0.0.1:7870 -D 127.0.0.1:1081 user@jump.example.com</span></pre></div>
+      <ul>
+        <li><strong>Outgoing</strong>, the node reaches every other node through the SOCKS proxy of that same SSH connection. Nothing else has to be allowed.</li>
+        <li><strong>Incoming</strong>, other nodes connect to <code>jump.example.com:7871</code>. That needs <code>GatewayPorts clientspecified</code> in the jump host's <code>sshd_config</code>. Without it the node still works: it connects out, and others reach it through relays.</li>
+        <li>SSH must log in without a password as root, or pass <code>--ssh-identity /path/to/key</code>. Other options: <code>--ssh-port</code>, <code>--ssh-public-host</code>, <code>--ssh-no-socks</code>.</li>
+      </ul>
+      <div class="note"><strong>Tunnel already managed elsewhere</strong> (autossh, for example)? Join with <code>--no-outbound --endpoint jump:7871</code>, then run <code>sudo meshvpn connect jump.example.com:7871</code> on any node.</div>
+    </section>
+
+    <section class="step" id="s5"><p class="step-n">STEP 5</p><h2>A public node for a network behind a firewall</h2>
+      <p>Joining works by the new node dialing the addresses in the invite. If the network sits behind a corporate firewall, a node on the internet can't reach those addresses, but the network can reach it. Let the connection start from inside:</p>
+      <div class="code"><span class="label">on the public node</span><pre><span class="p">$ </span>sudo meshvpn join mesh1-… --name edge --endpoint 203.0.113.7:7870
+<span class="p">$ </span>sudo meshvpn up</pre></div>
+      <div class="code"><span class="label">on any node of the network</span><pre><span class="p">$ </span>sudo meshvpn connect 203.0.113.7   <span class="c"># port 7870 is the default</span></pre></div>
+      <p>The address is remembered, and gossip tells every other node about the public node. Until then, <code>meshvpn status</code> on the public node says that it can't reach the network and prints this command.</p>
+      <div class="note warn"><strong>Keep in mind:</strong> a node on the internet can reach every service the other nodes offer on the mesh. Members are trusted.</div>
+    </section>
+
+    <section class="step" id="s6"><p class="step-n">STEP 6</p><h2>Devices without internet access</h2>
+      <p>Some devices can't reach the internet at all, but you can SSH into them from a jump host, often through an existing reverse tunnel such as <code>localhost:2222</code>. Install those <strong>from the jump host</strong>. Nothing is installed on the jump host itself:</p>
+      <div class="code"><span class="label">on the jump host</span><pre><span class="p">$ </span>curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/deploy.sh \
+  | sh -s -- --invite mesh1-… user@localhost -p 2222</pre></div>
+      <p>The script downloads the right binary, uploads it, installs it with <code>sudo</code> and joins the network. The device gets its own SSH key, which the script adds to your <code>~/.ssh/authorized_keys</code> on the jump host with <code>restrict,port-forwarding,command="echo meshvpn-ok"</code>: port forwarding only, no shell. Through that connection the device reaches the other nodes and GitHub for updates.</p>
+      <p>If the script can't work out how the device reaches the jump host, pass <code>--jump user@host[:port]</code>. Run it again to update the device.</p>
+    </section>
+
+    <section class="step" id="s7"><p class="step-n">STEP 7</p><h2>Internet through another node</h2>
+      <p>One node can offer its internet connection to the others, for example to appear with an office's address or to give machines without internet a way out:</p>
+      <div class="code"><pre><span class="p">$ </span>sudo meshvpn exit offer     <span class="c"># on the node with the internet connection (kernel mode)</span>
+<span class="p">$ </span>sudo meshvpn exit use office <span class="c"># on the nodes that should use it</span>
+<span class="p">$ </span>meshvpn exit list            <span class="c"># who offers it, which one is used</span>
+<span class="p">$ </span>sudo meshvpn exit off        <span class="c"># back to direct</span></pre></div>
+      <ul>
+        <li>All internet traffic of the machine goes through the exit. LANs, Docker networks, the mesh and replies to connections from outside stay direct, so an SSH session from the internet keeps working.</li>
+        <li>The exit forwards only to public internet addresses, never into its own LAN or to cloud metadata addresses. It needs <code>iptables</code>.</li>
+        <li>While the exit node is offline there is no internet, so nothing leaks out directly. DNS keeps using the machine's resolver, and IPv6 isn't carried.</li>
+      </ul>
+    </section>
+
+    <div class="pager"><a href="{{root}}tutorials/first-network.html">← Your first network</a><a href="{{root}}tutorials/containers.html">Next: Containers, rootless and the desktop →</a></div>
+  </div>
+</div></div>

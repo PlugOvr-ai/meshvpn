@@ -1,0 +1,99 @@
+<!--meta {"title": "Distributed training across nodes", "description": "Train a PyTorch model on GPU machines in different places: select nodes by tag, copy code, reserve GPUs, launch torchrun on every node, share datasets, and let AI agents do it.", "nav": "tutorials"} -->
+<div class="wrap">
+<div class="page-hero"><p class="eyebrow">Tutorial · open source · 25 min</p><h1>Distributed training across nodes</h1>
+<p class="lead">GPU servers in the lab, a cloud machine, a workstation under a desk. meshvpn connects them, works out the rendezvous for PyTorch, starts the job on every node and stops all of them if one fails.</p>
+<div class="meta-row"><span>You need: two or more Linux nodes with Python and PyTorch</span><span>Example: <a href="https://github.com/PlugOvr-ai/meshvpn/tree/main/examples/distributed-training">examples/distributed-training</a> (GPU or CPU)</span></div></div>
+<div class="tut">
+  <nav class="tut-nav" aria-label="Steps"><p class="eyebrow">Steps</p>
+    <a href="#s1">1. Prepare the nodes</a><a href="#s2">2. Look at the group</a><a href="#s3">3. Run on many nodes</a>
+    <a href="#s4">4. Share the data</a><a href="#s5">5. Train</a><a href="#s6">6. Reserve GPUs</a>
+    <a href="#s7">7. Long runs</a><a href="#s8">8. Let an agent do it</a></nav>
+  <div class="prose">
+    <section class="step" id="s1"><p class="step-n">STEP 1</p><h2>Prepare the nodes</h2>
+      <p>Each training node needs:</p>
+      <ul>
+        <li><strong>meshvpn as root, with its network interface</strong> <code>mesh0</code>. NCCL and gloo open their own connections and need a real interface. In containers, start them with <code>--cap-add=NET_ADMIN --device /dev/net/tun</code>.</li>
+        <li><strong>A tag</strong>, so the group is easy to select.</li>
+        <li><strong>SSH logins</strong> without a password from the machine you launch on, as the same user on every node.</li>
+        <li><strong>The same Python and PyTorch versions</strong> everywhere. A virtualenv or conda environment is fine.</li>
+      </ul>
+      <div class="code"><span class="label">on each GPU node</span><pre><span class="p">$ </span>sudo meshvpn tag add gpu
+<span class="p">$ </span>sudo meshvpn ssh allow alice@laptop --as alice   <span class="c"># or join with --ssh-allow-all alice</span></pre></div>
+      <p>The machine you launch from can be any node, also one without GPUs.</p>
+    </section>
+
+    <section class="step" id="s2"><p class="step-n">STEP 2</p><h2>Look at the group</h2>
+      <p>Nodes publish their hardware themselves, so this needs no login:</p>
+      <div class="code"><pre><span class="p">$ </span>meshvpn nodes tag:gpu                  <span class="c"># online? CPUs, memory, disk, GPUs, driver, CUDA</span>
+<span class="p">$ </span>meshvpn nodes --free-gpus 4            <span class="c"># nodes with at least 4 free GPUs</span>
+<span class="p">$ </span>meshvpn gpu list tag:gpu               <span class="c"># free, busy or reserved</span>
+<span class="p">$ </span>meshvpn net matrix --measure tag:gpu   <span class="c"># latency, throughput, shared LANs</span></pre></div>
+      <div class="code"><pre><span class="o">FROM  TO          RTT          MESH  LAN PATH           AGE
+gpu1  gpu2     0.0 ms    860 Mbit/s  172.23.0.4         0s
+gpu2  gpu1     1.0 ms    863 Mbit/s  172.23.0.3         0s</span></pre></div>
+      <p>A <code>LAN PATH</code> for every pair means the job will run over the LAN at full speed. If any pair lacks one, everyone uses the mesh: NCCL hangs when some nodes use one network and some another. Measure once before the first job of a new group.</p>
+    </section>
+
+    <section class="step" id="s3"><p class="step-n">STEP 3</p><h2>Run commands and copy files on many nodes</h2>
+      <p>Selectors address nodes: <code>all</code>, <code>tag:gpu</code>, node names or mesh IPs. Commands run in parallel and report per node.</p>
+      <div class="code"><pre><span class="p">$ </span>meshvpn exec tag:gpu -- hostname                      <span class="c"># test the logins</span>
+<span class="p">$ </span>meshvpn exec tag:gpu -- nvidia-smi
+<span class="p">$ </span>git clone https://github.com/PlugOvr-ai/meshvpn &amp;&amp; cd meshvpn/examples
+<span class="p">$ </span>meshvpn cp ./distributed-training tag:gpu:/home/$USER/
+<span class="p">$ </span>meshvpn cp tag:gpu:/srv/out.log ./logs                <span class="c"># downloads go to logs/&lt;node&gt;/</span></pre></div>
+      <div class="note"><strong>torchrun not found?</strong> A command started over SSH doesn't activate conda or a virtualenv. The example's <code>run.sh</code> activates the environment and passes meshvpn's rendezvous to torchrun. Adjust its activation line, or call torchrun by its full path.</div>
+    </section>
+
+    <section class="step" id="s4"><p class="step-n">STEP 4</p><h2>Share the data</h2>
+      <p>Copy small datasets like code. Share big ones once and let the nodes fetch them in parallel. Every node that has a piece serves it to the others, over the LAN where possible. Each 4 MB chunk is verified, and interrupted downloads resume.</p>
+      <div class="code"><span class="label">where the data is</span><pre><span class="p">$ </span>cd distributed-training &amp;&amp; python prepare_data.py
+<span class="p">$ </span>sudo meshvpn share data --name spirals   <span class="c"># prints an id</span></pre></div>
+      <div class="code"><span class="label">on each training node</span><pre><span class="p">$ </span>sudo meshvpn fetch &lt;id&gt; ~/distributed-training
+<span class="o">gpu1 fetched spirals into /home/agent/meshvpn-example: 962 kB in 0.1s (126 Mbit/s) from hub 962 kB
+gpu2 fetched spirals into /home/agent/meshvpn-example: 962 kB in 0.1s (109 Mbit/s) from gpu1 962 kB</span></pre></div>
+      <p>gpu2 got the data from gpu1, which had just fetched it. <code>meshvpn objects</code> lists what is shared and where.</p>
+    </section>
+
+    <section class="step" id="s5"><p class="step-n">STEP 5</p><h2>Train</h2>
+      <div class="code"><pre><span class="p">$ </span>meshvpn launch tag:gpu --workdir distributed-training -- ./run.sh --epochs 3
+<span class="o">job bb8ae227: ./run.sh --epochs 3 on 2 node(s), master gpu1 via lan
+[gpu1] backend gloo, rendezvous 172.23.0.3:29500, network lan (eth0)
+[gpu1] epoch 1/3: loss 0.9680, test accuracy 66.4%, 17,104 samples/s
+[gpu1] epoch 2/3: loss 0.6676, test accuracy 77.8%, 14,897 samples/s
+[gpu1] epoch 3/3: loss 0.4983, test accuracy 81.6%, 17,304 samples/s
+job bb8ae227: succeeded</span></pre></div>
+      <p><code>launch</code> picks rank 0 (the first node by name, or <code>--master gpu3</code>), sets <code>MASTER_ADDR</code>, <code>MASTER_PORT</code>, <code>NNODES</code>, <code>NODE_RANK</code> and <code>NCCL_SOCKET_IFNAME</code> on every node, and adds the rendezvous arguments when the command is <code>torchrun</code>. Each node's output is prefixed with its name. If one node fails, the others are stopped. Closing the terminal stops the job on all nodes.</p>
+      <p>Another launcher (DeepSpeed, Lightning, Accelerate, JAX)? Use meshvpn only for the rendezvous, on each node:</p>
+      <div class="code"><pre><span class="p">$ </span>eval $(meshvpn net env --master gpu1 tag:gpu)
+<span class="p">$ </span>echo $MASTER_ADDR $NODE_RANK $NNODES $NCCL_SOCKET_IFNAME</pre></div>
+    </section>
+
+    <section class="step" id="s6"><p class="step-n">STEP 6</p><h2>Reserve GPUs</h2>
+      <p>On shared machines, reserve GPUs so two jobs don't land on the same ones. The node with the GPUs grants the reservation, so reservations never collide.</p>
+      <div class="code"><pre><span class="p">$ </span>meshvpn launch tag:gpu --gpus 4 --workdir distributed-training -- ./run.sh
+<span class="p">$ </span>meshvpn gpu reserve gpu1 -n 2 --for 4h --note "debugging"   <span class="c"># prints CUDA_VISIBLE_DEVICES</span>
+<span class="p">$ </span>meshvpn gpu release &lt;id&gt;</pre></div>
+      <p><code>--gpus 4</code> reserves 4 free GPUs on every node before anything starts, or fails right away. It sets <code>CUDA_VISIBLE_DEVICES</code>, starts one process per GPU, and releases the reservation at the end. Reservations of a crashed launcher expire after 15 minutes. They are advisory, like Slurm without cgroups.</p>
+    </section>
+
+    <section class="step" id="s7"><p class="step-n">STEP 7</p><h2>Long runs</h2>
+      <div class="code"><pre><span class="p">$ </span>meshvpn launch tag:gpu --detach --workdir distributed-training -- ./run.sh --epochs 500
+<span class="p">$ </span>meshvpn jobs list           <span class="c"># running, succeeded, failed, stopped</span>
+<span class="p">$ </span>meshvpn jobs show &lt;id&gt;      <span class="c"># state, environment, the end of each node's log</span>
+<span class="p">$ </span>meshvpn jobs logs &lt;id&gt; --node gpu1
+<span class="p">$ </span>meshvpn jobs stop &lt;id&gt;</pre></div>
+      <p>A detached job is supervised from the machine you launched on, so launch from a node that stays up. Get results back with <code>meshvpn cp gpu1:/home/$USER/distributed-training/checkpoints ./results/</code>.</p>
+    </section>
+
+    <section class="step" id="s8"><p class="step-n">STEP 8</p><h2>Let an AI agent do it</h2>
+      <p>Every command takes <code>--json</code>, errors included, and exit codes are stable: 0 ok, 1 error, 2 usage, 3 meshvpn not running, 4 needs root, 5 not found.</p>
+      <p><code>meshvpn guide</code> prints instructions for agents: the rules, the commands for each task, and the network right now. Point your agent at it, for example in <code>AGENTS.md</code>: "Run <code>meshvpn guide</code> before working with other machines."</p>
+      <div class="code"><span class="label">Claude Code</span><pre><span class="p">$ </span>claude mcp add meshvpn -- meshvpn mcp   <span class="c"># MCP server: list nodes, reserve GPUs, launch, read logs</span>
+<span class="p">$ </span>mkdir -p ~/.claude/skills/meshvpn &amp;&amp; meshvpn guide --skill &gt; ~/.claude/skills/meshvpn/SKILL.md</pre></div>
+      <p>Any MCP client works. The tools include <code>list_nodes</code>, <code>exec</code>, <code>copy_to_nodes</code>, <code>gpu_reserve</code>, <code>launch</code>, <code>job_status</code>, <code>share</code>, <code>fetch</code> and <code>doctor</code>.</p>
+      <div class="note"><strong>Shared cluster with bookings?</strong> With meshvpn enterprise, agents book GPU nodes like people and get access only for the booked time. See <a href="{{root}}tutorials/ai-cluster.html">AI cluster with agents</a>.</div>
+    </section>
+
+    <div class="pager"><a href="{{root}}tutorials/containers.html">← Containers, rootless and the desktop</a><a href="{{root}}tutorials/test-bench.html">Next: Book a test bench →</a></div>
+  </div>
+</div></div>

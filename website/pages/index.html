@@ -1,0 +1,138 @@
+<!--meta {"title": "meshvpn: book a bench, SSH in from anywhere", "description": "A mesh VPN without a coordination server, plus device booking with personal sudo accounts for test benches, labs and AI clusters. Open source core, enterprise edition with portal.", "nav": ""} -->
+<div class="wrap">
+<div class="hero">
+  <div class="stack-lg">
+    <p class="eyebrow">Mesh VPN · device booking · Rust</p>
+    <h1>Book the bench. <em>SSH in from anywhere.</em></h1>
+    <p class="lead">meshvpn connects your machines into one private network, with no server to run. The enterprise edition adds bookings: people and AI agents reserve test benches or GPU nodes, get a personal account with sudo for exactly that time, and come in with nothing but their SSH key.</p>
+    <div class="btn-row">
+      <a class="btn primary" href="{{root}}tutorials/first-network.html">Build your first network</a>
+      <a class="btn" href="{{root}}tutorials/test-bench.html">See bookings in action</a>
+    </div>
+    <div class="code"><span class="label">install</span><pre><span class="p">$ </span>curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sudo sh</pre></div>
+  </div>
+
+  <div class="board" aria-label="Example: bookings of a test bench">
+    <div class="board-head"><span><b>lab-berlin</b> · tag:bench</span><span>Tue 3 Nov</span></div>
+    <div class="board-body">
+      <div class="lanes">
+        <span></span>
+        <div class="hours num"><span>08</span><span>09</span><span>10</span><span>11</span><span>12</span><span>13</span><span>14</span><span>15</span><span>16</span><span>17</span><span>18</span><span>19</span></div>
+        <span class="dev"><i></i>hil-ecu-01</span>
+        <div class="lane"><div class="bk" style="left:8.3%;width:33.3%">alice · exclusive</div><div class="now"></div></div>
+        <span class="dev"><i></i>hil-ecu-02</span>
+        <div class="lane"><div class="bk" style="left:8.3%;width:33.3%;animation-delay:.08s">alice · exclusive</div><div class="bk agent" style="left:50%;width:41.6%;animation-delay:.3s">agent7 · nightly-regression</div></div>
+        <span class="dev"><i></i>can-rig-03</span>
+        <div class="lane"><div class="bk shared" style="left:25%;width:50%;animation-delay:.16s">bob, carol · shared</div></div>
+        <span class="dev"><i class="off"></i>gpu-a100-1</span>
+        <div class="lane"><div class="bk agent" style="left:0%;width:100%;animation-delay:.22s">agent7 · tag:a100 --count 4</div></div>
+      </div>
+    </div>
+    <div class="legend"><span>exclusive</span><span class="s">shared</span><span class="a">AI agent</span><span class="n">now: 11:00</span></div>
+    <div class="code"><pre><span class="p">$ </span>sudo meshvpn book hil-ecu-01 hil-ecu-02 --user alice --for 4h
+<span class="o">booked hil-ecu-01, hil-ecu-02 for alice exclusively from 2026-11-03 08:00 UTC until 2026-11-03 12:00 UTC (id b7f3a20c1)</span>
+<span class="c"># alice, from home, with only her SSH key:</span>
+<span class="p">$ </span>ssh -J jump@gw.lab.example.com alice@hil-ecu-01.mesh
+<span class="o">alice@hil-ecu-01:~$ sudo flash-ecu firmware-2.4.bin</span></pre></div>
+  </div>
+</div>
+</div>
+
+<section><div class="wrap">
+  <div class="quote-strip">
+    <div class="fact"><b>0</b><span>coordination servers to run. Nodes find each other by gossip.</span></div>
+    <div class="fact"><b>1</b><span>static binary for Linux, macOS and Windows, x86 and ARM.</span></div>
+    <div class="fact"><b>100.64/10</b><span>stable addresses and <code>&lt;name&gt;.mesh</code> names for every node.</span></div>
+    <div class="fact"><b>Apache-2.0</b><span>open-source core. Enterprise features with a license.</span></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="section-head"><p class="eyebrow">Two editions</p><h2>A mesh VPN for everyone. Bookings for teams that share hardware.</h2></div>
+  <div class="editions">
+    <div class="edition">
+      <span class="tag">open source</span>
+      <h3>meshvpn</h3>
+      <p class="muted">Free, Apache-2.0. For your servers, laptops, Raspberry Pis, containers and GPU boxes.</p>
+      <ul>
+        <li>Direct UDP paths through NAT, IPv6, relays as fallback</li>
+        <li>Works behind firewalls that only allow SSH out</li>
+        <li>Password-less SSH between nodes, decided per machine</li>
+        <li>Remote desktop in the browser, even in containers</li>
+        <li>Distributed training: <code>launch</code>, GPU reservations, dataset sharing</li>
+        <li>Made for AI agents: <code>--json</code>, <code>meshvpn guide</code>, an MCP server</li>
+      </ul>
+      <div class="btn-row"><a class="btn" href="{{root}}features.html">All features</a><a class="btn" href="https://github.com/PlugOvr-ai/meshvpn">GitHub</a></div>
+    </div>
+    <div class="edition ent">
+      <span class="tag ent">enterprise</span>
+      <h3>meshvpn enterprise</h3>
+      <p class="muted">The same program with access control for shared benches, labs and clusters.</p>
+      <ul>
+        <li>Bookings: several devices at once, exclusive or shared, or "any 4 free A100 nodes"</li>
+        <li>A personal account with sudo on the device, only for the booked time</li>
+        <li>Outside users need only an SSH key and the gateway</li>
+        <li>Central, signed policy: users, groups, who may book what and for how long</li>
+        <li>Portal with two-factor login, API keys for AI agents, audit log</li>
+        <li>30-day trial, free for universities</li>
+      </ul>
+      <div class="btn-row"><a class="btn primary" href="{{root}}pricing.html">Plans and trial</a><a class="btn" href="{{root}}tutorials/test-bench.html">Tutorial</a></div>
+    </div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="section-head"><p class="eyebrow">How a booking works</p><h2>From request to sudo, and back to locked.</h2></div>
+  <div class="steps3">
+    <div><h3>Book</h3><p class="muted">An admin, a user in the portal or an agent through the API books devices for a time. Exclusive bookings never overlap; shared ones share with other shared ones.</p></div>
+    <div><h3>Work</h3><p class="muted">During the booking the device has an account for the user, with sudo if the rule allows it. The gateway lets the user's key through to the booked devices, and to nothing else.</p></div>
+    <div><h3>Release</h3><p class="muted">When the time is up the account is locked, sudo is removed and the user's processes stop, including open sessions. The audit log keeps who had which device when.</p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="section-head"><p class="eyebrow">Under the hood</p><h2>Every node is equal. Traffic takes the shortest path.</h2>
+  <p class="lead">Nodes sign their own records and gossip them. Links are Noise-encrypted, every packet is also encrypted end to end, and relays can neither read nor forge what they forward.</p></div>
+  <div class="diagram">
+    <svg viewBox="0 0 860 250" role="img" aria-label="A laptop behind NAT, a public server and a firewalled lab box connected through the mesh">
+      <g stroke="var(--line)" stroke-width="2" fill="none">
+        <path d="M150 125 H400"/><path d="M470 125 H700"/>
+      </g>
+      <path d="M150 150 C 300 230, 560 230, 710 150" stroke="var(--accent)" stroke-width="2" stroke-dasharray="6 6" fill="none"/>
+      <g>
+        <rect x="30" y="85" width="140" height="80" rx="6" fill="var(--card)" stroke="var(--fg)" stroke-width="1.5"/>
+        <text x="48" y="114">laptop</text><text x="48" y="134" class="dim">behind NAT</text><text x="48" y="152" class="dim">100.122.64.143</text>
+        <rect x="365" y="85" width="140" height="80" rx="6" fill="var(--card)" stroke="var(--fg)" stroke-width="1.5"/>
+        <text x="383" y="114">server</text><text x="383" y="134" class="dim">public IP</text><text x="383" y="152" class="dim">100.94.140.208</text>
+        <rect x="690" y="85" width="140" height="80" rx="6" fill="var(--card)" stroke="var(--fg)" stroke-width="1.5"/>
+        <text x="708" y="114">lab box</text><text x="708" y="134" class="dim">SSH out only</text><text x="708" y="152" class="dim">100.92.238.33</text>
+      </g>
+      <text x="215" y="115" class="dim">UDP, hole punched</text>
+      <text x="545" y="115" class="dim">ssh -R tunnel</text>
+      <text x="300" y="232" fill="var(--accent)">laptop ⇄ lab box: relayed, end-to-end encrypted</text>
+      <circle cx="16" cy="40" r="5" fill="var(--accent)"/><text x="28" y="44" class="dim">no coordination server: the three nodes are the whole network</text>
+    </svg>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="section-head"><p class="eyebrow">Use cases</p><h2>Built for shared hardware.</h2></div>
+  <div class="grid g3">
+    <a class="card" href="{{root}}use-cases.html#hil"><span class="tag ent">enterprise</span><h3>Hardware-in-the-loop test benches</h3><p class="muted">ECUs, CAN rigs, robots and prototypes, booked by the hour and reached from anywhere.</p><span class="more">Read more →</span></a>
+    <a class="card" href="{{root}}use-cases.html#ai"><span class="tag ent">enterprise</span><h3>AI compute clusters</h3><p class="muted">People and agents book GPU nodes by tag and count, then train across them with one command.</p><span class="more">Read more →</span></a>
+    <a class="card" href="{{root}}use-cases.html#fleet"><span class="tag">open source</span><h3>Fleets behind firewalls</h3><p class="muted">Raspberry Pis, field devices and lab machines that can only reach out over SSH.</p><span class="more">Read more →</span></a>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="section-head"><p class="eyebrow">Get started</p><h2>Two commands per machine.</h2></div>
+  <div class="grid g2">
+    <div class="code"><span class="label">first machine</span><pre><span class="p">$ </span>sudo meshvpn init --network lab --endpoint gw.example.com:7870
+<span class="o">invite: mesh1-eyJuZXR3b3Jr...</span>
+<span class="p">$ </span>sudo meshvpn install</pre></div>
+    <div class="code"><span class="label">every other machine</span><pre><span class="p">$ </span>sudo meshvpn join mesh1-eyJuZXR3b3Jr...
+<span class="p">$ </span>sudo meshvpn install
+<span class="p">$ </span>ssh labbox.mesh</pre></div>
+  </div>
+  <p class="muted" style="margin-top:1.2rem">Windows, macOS, containers and machines without root: see <a href="{{root}}download.html">Download</a> and the <a href="{{root}}tutorials/index.html">tutorials</a>.</p>
+</div></section>

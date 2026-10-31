@@ -1,0 +1,105 @@
+<!--meta {"title": "An AI cluster with bookings", "description": "GPU servers that people and AI agents book through the portal or its API, then log in to with their SSH key and train on.", "nav": "tutorials"} -->
+<div class="wrap">
+<div class="page-hero"><p class="eyebrow">Tutorial · enterprise · 25 min</p>
+<h1>An AI cluster with bookings for people and agents</h1>
+<p class="lead">Your GPU servers become a pool that people and AI agents book: "4 free A100 nodes for 3 hours". Agents book through the portal's API with a key and have the same rights as a person. When the booking ends, their access ends too.</p>
+<div class="meta-row"><span>You need: GPU servers on Linux, a gateway, the <a href="{{root}}tutorials/portal.html">portal</a></span><span>Builds on: <a href="{{root}}tutorials/test-bench.html">Book a test bench</a></span></div></div>
+
+<div class="tut">
+<nav class="tut-nav" aria-label="Steps"><p class="eyebrow">Steps</p>
+<a href="#s1">1. The setup</a>
+<a href="#s2">2. Tag the GPU nodes</a>
+<a href="#s3">3. Agents as users</a>
+<a href="#s4">4. A rule for the pool</a>
+<a href="#s5">5. An API key</a>
+<a href="#s6">6. Book through the API</a>
+<a href="#s7">7. Log in and train</a>
+<a href="#s8">8. Cancel and clean up</a>
+<a href="#s9">9. Teach your agent</a>
+</nav>
+
+<div class="prose">
+<section class="step" id="s1"><p class="step-n">STEP 1</p><h2>The setup</h2>
+<p>This tutorial assumes a network with the enterprise build on every node, a gateway, and a license or trial, as in <a href="{{root}}tutorials/test-bench.html">Book a test bench</a>. Here the devices are GPU servers <code>gpu1</code> to <code>gpu8</code>. The portal runs as admin of the network (<a href="{{root}}tutorials/portal.html">Set up the portal</a>); it gives agents an HTTP API.</p>
+<p>Bookings make sure two jobs don't land on the same machines. A booking is all or nothing: either all requested nodes are free for the whole time, or nothing is booked.</p>
+</section>
+
+<section class="step" id="s2"><p class="step-n">STEP 2</p><h2>Tag the GPU nodes</h2>
+<div class="code"><span class="label">on gpu1 ... gpu8</span><pre><span class="p">$ </span>sudo meshvpn tag add a100</pre></div>
+<p>Or tag them when they join: <code>sudo meshvpn join mesh1-... --tag a100</code>. Every node publishes its hardware, so you can check what's in the pool from any node:</p>
+<div class="code"><pre><span class="p">$ </span>meshvpn nodes tag:a100
+<span class="p">$ </span>meshvpn device list</pre></div>
+</section>
+
+<section class="step" id="s3"><p class="step-n">STEP 3</p><h2>Agents as users</h2>
+<p>An agent is a user with the agent flag and its own SSH key. Create the key pair where the agent runs:</p>
+<div class="code"><span class="label">where the agent runs</span><pre><span class="p">$ </span>ssh-keygen -t ed25519 -N "" -f ~/.ssh/agent7 -C agent7</pre></div>
+<p>Then add the agent with its public key. In the portal: <strong>Users</strong>, tick <em>agent</em>, paste the key, leave the password empty (agents use API keys only). On an admin node it's the same as for people:</p>
+<div class="code"><span class="label">on an admin node</span><pre><span class="p">$ </span>sudo meshvpn user add agent7 --key-file agent7.pub --agent
+<span class="p">$ </span>sudo meshvpn group set ml alice agent7</pre></div>
+<div class="note"><strong>Portal or CLI.</strong> When the portal manages a network, add users and groups in the portal. It keeps them the same in all its networks.</div>
+</section>
+
+<section class="step" id="s4"><p class="step-n">STEP 4</p><h2>A rule for the pool</h2>
+<div class="code"><span class="label">on an admin node</span><pre><span class="p">$ </span>sudo meshvpn device add tag:a100 --who group:ml --max 12h</pre></div>
+<p>In the portal, the same is under <strong>Networks → Bookable devices</strong>: <code>tag:a100</code>, who <code>group:ml</code>, longest <code>12h</code>, sudo on or off.</p>
+</section>
+
+<section class="step" id="s5"><p class="step-n">STEP 5</p><h2>An API key</h2>
+<p>People create their own keys in the portal under <strong>Account → API keys</strong>. A key for an agent account comes from an admin, through the API: log in once (with your 2FA code), then create the key for <code>agent7</code>. The key is shown once.</p>
+<div class="code"><span class="label">as a portal admin</span><pre><span class="p">$ </span>curl -s -c cookies -H "Content-Type: application/json" \
+    -d '{"user": "ops", "password": "...", "code": "123456"}' https://portal.example.com/api/login
+<span class="p">$ </span>curl -s -b cookies -H "Content-Type: application/json" \
+    -d '{"label": "training agent", "user": "agent7"}' https://portal.example.com/api/apikeys
+<span class="o">{"id": "k1a2b3c4d", "key": "mvk_...", "user": "agent7", "note": "shown only now - store it safely"}</span></pre></div>
+<p>The agent sends it on every request as <code>Authorization: Bearer mvk_...</code>. Revoke a key with <code>DELETE /api/apikeys/&lt;id&gt;</code> or in the portal.</p>
+</section>
+
+<section class="step" id="s6"><p class="step-n">STEP 6</p><h2>Book through the API</h2>
+<p>First the agent looks at the networks, their devices and the current bookings:</p>
+<div class="code"><pre><span class="p">$ </span>export MV="Authorization: Bearer mvk_..."
+<span class="p">$ </span>curl -s -H "$MV" https://portal.example.com/api/networks</pre></div>
+<p>Then it books 4 free nodes from the pool for 3 hours:</p>
+<div class="code"><pre><span class="p">$ </span>curl -s -H "$MV" -H "Content-Type: application/json" \
+    -d '{"network": "lab", "selector": "tag:a100", "count": 4, "duration": "3h", "note": "sweep lr=3e-4"}' \
+    https://portal.example.com/api/book
+<span class="o">{"ok": true, "message": "booked gpu2, gpu3, gpu5, gpu6 for agent7 exclusively from ... (id b7c1e2f0)", ...}</span></pre></div>
+<div class="table-wrap"><table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><code>network</code></td><td>the network's name in the portal</td></tr>
+<tr><td><code>devices</code></td><td>node names, e.g. <code>["gpu1", "gpu2"]</code>; or instead:</td></tr>
+<tr><td><code>selector</code> + <code>count</code></td><td>pick this many free nodes, e.g. <code>"tag:a100"</code> and <code>4</code></td></tr>
+<tr><td><code>from</code></td><td><code>"now"</code> (default), <code>"+1h"</code>, or <code>"2026-11-03T09:00+01:00"</code></td></tr>
+<tr><td><code>duration</code> or <code>until</code></td><td><code>"3h"</code>, or an end time</td></tr>
+<tr><td><code>exclusive</code></td><td><code>true</code> by default; <code>false</code> for a shared booking</td></tr>
+<tr><td><code>note</code></td><td>free text, shown in the bookings</td></tr>
+<tr><td><code>user</code></td><td>admins only: book for someone else</td></tr>
+</table></div>
+</section>
+
+<section class="step" id="s7"><p class="step-n">STEP 7</p><h2>Log in and train</h2>
+<p>The portal tells the agent how to reach a booked node:</p>
+<div class="code"><pre><span class="p">$ </span>curl -s -H "$MV" https://portal.example.com/api/networks/lab/connect/gpu2
+<span class="o">{"command": "ssh -J jump@gw.example.com agent7@gpu2.mesh", "ssh_config": "Host *.mesh\n    User agent7\n    ProxyJump jump@gw.example.com\n"}</span></pre></div>
+<p>With that in <code>~/.ssh/config</code>, the agent works on the booked nodes like on any server. On each node of a multi-node job, the open-source <code>meshvpn net env</code> prints the variables torchrun needs and picks the fastest path between the nodes:</p>
+<div class="code"><span class="label">on gpu2, gpu3, gpu5, gpu6</span><pre><span class="p">$ </span>eval $(meshvpn net env --master gpu2 gpu2 gpu3 gpu5 gpu6)
+<span class="p">$ </span>torchrun --nproc_per_node=8 train.py</pre></div>
+<p>In a shared booking, several jobs share the same nodes. Then reserve GPUs, so jobs don't take each other's: <code>meshvpn gpu reserve gpu2 -n 4 --for 3h</code> prints <code>CUDA_VISIBLE_DEVICES</code>, and <code>meshvpn gpu release</code> frees them. See <a href="{{root}}tutorials/gpu-training.html">Train across GPU nodes</a> for <code>launch</code>, <code>gpu</code>, <code>share</code> and <code>fetch</code>.</p>
+</section>
+
+<section class="step" id="s8"><p class="step-n">STEP 8</p><h2>Cancel and clean up</h2>
+<p>When the job is done early, the agent gives the nodes back:</p>
+<div class="code"><pre><span class="p">$ </span>curl -s -X POST -H "$MV" https://portal.example.com/api/networks/lab/bookings/b7c1e2f0/cancel</pre></div>
+<p>Users and agents can cancel their own bookings; admins can cancel any. At the end of a booking, the nodes lock the account, remove sudo and stop all its processes, so a forgotten job doesn't block the next one.</p>
+</section>
+
+<section class="step" id="s9"><p class="step-n">STEP 9</p><h2>Teach your agent</h2>
+<p><code>meshvpn guide</code> on any node prints instructions for AI agents: the rules, the commands for each task, and what's in the network right now. Point your agent at it, for example in <code>AGENTS.md</code> or <code>CLAUDE.md</code>:</p>
+<div class="code"><span class="label">AGENTS.md</span><pre>Book GPU nodes through https://portal.example.com/api/book (key in $MESHVPN_KEY),
+cancel the booking when you're done, and run `meshvpn guide` on a node before
+working with other machines.</pre></div>
+<p>For Claude Code, install the guide as a skill: <code>mkdir -p ~/.claude/skills/meshvpn &amp;&amp; meshvpn guide --skill &gt; ~/.claude/skills/meshvpn/SKILL.md</code>.</p>
+<div class="pager"><a href="{{root}}tutorials/test-bench.html">← Book a test bench</a><a href="{{root}}tutorials/portal.html">Next: set up the portal →</a></div>
+</section>
+</div>
+</div></div>
