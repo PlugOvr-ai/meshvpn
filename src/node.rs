@@ -61,6 +61,23 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// "2026-11-03 14:05 UTC".
+pub(crate) fn fmt_time(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Civil date from days since 1970 (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
+}
+
 /// Other interfaces holding addresses in our overlay range. Their routes and firewall rules
 /// win over ours: e.g. Tailscale drops every packet from 100.64.0.0/10 not arriving on
 /// tailscale0, which silently breaks all incoming mesh traffic.
@@ -311,6 +328,9 @@ pub struct Status {
     /// IPv6 addresses for direct paths.
     #[serde(default)]
     pub ipv6: Vec<String>,
+    /// This computer is a client: whose, and until when it is a member.
+    #[serde(default)]
+    pub client: Option<crate::proto::ClientGrant>,
     /// What an extension reports (e.g. its features and their state).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension: Option<serde_json::Value>,
@@ -338,6 +358,9 @@ pub struct SshOverview {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PeerStatus {
     pub name: String,
+    /// A client (a user's computer, a member for a time): whose.
+    #[serde(default)]
+    pub client: Option<String>,
     /// The account the node suggests logging in as.
     #[serde(default)]
     pub login_user: Option<String>,
@@ -1647,7 +1670,8 @@ impl Node {
         while let Some(cur) = queue.pop_front() {
             let first = routes[&cur];
             let Some(rec) = st.records.get(&cur) else { continue };
-            if !self.is_online(st, &cur) {
+            // Clients relay nothing: nobody is reached through one.
+            if !self.is_online(st, &cur) || Self::client_of(st, &cur).is_some() {
                 continue;
             }
             for nb in &rec.info.neighbors {
@@ -1761,6 +1785,9 @@ impl Node {
             }
             f[65] = ttl - 1;
             let st = self.state.lock().unwrap();
+            if Self::client_of(&st, &self.ident.id).is_some() {
+                return None; // clients relay nothing
+            }
             let hop = st.routes.get(&dst)?;
             let _ = st.links.get(hop)?.tx.try_send(f);
             return None;
@@ -2325,6 +2352,7 @@ impl Node {
                 }
                 st.forgotten.retain(|_, f| f.at > cutoff);
                 self.expire_leases(&mut st);
+                self.expire_clients(&mut st);
                 self.auto_forget(&mut st);
                 self.rebuild(&mut st);
                 self.dial_candidates(&mut st)
@@ -2488,6 +2516,7 @@ impl Node {
                 };
                 PeerStatus {
                     name: r.info.name.clone(),
+                    client: Self::client_of(&st, &id).map(|c| c.user.clone()),
                     login_user: r.info.login_user.clone(),
                     version: r.info.version.clone(),
                     exit: r.info.exit,
@@ -2599,6 +2628,7 @@ impl Node {
             objects: st.objects_ad.clone(),
             leases: st.leases.clone(),
             peers,
+            client: Self::client_of(&st, &self.ident.id).cloned(),
         }
     }
 

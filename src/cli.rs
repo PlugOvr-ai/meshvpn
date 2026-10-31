@@ -59,6 +59,12 @@ enum Cmd {
         /// How long it is valid, e.g. 30m, 24h, 7d (managed networks).
         #[arg(long, default_value = "24h")]
         expires: String,
+        /// For a user's computer: a client (not a node), a member for --client-for only.
+        #[arg(long, value_name = "USER")]
+        client: Option<String>,
+        /// How long the client stays a member (with --client).
+        #[arg(long, default_value = "12h")]
+        client_for: String,
     },
     /// Exit nodes: send this machine's internet traffic through another node, or offer this
     /// node's internet connection to the network.
@@ -727,13 +733,37 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
             println!("Created network \"{}\".\n", cfg.network);
             print_node_summary(&cfg)?;
-            print_invite(&dir, &cfg, 1, 24 * 3600 * 1000, false)?;
+            print_invite(&dir, &cfg, 1, 24 * 3600 * 1000, None, false)?;
             enable_ssh_logins(&cfg);
             print_next_steps(&dir, &cfg);
         }
         Cmd::Join { invite, node } => {
             let inv = Invite::decode(&invite)?;
             check_invite_expiry(&inv)?;
+            // Already a member of this network (a client renewing): a new admission only.
+            if let Ok(cfg) = Config::load(&dir)
+                && !node.force
+                && cfg.network_id() == inv.id
+                && let Some(ticket) = inv.ticket.clone()
+            {
+                require_owner()?;
+                if control::is_running(&dir) {
+                    let req = control::Request::Readmit { ticket };
+                    let resp = tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?;
+                    match resp {
+                        control::Response::Message { text } => say(json, &text),
+                        control::Response::Error { message } => bail!("{message}"),
+                        _ => bail!("unexpected answer from meshvpn"),
+                    }
+                } else {
+                    let mut cfg = cfg;
+                    cfg.ticket = Some(ticket);
+                    cfg.claim = None;
+                    cfg.save(&dir)?;
+                    say(json, "admission renewed - it applies when meshvpn starts");
+                }
+                return Ok(0);
+            }
             let key = keys::unb64_32(&inv.key)?;
             let mut cfg = create(&dir, node, inv.network, key, inv.bootstrap)?;
             cfg.network_id = inv.id;
@@ -747,9 +777,21 @@ fn real_main(cli: Cli) -> Result<i32> {
             enable_ssh_logins(&cfg);
             print_next_steps(&dir, &cfg);
         }
-        Cmd::Invite { uses, expires } => {
+        Cmd::Invite {
+            uses,
+            expires,
+            client,
+            client_for,
+        } => {
             let cfg = Config::load(&dir)?;
-            print_invite(&dir, &cfg, uses, parse_duration_ms(&expires)?, json)?;
+            let client = match client {
+                Some(user) => Some(proto::ClientGrant {
+                    user,
+                    until: now_ms() + parse_duration_ms(&client_for)?,
+                }),
+                None => None,
+            };
+            print_invite(&dir, &cfg, uses, parse_duration_ms(&expires)?, client, json)?;
         }
         Cmd::Gpu { cmd } => return gpu_cmd(&dir, cmd, json),
         Cmd::Exit { cmd } => return exit_cmd(&dir, cmd, json),
@@ -1795,7 +1837,13 @@ fn print_next_steps(dir: &Path, cfg: &Config) {
     }
 }
 
-fn make_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64) -> Result<Invite> {
+fn make_invite(
+    dir: &Path,
+    cfg: &Config,
+    uses: u32,
+    valid_ms: u64,
+    client: Option<proto::ClientGrant>,
+) -> Result<Invite> {
     let mut boot: Vec<String> = cfg.static_endpoints();
     let saved = SavedState::load(dir);
     let net = cfg.network_id();
@@ -1821,7 +1869,7 @@ fn make_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64) -> Result<Inv
     boot.retain(|e| seen.insert(e.clone()));
     boot.truncate(12);
 
-    let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms)?;
+    let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms, client)?;
     Ok(Invite {
         network: cfg.network.clone(),
         key: cfg.network_key.clone(),
@@ -1986,9 +2034,10 @@ fn invite_ticket(
     cfg: &Config,
     uses: u32,
     valid_ms: u64,
+    client: Option<proto::ClientGrant>,
 ) -> Result<(Option<proto::SignedDoc>, Vec<keys::NodeId>)> {
     if control::is_running(dir) {
-        let req = control::Request::IssueTicket { uses, valid_ms };
+        let req = control::Request::IssueTicket { uses, valid_ms, client };
         let control::Response::Message { text } =
             tokio::runtime::Runtime::new()?.block_on(control::request(dir, &req))?
         else {
@@ -2017,6 +2066,7 @@ fn invite_ticket(
         expires: now_ms() + valid_ms,
         uses: uses.max(1),
         issuer: ident.id,
+        client,
     };
     Ok((Some(proto::SignedDoc::sign(&ticket, &ident)), roster.admins))
 }
@@ -2163,8 +2213,19 @@ fn ago(ms: u64) -> String {
     }
 }
 
-fn print_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64, json: bool) -> Result<()> {
-    let inv = make_invite(dir, cfg, uses, valid_ms)?;
+fn print_invite(
+    dir: &Path,
+    cfg: &Config,
+    uses: u32,
+    valid_ms: u64,
+    client: Option<proto::ClientGrant>,
+    json: bool,
+) -> Result<()> {
+    let until = client.as_ref().map(|c| c.until);
+    let inv = make_invite(dir, cfg, uses, valid_ms, client)?;
+    if until.is_some() && inv.ticket.is_none() {
+        bail!("clients need a managed network (meshvpn admin enable)");
+    }
     if json {
         println!(
             "{}",
@@ -2173,6 +2234,7 @@ fn print_invite(dir: &Path, cfg: &Config, uses: u32, valid_ms: u64, json: bool) 
                 "managed": inv.ticket.is_some(),
                 "uses": inv.ticket.as_ref().map(|_| uses),
                 "expires_ms": inv.ticket.as_ref().map(|_| now_ms() + valid_ms),
+                "client_until_ms": until,
             })
         );
         return Ok(());
@@ -2249,6 +2311,21 @@ fn print_status(st: &node::Status) {
     if !st.banned.is_empty() {
         println!("  banned:       {}", st.banned.join(", "));
     }
+    if let Some(c) = &st.client {
+        let left = c.until.saturating_sub(now_ms());
+        if left == 0 {
+            println!(
+                "  \x1b[1;33mclient:\x1b[0m {}'s computer - the admission has ended; renew it (meshvpn login)",
+                c.user
+            );
+        } else {
+            println!(
+                "  client:       {}'s computer, a member for {} more",
+                c.user,
+                human_duration(left)
+            );
+        }
+    }
     for w in &st.warnings {
         println!("  \x1b[1;33mwarning:\x1b[0m {w}");
     }
@@ -2323,6 +2400,10 @@ fn print_status(st: &node::Status) {
                 Some(s) => format!("last seen {}", human_secs(s)),
                 None => "not seen since restart".into(),
             }
+        };
+        let path = match &p.client {
+            Some(u) => format!("{path}  (client: {u})"),
+            None => path,
         };
         println!(
             "{:<w$}  {:<15}  {:<7}  {:>6}  {version}  {}",

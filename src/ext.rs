@@ -35,6 +35,9 @@ pub struct Peer {
     pub inventory: serde_json::Value,
     /// Seconds since the node was last heard of (None: never, or this node).
     pub last_seen_secs: Option<u64>,
+    /// A client - a user's computer, a member for a time - and whose (None: a node).
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 /// The network right now (a copy: extensions never hold meshvpn's locks).

@@ -72,6 +72,18 @@ pub struct Ticket {
     pub expires: u64,
     pub uses: u32,
     pub issuer: NodeId,
+    /// A client, not a node: a user's computer, a member until `ClientGrant::until` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientGrant>,
+}
+
+/// What makes a member a client: whose computer it is, and until when it may be one. Clients
+/// relay nothing for others and nobody routes through them; extensions may treat them apart
+/// (e.g. not count them, or let them reach only some nodes).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ClientGrant {
+    pub user: String,
+    pub until: u64,
 }
 
 /// A new node binding a ticket to itself (signed by that node).

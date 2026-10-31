@@ -310,6 +310,37 @@ def test_ban(lab):
 
 
 @test
+def test_clients(lab):
+    """A user's computer joins as a client for a time: reaches the nodes, relays nothing, is dropped when its time is up, renews."""
+    net, (hub, a) = mesh(lab, ["hub", "a"])
+    laptop = lab.node("laptop", [net])
+    inv = json.loads(hub.mv("--json invite --client alice --client-for 75s"))
+    check(inv["client_until_ms"], f"a client invite: {inv}")
+    laptop.mv(f"join {inv['invite']} --name alice-laptop")
+    laptop.up()
+    wait(lambda: hub.online("alice-laptop") and a.online("alice-laptop"), "the client is in", 40)
+    check(ping(laptop, "a.mesh"), "the client reaches a")
+    check("(client: alice)" in hub.mv("status"), "status marks the client")
+    st = laptop.status()
+    check(st["client"]["user"] == "alice", f"the client knows it is one: {st.get('client')}")
+    check("alice's computer" in laptop.mv("status"), "and says so")
+    # Its time is up: every node drops it, and it can't reach anyone.
+    wait(lambda: not hub.online("alice-laptop") and not a.online("alice-laptop"), "the client is dropped when its time is up", 120)
+    check(not ping(laptop, "a.mesh", count=1), "an expired client still reaches a")
+    check("renew" in laptop.mv("status"), "the client is told to renew")
+    # Renewal: a new client invite for the same computer, same identity.
+    old_id = laptop.status()["id"]
+    inv = json.loads(hub.mv("--json invite --client alice --client-for 10m"))
+    out = laptop.mv(f"join {inv['invite']}")
+    check("client until" in out, f"renewed: {out}")
+    wait(lambda: hub.online("alice-laptop"), "the renewed client is back", 60)
+    check(laptop.status()["id"] == old_id and ping(laptop, "a.mesh"), "the same identity, reaching a again")
+    # Nobody routes through a client.
+    routes = a.status()["peers"]
+    check(all("relay via alice-laptop" not in p["path"] for p in routes), f"routes through the client: {routes}")
+
+
+@test
 def test_nat_traversal(lab):
     """Two clients behind separate NAT routers get a direct UDP path; falls back when UDP is blocked."""
     pub = lab.network("pub", subnet="198.51.100.0/24")

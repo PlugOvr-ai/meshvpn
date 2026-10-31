@@ -64,6 +64,7 @@ impl Node {
                 .get(&info.id)
                 .and_then(|r| r.last_heard)
                 .map(|t| t.elapsed().as_secs()),
+            client: Self::client_of(st, &info.id).map(|c| c.user.clone()),
         }
     }
 
@@ -80,6 +81,7 @@ impl Node {
             version: env!("CARGO_PKG_VERSION").into(),
             inventory: serde_json::to_value(&st.inventory).unwrap_or_default(),
             last_seen_secs: None,
+            client: Self::client_of(&st, &self.ident.id).map(|c| c.user.clone()),
         };
         let peers = st
             .records

@@ -46,7 +46,38 @@ impl Node {
         }
         match &st.roster {
             None => true,
-            Some((_, r)) => r.admins.contains(id) || r.members.contains(id) || st.claims.contains_key(id),
+            Some((_, r)) => {
+                r.admins.contains(id)
+                    || r.members.contains(id)
+                    || st
+                        .claims
+                        .get(id)
+                        .is_some_and(|a| a.ticket.client.as_ref().is_none_or(|c| c.until > now_ms()))
+            }
+        }
+    }
+
+    /// `id` is a client (a user's computer, admitted for a time), and whose.
+    pub(super) fn client_of<'a>(st: &'a State, id: &NodeId) -> Option<&'a crate::proto::ClientGrant> {
+        if let Some((_, r)) = &st.roster
+            && (r.admins.contains(id) || r.members.contains(id))
+        {
+            return None;
+        }
+        st.claims.get(id).and_then(|a| a.ticket.client.as_ref())
+    }
+
+    /// Clients whose time is up: disconnect them; forget their admissions a day later.
+    pub(super) fn expire_clients(&self, st: &mut State) {
+        let now = now_ms();
+        let expired = st
+            .claims
+            .values()
+            .any(|a| a.ticket.client.as_ref().is_some_and(|c| c.until <= now));
+        if expired {
+            st.claims
+                .retain(|_, a| a.ticket.client.as_ref().is_none_or(|c| c.until + 86_400_000 > now));
+            self.drop_unadmitted(st);
         }
     }
 
@@ -118,6 +149,13 @@ impl Node {
             && a.claim.ticket.data == claim.ticket.data
         {
             return Ok(None); // known
+        }
+        // A client renews with a new ticket; an older admission arriving late changes nothing.
+        if let Some(a) = st.claims.get(&claim.node) {
+            let until = |t: &Ticket| t.client.as_ref().map_or(u64::MAX, |c| c.until);
+            if until(&a.ticket) >= until(&ticket) {
+                return Ok(None);
+            }
         }
         // Fresh (made recently, before the ticket expired) - or vouched for by a member that
         // saw it fresh.
@@ -387,8 +425,14 @@ impl Node {
         }
     }
 
-    /// `meshvpn invite` in a managed network: a ticket signed by this (admin) node.
-    pub fn issue_ticket(&self, uses: u32, valid_ms: u64) -> Result<(Option<SignedDoc>, Vec<NodeId>)> {
+    /// `meshvpn invite` in a managed network: a ticket signed by this (admin) node; with
+    /// `client`, for a user's computer that is a member for a time only.
+    pub fn issue_ticket(
+        &self,
+        uses: u32,
+        valid_ms: u64,
+        client: Option<crate::proto::ClientGrant>,
+    ) -> Result<(Option<SignedDoc>, Vec<NodeId>)> {
         let st = self.state.lock().unwrap();
         let Some((_, roster)) = &st.roster else {
             return Ok((None, vec![]));
@@ -409,8 +453,44 @@ impl Node {
             expires: now_ms() + valid_ms,
             uses: uses.max(1),
             issuer: self.ident.id,
+            client,
         };
         Ok((Some(SignedDoc::sign(&ticket, &self.ident)), roster.admins.clone()))
+    }
+
+    /// A new admission for this node from `ticket` (a client renewing its time): saved,
+    /// accepted here and sent to everyone.
+    pub fn readmit(&self, ticket: SignedDoc) -> Result<String> {
+        let t = ticket.open::<Ticket>(|t| t.issuer)?;
+        if t.net != self.net {
+            bail!("this invite is for another network");
+        }
+        let claim = Claim {
+            net: self.net.clone(),
+            ticket,
+            node: self.ident.id,
+            at: now_ms(),
+        };
+        let msg = ClaimMsg {
+            claim: SignedDoc::sign(&claim, &self.ident),
+            witness: None,
+        };
+        let mut cfg = Config::load(&self.dir)?;
+        cfg.ticket = Some(claim.ticket.clone());
+        cfg.claim = Some(msg.clone());
+        cfg.save(&self.dir)?;
+        let mut st = self.state.lock().unwrap();
+        if let Some(m) = self.accept_claim(&mut st, msg)? {
+            self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None);
+        }
+        Ok(match &t.client {
+            Some(c) => format!(
+                "admitted as {}'s client until {}",
+                c.user,
+                crate::node::fmt_time(c.until)
+            ),
+            None => "admitted".into(),
+        })
     }
 
     pub(super) fn dispatch_admin(&self, kind: u8, peer: NodeId, payload: &[u8]) -> bool {
