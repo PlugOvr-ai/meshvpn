@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 pub use crate::keys::NodeId;
 
 /// A node as an extension sees it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {
     pub id: NodeId,
     pub name: String,
@@ -38,7 +38,7 @@ pub struct Peer {
 }
 
 /// The network right now (a copy: extensions never hold meshvpn's locks).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct View {
     pub me: Peer,
     /// The network is managed (has admins); in an open network every node counts as admin.
