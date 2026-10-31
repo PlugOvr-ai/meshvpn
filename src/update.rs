@@ -7,6 +7,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub const REPO: &str = "PlugOvr-ai/meshvpn";
+
+/// Where releases of this build come from: an extension's own (enterprise builds update to
+/// enterprise builds), else the open-source repository.
+pub fn repo() -> String {
+    crate::ext::get().and_then(|e| e.release_repo()).unwrap_or_else(|| REPO.to_string())
+}
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const TARGET: &str = env!("MESHVPN_RELEASE_TARGET");
 
@@ -41,7 +47,7 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 /// Tag of the latest release (e.g. `v0.2.0`). Uses the `releases/latest` redirect instead of
 /// the GitHub API, so there is no rate limit to run into.
 pub async fn latest_tag(client: &reqwest::Client) -> Result<String> {
-    let url = format!("https://github.com/{REPO}/releases/latest");
+    let url = format!("https://github.com/{}/releases/latest", repo());
     let resp = client.head(&url).send().await.context("contacting github.com")?;
     let final_url = resp.url().clone();
     let tag = final_url
@@ -66,7 +72,7 @@ pub fn current_exe() -> Result<PathBuf> {
 
 /// Downloads file `name` of release `tag` and checks it against the published `<name>.sha256`.
 pub async fn download_verified(client: &reqwest::Client, tag: &str, name: &str) -> Result<Vec<u8>> {
-    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let base = format!("https://github.com/{}/releases/download/{tag}", repo());
     let get = |url: String| async move {
         let r = client
             .get(&url)
@@ -94,7 +100,7 @@ pub async fn download_verified(client: &reqwest::Client, tag: &str, name: &str) 
 
 /// Downloads the meshvpn binary of release `tag` for `target` and verifies its checksum.
 pub async fn download_binary(client: &reqwest::Client, tag: &str, target: &str) -> Result<Vec<u8>> {
-    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+    let base = format!("https://github.com/{}/releases/download/{tag}", repo());
     let archive = format!("meshvpn-{target}.tar.gz");
     let get = |url: String| async move {
         let r = client

@@ -43,6 +43,9 @@ pub struct View {
     pub me: Peer,
     /// The network is managed (has admins); in an open network every node counts as admin.
     pub managed: bool,
+    /// The network's id (the same on every node; e.g. to bind a license to the network).
+    #[serde(default)]
+    pub network: String,
     pub peers: Vec<Peer>,
     pub now_ms: u64,
 }
@@ -117,6 +120,11 @@ pub trait Extension: Send + Sync {
 
     /// `meshvpn <args...>` for a command meshvpn doesn't have. None: not ours either.
     fn command(&self, _dir: &Path, _json: bool, _args: &[String]) -> Option<Result<i32>> {
+        None
+    }
+
+    /// The GitHub repository whose releases `meshvpn update` installs ("owner/name").
+    fn release_repo(&self) -> Option<String> {
         None
     }
 

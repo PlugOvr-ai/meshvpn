@@ -90,6 +90,7 @@ impl Node {
         View {
             me,
             managed: Self::managed(&st),
+            network: self.net.clone(),
             peers,
             now_ms: now_ms(),
         }

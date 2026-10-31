@@ -13,6 +13,10 @@
 #
 #   curl -fsSL .../install.sh | sh -s -- --user join mesh1-...
 #
+# The enterprise edition (a license unlocks its features; 30-day trial): --enterprise first, e.g.
+#
+#   curl -fsSL .../install.sh | sudo sh -s -- --enterprise join mesh1-...
+#
 # Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin,
 # MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub,
 # MESHVPN_ROOTLESS=1 for the same as --user.
@@ -26,10 +30,15 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 ROOTLESS="${MESHVPN_ROOTLESS:-}"
 [ "$ROOTLESS" = 0 ] && ROOTLESS=""
-if [ "${1:-}" = "--user" ] || [ "${1:-}" = "--rootless" ]; then
-    ROOTLESS=1
+[ "${MESHVPN_EDITION:-}" = enterprise ] && REPO="PlugOvr-ai/meshvpn-enterprise-releases"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user | --rootless) ROOTLESS=1 ;;
+        --enterprise) REPO="PlugOvr-ai/meshvpn-enterprise-releases" ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 
 OS="$(uname -s)"
 case "$OS/$(uname -m)" in
