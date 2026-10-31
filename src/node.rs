@@ -476,7 +476,8 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         node.cfg.name, my_ip, node.cfg.interface, node.cfg.network, node.ident.id
     );
 
-    if !node.cfg.ssh_allow.is_empty() || !node.cfg.ssh_allow_all.is_empty() {
+    // An extension may grant logins too (e.g. bench reservations).
+    if !node.cfg.ssh_allow.is_empty() || !node.cfg.ssh_allow_all.is_empty() || crate::ext::get().is_some() {
         match crate::sshd::enable_if_installed() {
             Ok(true) => info!(
                 "enabled password-less SSH logins from mesh nodes in sshd ({})",
