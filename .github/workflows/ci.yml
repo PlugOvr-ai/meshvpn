@@ -24,6 +24,8 @@ jobs:
         run: shellcheck install.sh deploy.sh tests/macos/smoke.sh
 
   macos:
+    # Paused: Linux first (enterprise). Remove this line to build and test it again.
+    if: false
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +40,8 @@ jobs:
         run: tests/macos/smoke.sh target/release/meshvpn
 
   windows:
+    # Paused: Linux first (enterprise). Remove this line to build and test it again.
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7

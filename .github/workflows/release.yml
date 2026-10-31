@@ -70,6 +70,8 @@ jobs:
           path: dist/*
 
   macos:
+    # Paused: Linux first (enterprise). Remove this line to build and test it again.
+    if: false
     # Built natively on a Mac (both architectures), after the macOS smoke test.
     name: build macOS
     runs-on: macos-latest
@@ -103,6 +105,8 @@ jobs:
           path: dist/*
 
   windows:
+    # Paused: Linux first (enterprise). Remove this line to build and test it again.
+    if: false
     name: build Windows
     runs-on: windows-latest
     steps:
@@ -164,7 +168,8 @@ jobs:
 
   release:
     # Published only when every end-to-end test passed.
-    needs: [build, macos, windows, desktop, e2e]
+    # (macOS and Windows are paused: add them back to `needs` with them)
+    needs: [build, desktop, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -190,7 +195,7 @@ jobs:
         working-directory: dist
         run: |
           cp ../install.sh ../install.ps1 ../deploy.sh .
-          for f in *.tar.gz *.zip; do sha256sum "$f" > "$f.sha256"; done
+          for f in *.tar.gz *.zip; do [ -e "$f" ] || continue; sha256sum "$f" > "$f.sha256"; done
           sha256sum -- meshvpn-* *.deb *.rpm install.sh install.ps1 deploy.sh | grep -v '\.sha256$' > SHA256SUMS
           ls -l
 
