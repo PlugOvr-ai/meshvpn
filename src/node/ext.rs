@@ -344,6 +344,7 @@ mod tests {
                 ),
                 k("alice", vec![], vec![gw]),
                 k("alice", vec![], vec![]),                                // no source: never
+                k("guest", vec!["restrict", "port-forwarding"], vec![]),   // no source but restricted: fine
                 k("alice", vec!["command=\"x\"\nssh-rsa AAAA"], vec![gw]), // smuggled line: never
             ],
             only: None,
