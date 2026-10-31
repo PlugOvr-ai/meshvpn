@@ -264,3 +264,9 @@ section.step + section.step { border-top: 0; padding-top: 1rem; }
 .tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
 .tabpanel { padding-bottom: 3rem; }
 .legend .n::before { width: 2px; background: var(--fg); }
+
+/* Developer experience section; queued jobs on the board */
+.ws { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr); gap: clamp(2rem, 4vw, 3.5rem); align-items: start; }
+@media (max-width: 960px) { .ws { grid-template-columns: minmax(0, 1fr); } }
+.bk.job { background: var(--accent-soft); color: var(--accent); border: 1px dashed var(--accent); }
+.legend .j::before { background: var(--accent-soft); outline: 1px dashed var(--accent); outline-offset: -1px; }

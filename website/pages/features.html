@@ -4,7 +4,7 @@
   <p class="eyebrow">Features</p>
   <h1>One program. Every node is the same.</h1>
   <p class="lead">The open-source core connects machines anywhere. The enterprise edition adds who may use which machine, when, and with which rights. Both are the same <code>meshvpn</code> binary.</p>
-  <div class="btn-row"><a class="btn" href="#network">Network</a><a class="btn" href="#access">Access</a><a class="btn" href="#work">Working across nodes</a><a class="btn" href="#enterprise">Enterprise</a><a class="btn" href="#platforms">Platforms</a></div>
+  <div class="btn-row"><a class="btn" href="#network">Network</a><a class="btn" href="#access">Access</a><a class="btn" href="#work">Working across nodes</a><a class="btn" href="#enterprise">Enterprise</a><a class="btn" href="#jobs">Jobs and homes</a><a class="btn" href="#platforms">Platforms</a></div>
 </div>
 </div>
 
@@ -65,6 +65,23 @@
     <div class="feat"><h3>Self-hosted</h3><p>Everything runs on your machines. Only a trial request goes to PlugOvr's license server, and updates come from GitHub. Your traffic and your policy never leave your network.</p></div>
   </div>
   <div class="btn-row" style="margin-top:2rem"><a class="btn primary" href="{{root}}tutorials/test-bench.html">Tutorial: book a test bench</a><a class="btn" href="{{root}}pricing.html">Pricing</a></div>
+</div></section>
+
+<section id="jobs"><div class="wrap">
+  <div class="section-head"><span class="tag ent">enterprise</span><h2>Jobs and homes: your own workstation on a shared cluster</h2>
+    <p class="lead">Queued jobs use every node nobody has booked. When someone books one, the job saves a checkpoint, steps aside, and continues on the next free nodes with your home and its name. You keep working as if the machine were yours.</p></div>
+  <div class="grid g3">
+    <div class="feat"><h3>A queue that fills the gaps</h3><p><code>meshvpn job submit tag:a100 --count 4 -- torchrun train.py</code> runs as soon as four nodes are free, and keeps running as long as nobody needs them.</p></div>
+    <div class="feat"><h3>Bookings always win</h3><p>Before a booking starts, the job on its nodes gets a stop request (a stop file, optionally a signal), saves its checkpoint within the grace period and goes back into the queue.</p></div>
+    <div class="feat"><h3>Resume where it stopped</h3><p>The next run gets <code>MESHVPN_RESUME=1</code> and the same home with the checkpoint in it, also on other nodes. torchrun gets its rendezvous arguments for the new nodes.</p></div>
+    <div class="feat"><h3>Homes that follow you</h3><p>Your home lives where you used it last and comes to the next machine before you need it, copying only what changed. One extra copy on another node keeps it available.</p></div>
+    <div class="feat"><h3>A home per purpose</h3><p>Next to your default home, keep homes for projects or experiments, each with its own rules: deleted with its job, after a date, or kept. Old copies go after 7 days, right away, or never, as you choose.</p></div>
+    <div class="feat"><h3>A name that follows the job</h3><p><code>train42.mesh</code> always points to the job's first node, on every node and through the gateway. Host certificates keep <code>ssh</code> free of warnings after a move.</p></div>
+    <div class="feat"><h3>The same user everywhere</h3><p>One user id per person on every node, so files keep their owner wherever the home goes. Accounts that existed before are never touched.</p></div>
+    <div class="feat"><h3>People and agents in one queue</h3><p>AI agents submit jobs and book nodes like people, under the same rules, in the same audit log.</p></div>
+    <div class="feat"><h3>Survives restarts</h3><p>With systemd, every run is its own unit: updating meshvpn doesn't stop a running job.</p></div>
+  </div>
+  <div class="btn-row" style="margin-top:2rem"><a class="btn primary" href="{{root}}tutorials/jobs.html">Tutorial: jobs that step aside</a></div>
 </div></section>
 
 <section id="platforms"><div class="wrap">
