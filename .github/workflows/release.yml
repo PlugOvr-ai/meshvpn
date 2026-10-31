@@ -174,6 +174,18 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      - name: SBOM (CycloneDX)
+        run: |
+          # The software bill of materials: every crate the released program is built from.
+          sed -i "0,/^version = .*/s//version = \"${TAG#v}\"/" Cargo.toml
+          cargo cyclonedx --format json
+          mv ./*.cdx.json dist/meshvpn-${TAG}.cdx.json
+          git checkout Cargo.toml Cargo.lock
+          jq -e '.components | length > 50' dist/meshvpn-${TAG}.cdx.json
+
       - name: Checksums
         working-directory: dist
         run: |

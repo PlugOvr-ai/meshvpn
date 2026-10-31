@@ -447,6 +447,9 @@ Set `RUST_LOG=meshvpn=debug` for verbose logs.
 
 ## Security model and limitations
 
+Found a vulnerability? Please report it privately, see [SECURITY.md](SECURITY.md). Every release has SHA-256 checksums
+and a CycloneDX software bill of materials (`meshvpn-<version>.cdx.json`).
+
 * In managed networks (the default since v0.7) only admins invite, ban and change the admins. In open networks every
   member can do all of that. Members are trusted either way: they can reach each other's services and share data.
   Treat invite codes like passwords until they are used or expire. If two admins ban nodes at the same moment, run the
@@ -486,7 +489,7 @@ tests/e2e/run.py --binary ... --keep nat_traversal                              
 They run on every push, and a release is only published when all of them pass.
 
 To publish a release, push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow then builds static
-binaries for every architecture, `.deb`/`.rpm` packages and checksums, and attaches `install.sh`.
+binaries for every architecture, `.deb`/`.rpm` packages, checksums and the SBOM, and attaches `install.sh`.
 
 The end-to-end behavior was tested with three rootless network namespaces: a public node, a NAT'd node without a
 listener, and a node whose firewall only allows SSH to a jump host. That covered direct links, relayed traffic, SSH
