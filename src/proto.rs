@@ -24,6 +24,10 @@ pub const T_ROSTER: u8 = 13;
 pub const T_CLAIM: u8 = 14;
 /// Why a node was turned away (sent to it right before the connection is closed).
 pub const T_REJECT: u8 = 15;
+/// An admin-signed document for extensions (gossiped, kept by every node).
+pub const T_DOC: u8 = 16;
+/// A signed message from one node's extension to another's (routed like data).
+pub const T_EXT: u8 = 17;
 
 /// A JSON document signed by a node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

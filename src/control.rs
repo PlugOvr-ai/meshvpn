@@ -15,6 +15,10 @@ use crate::node::{Node, Status};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    /// For the installed extension (`crate::ext`); it decides what needs privileges.
+    Ext {
+        body: serde_json::Value,
+    },
     /// For sshd's AuthorizedKeysCommand (runs as nobody).
     AuthorizedKeys {
         user: String,
@@ -173,8 +177,12 @@ async fn serve_unix(node: Arc<Node>, path: PathBuf) {
     crate::sys::set_mode(&path, 0o666).ok();
     let me = unsafe { libc::geteuid() };
     while let Ok((stream, _)) = listener.accept().await {
-        let privileged = stream.peer_cred().is_ok_and(|c| c.uid() == 0 || c.uid() == me);
-        tokio::spawn(handle(node.clone(), stream, privileged));
+        let cred = stream.peer_cred().ok();
+        let caller = crate::ext::Caller {
+            privileged: cred.is_some_and(|c| c.uid() == 0 || c.uid() == me),
+            user: cred.and_then(|c| crate::sys::user_name_of(c.uid())),
+        };
+        tokio::spawn(handle(node.clone(), stream, caller));
     }
 }
 
@@ -232,12 +240,15 @@ async fn serve_pipe(node: Arc<Node>, path: PathBuf) {
         let mut pid = 0u32;
         let privileged = unsafe { GetNamedPipeClientProcessId(server.as_raw_handle() as _, &mut pid) } != 0
             && crate::sys::pid_elevated(pid);
-        tokio::spawn(handle(node.clone(), server, privileged));
+        // Windows: who is behind the pipe isn't looked up (yet); elevated callers act as admins.
+        let caller = crate::ext::Caller { privileged, user: None };
+        tokio::spawn(handle(node.clone(), server, caller));
     }
 }
 
 /// One request and its answer.
-async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, stream: S, privileged: bool) {
+async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, stream: S, caller: crate::ext::Caller) {
+    let privileged = caller.privileged;
     let (r, mut w) = tokio::io::split(stream);
     let mut line = String::new();
     // Any local user may connect: one request line, at most 1 MB.
@@ -245,7 +256,34 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
         return;
     }
     let resp = match serde_json::from_str::<Request>(&line) {
-        Ok(Request::Status) => Response::Status(Box::new(node.status())),
+        Ok(Request::Status) => {
+            let mut st = node.status();
+            if let Some(e) = crate::ext::get() {
+                let n = node.clone();
+                st.extension = tokio::task::spawn_blocking(move || e.status(&crate::ext::Ctx { node: n }))
+                    .await
+                    .ok()
+                    .flatten();
+            }
+            Response::Status(Box::new(st))
+        }
+        Ok(Request::Ext { body }) => match crate::ext::get() {
+            Some(e) => {
+                let n = node.clone();
+                let r =
+                    tokio::task::spawn_blocking(move || e.control(&crate::ext::Ctx { node: n }, body, &caller)).await;
+                match r {
+                    Ok(Ok(v)) => Response::Message { text: v.to_string() },
+                    Ok(Err(e)) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                    Err(e) => Response::Error { message: e.to_string() },
+                }
+            }
+            None => Response::Error {
+                message: "this meshvpn has no extension for that".into(),
+            },
+        },
         Ok(Request::AuthorizedKeys { user }) => Response::Message {
             text: node.authorized_keys(&user),
         },

@@ -23,6 +23,7 @@ use crate::proto::*;
 
 mod admin;
 mod exit;
+mod ext;
 mod gpu;
 mod udp;
 
@@ -53,7 +54,7 @@ const GOSSIP_BYTES: usize = 48 * 1024;
 /// set up again) is forgotten automatically after this long.
 const AUTO_FORGET_AFTER: Duration = Duration::from_secs(600);
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -178,6 +179,8 @@ struct State {
     id_prefix: HashMap<[u8; 8], NodeId>,
     my_udp: Vec<String>,
     my_udp6: Vec<String>,
+    /// Admin-signed documents for extensions, newest per kind.
+    docs: HashMap<String, (crate::ext::Doc, SignedDoc)>,
     /// Our public IPv4 address as other nodes outside our networks see it (for the NAT check).
     udp_seen: HashMap<NodeId, (SocketAddr, Instant)>,
     /// Managed networks (see node/admin.rs).
@@ -209,6 +212,8 @@ pub struct Node {
     udp: Option<Arc<tokio::net::UdpSocket>>,
     /// The IPv6 socket (same port; no NAT on the way, so direct paths through most firewalls).
     udp6: Option<Arc<tokio::net::UdpSocket>>,
+    /// Documents changed: tell the extension.
+    ext_notify: tokio::sync::Notify,
     /// The built-in SSH server (see sshserver.rs).
     ssh_cfg: Arc<russh::server::Config>,
     /// Kernel mode: the built-in SSH server listens on the mesh address.
@@ -306,6 +311,9 @@ pub struct Status {
     /// IPv6 addresses for direct paths.
     #[serde(default)]
     pub ipv6: Vec<String>,
+    /// What an extension reports (e.g. its features and their state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension: Option<serde_json::Value>,
     pub peers: Vec<PeerStatus>,
 }
 
@@ -407,6 +415,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         socks,
         shares: crate::share::Store::load(&dir),
         udp6: udp::bind6(udp.as_ref()).await,
+        ext_notify: tokio::sync::Notify::new(),
         udp,
         ssh_cfg: crate::sshserver::config(&ident_for_ssh),
         ssh_listening: std::sync::atomic::AtomicBool::new(false),
@@ -441,6 +450,9 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
             if let Err(e) = node.accept_claim(&mut st, c) {
                 debug!("dropping saved admission: {e:#}");
             }
+        }
+        for d in saved.docs.clone() {
+            node.accept_doc(&mut st, d);
         }
         if let Some(r) = saved.rotation
             && let Ok(body) = r.verify(&node.net)
@@ -551,6 +563,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     }
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
     node.exit_start();
+    node.ext_run();
 
     #[cfg(unix)]
     {
@@ -793,6 +806,7 @@ impl Node {
         all.extend(st.my_signed.clone());
         // Roster and admissions first: the records of invited nodes depend on them.
         let mut frames = self.admin_frames(st);
+        frames.extend(self.doc_frames(st));
         frames.extend(gossip_frames(&all));
         if let Some((r, _)) = &st.rotation {
             frames.insert(0, frame(T_ROTATE, &serde_json::to_vec(r).unwrap()));
@@ -901,8 +915,8 @@ impl Node {
         ip: Ipv4Addr,
         key: &russh::keys::PublicKey,
     ) -> std::result::Result<String, String> {
+        let access = self.ext_ssh_access();
         let st = self.state.lock().unwrap();
-        let everyone = st.ssh_allow_all.iter().any(|u| u == user);
         let Some(rec) = st.records.values().find(|r| overlay_ip(&r.info.id) == ip) else {
             return Err(format!("{ip} is not a known mesh node"));
         };
@@ -910,8 +924,10 @@ impl Node {
         if st.banned.contains_key(&rec.info.id) {
             return Err(format!("{node} is banned"));
         }
-        let rules: Vec<_> = st
-            .ssh_allow
+        let all_rules = Self::ssh_rules(&st, &access);
+        let in_scope = access.only.as_ref().is_none_or(|o| o.contains(&rec.info.id));
+        let everyone = in_scope && st.ssh_allow_all.iter().any(|u| u == user);
+        let rules: Vec<_> = all_rules
             .iter()
             .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
             .collect();
@@ -964,12 +980,14 @@ impl Node {
     /// What sshd asks (AuthorizedKeysCommand): keys that may log in as local `user`, each
     /// pinned to its node's mesh IP (which meshvpn guarantees can't be spoofed).
     pub fn authorized_keys(&self, user: &str) -> String {
+        let access = self.ext_ssh_access();
         let st = self.state.lock().unwrap();
-        let everyone = st.ssh_allow_all.iter().any(|u| u == user);
+        let all_rules = Self::ssh_rules(&st, &access);
         let mut lines: Vec<String> = vec![];
         for rec in st.records.values() {
-            let rules: Vec<_> = st
-                .ssh_allow
+            let in_scope = access.only.as_ref().is_none_or(|o| o.contains(&rec.info.id));
+            let everyone = in_scope && st.ssh_allow_all.iter().any(|u| u == user);
+            let rules: Vec<_> = all_rules
                 .iter()
                 .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
                 .collect();
@@ -984,6 +1002,23 @@ impl Node {
             }
         }
         lines.concat()
+    }
+
+    /// This machine's login rules (limited by an extension, if it says so) and the extension's.
+    fn ssh_rules(st: &State, access: &crate::ext::SshAccess) -> Vec<crate::config::SshAllow> {
+        let mut rules: Vec<crate::config::SshAllow> = st
+            .ssh_allow
+            .iter()
+            .filter(|r| access.only.as_ref().is_none_or(|o| o.contains(&r.node)))
+            .cloned()
+            .collect();
+        rules.extend(access.grant.iter().map(|g| crate::config::SshAllow {
+            node: g.node,
+            name: String::new(),
+            from_user: g.from_user.clone(),
+            users: g.users.clone(),
+        }));
+        rules
     }
 
     /// Resolves `[user@]node` to a rule key.
@@ -2064,6 +2099,8 @@ impl Node {
                 T_ROSTER | T_CLAIM => {
                     self.dispatch_admin(kind, peer, payload);
                 }
+                T_DOC => self.handle_doc(peer, payload),
+                T_EXT => self.handle_ext(payload),
                 T_REJECT => {
                     let why: String = String::from_utf8_lossy(payload).chars().take(300).collect();
                     let mut st = self.state.lock().unwrap();
@@ -2307,6 +2344,7 @@ impl Node {
             roster: st.roster.as_ref().map(|(r, _)| r.clone()),
             claims: st.claims.values().map(|a| a.msg.clone()).collect(),
             leases: st.leases.clone(),
+            docs: st.docs.values().map(|(_, s)| s.clone()).collect(),
         };
         drop(st);
         if let Err(e) = saved.save(&self.dir) {
@@ -2507,6 +2545,7 @@ impl Node {
             nat: nat.as_ref().map(|n| n.describe()),
             nat_hard: nat == Some(udp::NatKind::ChangesPort),
             ipv6,
+            extension: None,
             version: crate::update::CURRENT.into(),
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),

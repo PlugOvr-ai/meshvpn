@@ -262,7 +262,10 @@ impl Node {
     /// are an exit.
     pub(super) fn may_deliver(&self, pkt: &[u8]) -> bool {
         let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-        dst == self.my_ip || (is_public(dst) && self.state.lock().unwrap().exit_offer)
+        if dst == self.my_ip {
+            return self.ext_allows(pkt);
+        }
+        is_public(dst) && self.state.lock().unwrap().exit_offer
     }
 
     /// Applies the saved exit settings when meshvpn starts.

@@ -454,6 +454,9 @@ pub struct SavedState {
     /// GPU reservations on this node.
     #[serde(default)]
     pub leases: Vec<crate::proto::Lease>,
+    /// Admin-signed documents for extensions.
+    #[serde(default)]
+    pub docs: Vec<crate::proto::SignedDoc>,
 }
 
 impl SavedState {

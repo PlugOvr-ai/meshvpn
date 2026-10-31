@@ -466,3 +466,12 @@ pub fn global_ipv6() -> Vec<std::net::Ipv6Addr> {
             .collect()
     }
 }
+
+/// The name of account `uid`.
+#[cfg(unix)]
+pub fn user_name_of(uid: u32) -> Option<String> {
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        (!pw.is_null()).then(|| std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
+    }
+}

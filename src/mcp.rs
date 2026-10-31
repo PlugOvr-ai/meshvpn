@@ -332,7 +332,7 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             let (st, mut nodes) = targets(dir, args)?;
             nodes.retain(|n| n.online);
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(1) as u32;
-            let ttl = crate::parse_duration_ms(args.get("for").and_then(Value::as_str).unwrap_or("2h"))?;
+            let ttl = crate::cli::parse_duration_ms(args.get("for").and_then(Value::as_str).unwrap_or("2h"))?;
             let holder = crate::gpu::default_holder(args.get("note").and_then(Value::as_str));
             let r = remote(&st, args, 60);
             let grants = if args.get("one").and_then(Value::as_bool).unwrap_or(false) {
@@ -360,7 +360,7 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
             let renew = args
                 .get("renew_for")
                 .and_then(Value::as_str)
-                .map(crate::parse_duration_ms)
+                .map(crate::cli::parse_duration_ms)
                 .transpose()?;
             let mut out = vec![];
             for id in strings(args, "ids") {
