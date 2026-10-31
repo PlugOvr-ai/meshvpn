@@ -6,7 +6,7 @@ use crate::ext::{Ctx, Doc, Extension, Inbound, Peer, SshAccess, View};
 
 /// sshd option text an extension may pass on (no line breaks, quotes balanced).
 fn safe_option(o: &str) -> bool {
-    !o.is_empty() && o.len() < 512 && !o.contains(['\n', '\r']) && o.matches('"').count() % 2 == 0
+    !o.is_empty() && o.len() < 512 && !o.contains(['\n', '\r']) && o.matches('"').count().is_multiple_of(2)
 }
 
 /// The largest document a node accepts (a policy for thousands of devices fits easily).
