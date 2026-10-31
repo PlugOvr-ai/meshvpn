@@ -925,6 +925,18 @@ impl Node {
         if st.banned.contains_key(&rec.info.id) {
             return Err(format!("{node} is banned"));
         }
+        // The extension's keys (only those without sshd options: those need sshd).
+        for k in access
+            .keys
+            .iter()
+            .filter(|k| k.user == user && k.from.contains(&ip) && k.options.is_empty())
+        {
+            if let Ok(pk) = russh::keys::PublicKey::from_openssh(&k.key)
+                && pk.key_data() == key.key_data()
+            {
+                return Ok(format!("{} via {}", k.comment, rec.info.name));
+            }
+        }
         let all_rules = Self::ssh_rules(&st, &access);
         let in_scope = access.only.as_ref().is_none_or(|o| o.contains(&rec.info.id));
         let everyone = in_scope && st.ssh_allow_all.iter().any(|u| u == user);
@@ -1002,24 +1014,21 @@ impl Node {
                 }
             }
         }
+        for line in Self::ext_key_lines(&access, user) {
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
         lines.concat()
     }
 
     /// This machine's login rules (limited by an extension, if it says so) and the extension's.
     fn ssh_rules(st: &State, access: &crate::ext::SshAccess) -> Vec<crate::config::SshAllow> {
-        let mut rules: Vec<crate::config::SshAllow> = st
-            .ssh_allow
+        st.ssh_allow
             .iter()
             .filter(|r| access.only.as_ref().is_none_or(|o| o.contains(&r.node)))
             .cloned()
-            .collect();
-        rules.extend(access.grant.iter().map(|g| crate::config::SshAllow {
-            node: g.node,
-            name: String::new(),
-            from_user: g.from_user.clone(),
-            users: g.users.clone(),
-        }));
-        rules
+            .collect()
     }
 
     /// Resolves `[user@]node` to a rule key.

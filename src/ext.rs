@@ -29,6 +29,12 @@ pub struct Peer {
     pub admin: bool,
     /// Users of the node that publish an SSH key.
     pub ssh_users: Vec<String>,
+    /// meshvpn version the node runs.
+    pub version: String,
+    /// Hardware and load as the node publishes it (CPU, memory, disk, GPUs with utilization).
+    pub inventory: serde_json::Value,
+    /// Seconds since the node was last heard of (None: never, or this node).
+    pub last_seen_secs: Option<u64>,
 }
 
 /// The network right now (a copy: extensions never hold meshvpn's locks).
@@ -65,20 +71,26 @@ pub struct Doc {
     pub data: String,
 }
 
-/// SSH logins: `users` of this machine for key owner `from_user` (any if None) of `node`.
+/// A key that may log in as local account `user`, from the mesh addresses `from` only (e.g. a
+/// gateway the logins come through). `options` are sshd's authorized_keys options, such as
+/// `restrict` or `permitopen="host:22"`; keys with options only work with sshd (the built-in
+/// SSH server can't apply them and skips them).
 #[derive(Clone, Debug)]
-pub struct SshGrant {
-    pub node: NodeId,
-    pub from_user: Option<String>,
-    pub users: Vec<String>,
+pub struct AuthorizedKey {
+    pub user: String,
+    /// "ssh-ed25519 AAAA..."
+    pub key: String,
+    pub from: Vec<Ipv4Addr>,
+    pub options: Vec<String>,
+    pub comment: String,
 }
 
 /// What an extension says about SSH logins into this machine.
 #[derive(Clone, Debug, Default)]
 pub struct SshAccess {
-    /// Logins on top of this machine's own rules.
-    pub grant: Vec<SshGrant>,
-    /// If set, this machine's own rules only apply to these nodes (e.g. a reserved bench).
+    /// Keys on top of this machine's own rules.
+    pub keys: Vec<AuthorizedKey>,
+    /// If set, this machine's own rules only apply to these nodes.
     pub only: Option<HashSet<NodeId>>,
 }
 
