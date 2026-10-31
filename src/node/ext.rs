@@ -247,16 +247,21 @@ impl Node {
         }
     }
 
-    /// The extension's keys for local `user`, as authorized_keys lines (sshd).
+    /// The extension's keys for local `user`, as authorized_keys lines (sshd). A key without
+    /// source addresses must come with `restrict` (no shell: e.g. a gateway's jump account).
     pub(super) fn ext_key_lines(access: &SshAccess, user: &str) -> Vec<String> {
         access
             .keys
             .iter()
-            .filter(|k| k.user == user && !k.from.is_empty() && crate::proto::valid_ssh_key(&k.key))
+            .filter(|k| k.user == user && crate::proto::valid_ssh_key(&k.key))
+            .filter(|k| !k.from.is_empty() || k.options.iter().any(|o| o == "restrict"))
             .filter(|k| k.options.iter().all(|o| safe_option(o)) && !k.comment.contains(['\n', '\r']))
             .map(|k| {
-                let from: Vec<String> = k.from.iter().map(|ip| ip.to_string()).collect();
-                let mut opts = vec![format!("from=\"{}\"", from.join(","))];
+                let mut opts = vec![];
+                if !k.from.is_empty() {
+                    let from: Vec<String> = k.from.iter().map(|ip| ip.to_string()).collect();
+                    opts.push(format!("from=\"{}\"", from.join(",")));
+                }
                 opts.extend(k.options.iter().cloned());
                 format!("{} {} {}\n", opts.join(","), k.key, k.comment.replace(' ', "_"))
             })
@@ -354,5 +359,9 @@ mod tests {
             vec![format!("from=\"100.64.0.9\" {key} booking_r1\n")]
         );
         assert!(Node::ext_key_lines(&access, "bob").is_empty());
+        assert_eq!(
+            Node::ext_key_lines(&access, "guest"),
+            vec![format!("restrict,port-forwarding {key} booking_r1\n")]
+        );
     }
 }
