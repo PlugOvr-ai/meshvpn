@@ -11,7 +11,9 @@ pub const REPO: &str = "PlugOvr-ai/meshvpn";
 /// Where releases of this build come from: an extension's own (enterprise builds update to
 /// enterprise builds), else the open-source repository.
 pub fn repo() -> String {
-    crate::ext::get().and_then(|e| e.release_repo()).unwrap_or_else(|| REPO.to_string())
+    crate::ext::get()
+        .and_then(|e| e.release_repo())
+        .unwrap_or_else(|| REPO.to_string())
 }
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const TARGET: &str = env!("MESHVPN_RELEASE_TARGET");
