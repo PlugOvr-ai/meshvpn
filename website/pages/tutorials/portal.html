@@ -96,7 +96,8 @@
 
 <section class="step" id="s9"><p class="step-n">STEP 9</p><h2>Day to day</h2>
 <ul>
-<li><strong>People</strong> see the devices, book one or several for a time, exclusive or shared, and cancel their bookings under <strong>Devices</strong> and <strong>My bookings</strong>. The portal shows them the <code>ssh -J</code> command for each booked device.</li>
+<li><strong>People</strong> start in their <strong>Workspace</strong>: a one-time setup of their computer (the <code>~/.ssh/config</code> block and the host CA line, with copy buttons), their jobs with <code>ssh &lt;job&gt;.mesh</code>, their bookings and their homes. They queue jobs there, add homes and set their rules, and end bookings. Under <strong>Devices</strong> they see every machine, its GPUs and who has it, and book one or several, exclusive or shared.</li>
+<li><strong>Jobs</strong>: the portal schedules them in every network it is admin of (with a valid license): it turns the scheduler on by itself and signs the nodes' host certificates. See <a href="{{root}}tutorials/jobs.html">Jobs that step aside</a>.</li>
 <li><strong>Everyone</strong> manages their SSH keys and API keys under <strong>Account</strong>.</li>
 <li><strong>Admins</strong> open each network's <strong>Audit log</strong>: who changed and booked what.</li>
 <li><strong>Updates</strong>: run the installer again. It keeps the data in <code>/var/lib/meshvpn-portal</code>. Update the nodes with <code>sudo meshvpn update</code>.</li>

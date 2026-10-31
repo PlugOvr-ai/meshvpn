@@ -78,14 +78,19 @@ dist.destroy_process_group()</pre></div>
 </section>
 
 <section class="step" id="s3"><p class="step-n">STEP 3</p><h2>Turn on the scheduler</h2>
-<p>One admin node places jobs and signs the nodes' SSH host certificates. Pick one that is always on:</p>
+<p>One admin node places jobs and signs the nodes' SSH host certificates. In networks the <a href="{{root}}tutorials/portal.html">portal</a> manages, the portal does it by itself. Without a portal, pick an admin node that is always on:</p>
 <div class="code"><span class="label">on the admin node</span><pre><span class="p">$ </span>sudo meshvpn job scheduler enable
 <span class="o">adm schedules jobs and signs host certificates</span></pre></div>
-<p>The network now has its own SSH host CA. <code>meshvpn job list</code> prints the line your users add to their <code>~/.ssh/known_hosts</code> once, so that <code>ssh</code> trusts every node by its certificate, also after a job moved:</p>
+<p>The network now has its own SSH host CA. The portal's Workspace shows each user the line to add, with a copy button (and <code>meshvpn job list</code> prints it) to their <code>~/.ssh/known_hosts</code> once, so that <code>ssh</code> trusts every node by its certificate, also after a job moved:</p>
 <div class="code"><span class="label">on your laptop, once</span><pre><span class="p">$ </span>echo '@cert-authority *.mesh ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...' &gt;&gt; ~/.ssh/known_hosts</pre></div>
 </section>
 
 <section class="step" id="s4"><p class="step-n">STEP 4</p><h2>Submit a job</h2>
+<p>Users do it themselves in the portal: <strong>Workspace → New job</strong> (nodes, how many, a name, the command, which home). Agents use the same API with their key:</p>
+<div class="code"><pre><span class="p">$ </span>curl -H "Authorization: Bearer mvk_..." -H "Content-Type: application/json" \
+       -d '{"network":"cluster","select":"tag:a100","count":4,"name":"train42","command":"torchrun --nproc_per_node 8 train.py"}' \
+       https://portal.example.com/api/jobs</pre></div>
+<p>Or an admin on the command line:</p>
 <div class="code"><span class="label">on the admin node</span><pre><span class="p">$ </span>sudo meshvpn job submit tag:a100 --count 4 --user alice --name train42 \
       --workdir projects/llm -- torchrun --nproc_per_node 8 train.py --config exp42.yaml
 <span class="o">job train42 (j3f9c21a0) for alice: 4 node(s) of tag:a100: torchrun --nproc_per_node 8 train.py --config exp42.yaml</span>
