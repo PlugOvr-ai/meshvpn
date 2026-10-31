@@ -58,6 +58,24 @@ jobs:
       - name: Smoke test (two nodes, Wintun, scheduled task)
         shell: pwsh
         run: tests\windows\smoke.ps1 target\release\meshvpn.exe
+      - name: install.ps1 in Windows PowerShell 5.1 (as users run it, from a local copy of a release)
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force rel, s | Out-Null
+          Copy-Item target\release\meshvpn.exe, target\release\wintun.dll s\
+          Compress-Archive s\* rel\meshvpn-x86_64-pc-windows-msvc.zip
+          (Get-FileHash rel\meshvpn-x86_64-pc-windows-msvc.zip).Hash.ToLower() + "  meshvpn-x86_64-pc-windows-msvc.zip" | Set-Content rel\meshvpn-x86_64-pc-windows-msvc.zip.sha256
+          Copy-Item install.ps1 rel\
+          $srv = Start-Process python -ArgumentList "-m", "http.server", "8765", "--directory", "rel" -PassThru -NoNewWindow
+          Start-Sleep 2
+          $env:MESHVPN_DOWNLOAD_URL = "http://127.0.0.1:8765"
+          irm http://127.0.0.1:8765/install.ps1 | iex
+          $v = & "$env:ProgramFiles\meshvpn\meshvpn.exe" --version
+          if ($LASTEXITCODE -ne 0 -or $v -notmatch "meshvpn") { throw "not installed: $v" }
+          # Again, now that it is installed (the update path).
+          irm http://127.0.0.1:8765/install.ps1 | iex
+          Stop-Process -Id $srv.Id -Force
+          Write-Host "install.ps1 works in Windows PowerShell $($PSVersionTable.PSVersion)"
 
   e2e:
     uses: ./.github/workflows/e2e.yml
