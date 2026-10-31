@@ -2365,6 +2365,7 @@ impl Node {
     /// Host keys of the nodes (as they publish them) for ssh clients, under the same names as
     /// in /etc/hosts.
     fn update_known_hosts(&self) {
+        let aliases = self.ext_host_names();
         let mut st = self.state.lock().unwrap();
         let mut recs: Vec<_> = st.records.values().collect();
         recs.sort_by_key(|r| {
@@ -2383,6 +2384,14 @@ impl Node {
                 format!("{}-{}", r.info.name, r.info.id.short())
             };
             entries.push((name, overlay_ip(&r.info.id), r.info.ssh_host_key.clone()));
+        }
+        // The extension's names: the host key of the node they point to.
+        for (alias, ip) in aliases {
+            if used.insert(alias.clone())
+                && let Some(key) = entries.iter().find(|e| e.1 == ip).map(|e| e.2.clone())
+            {
+                entries.push((alias, ip, key));
+            }
         }
         let mut text = String::new();
         for (name, ip, key) in entries {
@@ -2424,6 +2433,7 @@ impl Node {
         if !self.cfg.manage_hosts {
             return;
         }
+        let aliases = self.ext_host_names();
         let mut st = self.state.lock().unwrap();
         let mut entries = vec![(st.my_name.clone(), self.my_ip, self.ident.id)];
         // If two nodes share a name, the plain name goes to the one that is online and newest
@@ -2441,7 +2451,8 @@ impl Node {
             .map(|r| (r.info.name.clone(), overlay_ip(&r.info.id), r.info.id))
             .collect();
         entries.extend(others);
-        let block = crate::hosts::render(&entries);
+        let taken: HashSet<String> = entries.iter().map(|e| e.0.clone()).collect();
+        let block = crate::hosts::render(&entries) + &crate::hosts::render_aliases(&aliases, &taken);
         if block == st.hosts_written {
             return;
         }

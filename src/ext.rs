@@ -151,6 +151,14 @@ pub trait Extension: Send + Sync {
         SshAccess::default()
     }
 
+    /// More `<name>.mesh` names for /etc/hosts and meshvpn's known_hosts, e.g. a name that
+    /// follows a job to whichever node runs it. Names of nodes win over these; names must be
+    /// lower case letters, digits and `-`. Asked when meshvpn writes those files (after every
+    /// tick, among others): keep it fast.
+    fn host_names(&self, _view: &View) -> Vec<(String, Ipv4Addr)> {
+        vec![]
+    }
+
     /// Called for every packet: keep it fast (decide from state prepared in tick/docs_changed).
     fn allow_inbound(&self, _packet: &Inbound) -> bool {
         true
@@ -243,4 +251,16 @@ pub fn verify_ed25519(public_key: &[u8; 32], message: &[u8], signature: &[u8]) -
 
 pub fn now_ms() -> u64 {
     crate::node::now_ms()
+}
+
+/// torchrun's rendezvous arguments (`--nnodes`, `--node_rank`, `--master_addr`,
+/// `--master_port`, `--nproc_per_node` from MESHVPN_GPUS) added to `cmd` from `env`, unless
+/// given already - as `meshvpn launch` does.
+pub fn add_torchrun_args(cmd: &[String], env: &std::collections::HashMap<String, String>) -> Vec<String> {
+    crate::launch::add_torchrun_args(cmd, env)
+}
+
+/// The configured name of the mesh network interface (`mesh0` by default, on Linux).
+pub fn interface_name(dir: &Path) -> Option<String> {
+    crate::config::Config::load(dir).ok().map(|c| c.interface)
 }

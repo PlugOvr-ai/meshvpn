@@ -269,6 +269,22 @@ impl Node {
             .collect()
     }
 
+    /// The extension's extra host names (valid ones only).
+    pub(super) fn ext_host_names(&self) -> Vec<(String, Ipv4Addr)> {
+        let Some(ext) = Self::ext() else { return vec![] };
+        let valid = |n: &str| {
+            !n.is_empty()
+                && n.len() <= 63
+                && n.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && !n.starts_with('-')
+        };
+        ext.host_names(&self.ext_view())
+            .into_iter()
+            .filter(|(n, _)| valid(n))
+            .collect()
+    }
+
     /// Lets the extension filter a packet from the mesh to this node.
     pub(super) fn ext_allows(&self, pkt: &[u8]) -> bool {
         let Some(ext) = Self::ext() else { return true };
@@ -314,7 +330,12 @@ impl Node {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let n = node.clone();
-                let _ = tokio::task::spawn_blocking(move || ext.tick(&n.ext_ctx())).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    ext.tick(&n.ext_ctx());
+                    // Its host names may have changed.
+                    n.update_hosts();
+                })
+                .await;
             }
         });
     }

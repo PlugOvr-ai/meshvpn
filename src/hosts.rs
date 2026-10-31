@@ -28,6 +28,18 @@ pub fn render(entries: &[(String, Ipv4Addr, NodeId)]) -> String {
     out
 }
 
+/// An extension's extra names; names of nodes (`taken`) win.
+pub fn render_aliases(aliases: &[(String, Ipv4Addr)], taken: &HashSet<String>) -> String {
+    let mut used = taken.clone();
+    let mut out = String::new();
+    for (name, ip) in aliases {
+        if used.insert(name.clone()) {
+            out.push_str(&format!("{ip}\t{name}.mesh {name}\n"));
+        }
+    }
+    out
+}
+
 pub fn write(block: Option<&str>) -> Result<()> {
     let current = std::fs::read_to_string(HOSTS).unwrap_or_default();
     let mut kept = String::new();
@@ -63,4 +75,24 @@ pub fn write(block: Option<&str>) -> Result<()> {
             .status();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aliases_never_shadow_node_names() {
+        let ip = |n| Ipv4Addr::new(100, 64, 0, n);
+        let taken = HashSet::from(["dev1".to_string()]);
+        let out = render_aliases(
+            &[
+                ("train42".into(), ip(2)),
+                ("dev1".into(), ip(3)),
+                ("train42".into(), ip(4)),
+            ],
+            &taken,
+        );
+        assert_eq!(out, "100.64.0.2\ttrain42.mesh train42\n");
+    }
 }
