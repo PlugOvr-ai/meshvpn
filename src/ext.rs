@@ -131,6 +131,12 @@ pub trait Extension: Send + Sync {
         None
     }
 
+    /// The version of this build ("0.17.1"), if it has its own releases (see `release_repo`):
+    /// shown by `--version` and status, published to other nodes, compared by `meshvpn update`.
+    fn version(&self) -> Option<String> {
+        None
+    }
+
     /// Lines for `meshvpn --help`.
     fn help(&self) -> String {
         String::new()

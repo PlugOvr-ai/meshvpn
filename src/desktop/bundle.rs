@@ -108,7 +108,7 @@ pub fn setup(from: Option<&Path>) -> Result<Bundle> {
                 let tag = if crate::update::is_dev_build() {
                     crate::update::latest_tag(&client).await?
                 } else {
-                    format!("v{}", crate::update::CURRENT)
+                    format!("v{}", env!("CARGO_PKG_VERSION"))
                 };
                 crate::update::download_verified(&client, &tag, &archive_name())
                     .await

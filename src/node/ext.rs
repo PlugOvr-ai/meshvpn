@@ -78,7 +78,7 @@ impl Node {
             online: true,
             admin: Self::is_admin(&st, &self.ident.id),
             ssh_users: vec![],
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: crate::update::current(),
             inventory: serde_json::to_value(&st.inventory).unwrap_or_default(),
             last_seen_secs: None,
             client: Self::client_of(&st, &self.ident.id).map(|c| c.user.clone()),

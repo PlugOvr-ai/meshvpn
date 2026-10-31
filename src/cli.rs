@@ -592,6 +592,8 @@ pub fn main() {
     let cli = {
         use clap::{CommandFactory, FromArgMatches};
         let mut cmd = Cli::command();
+        // `--version` of this build (an extension's own release number).
+        cmd = cmd.version(&*Box::leak(crate::update::current().into_boxed_str()));
         if let Some(e) = crate::ext::get() {
             let help = e.help();
             if !help.is_empty() {
@@ -2437,15 +2439,15 @@ fn update_cmd(dir: &Path, check: bool, force: bool, json: bool) -> Result<()> {
     rt.block_on(async {
         let client = update::client(socks.as_deref())?;
         let tag = update::latest_tag(&client).await?;
-        if !update::is_newer(&tag, update::CURRENT) {
-            println!("meshvpn {} is up to date", update::CURRENT);
+        if !update::is_newer(&tag, &update::current()) {
+            println!("meshvpn {} is up to date", update::current());
         } else if check {
-            println!("meshvpn {tag} is available (running {})", update::CURRENT);
+            println!("meshvpn {tag} is available (running {})", update::current());
         } else if update::is_dev_build() && !force {
             bail!("this is a development build - update it with git pull && cargo build (or use --force)");
         } else {
             let exe = update::install(&client, &tag).await?;
-            println!("updated {} -> {tag} ({})", update::CURRENT, exe.display());
+            println!("updated {} -> {tag} ({})", update::current(), exe.display());
         }
         Ok(())
     })

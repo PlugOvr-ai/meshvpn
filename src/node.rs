@@ -689,7 +689,7 @@ impl Node {
             neighbors,
             seq: st.my_seq,
             net: self.net.clone(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: crate::update::current(),
             tags: st.my_tags.clone(),
             inventory: st.inventory.clone(),
             lan: crate::net::local_lans()
@@ -2596,7 +2596,7 @@ impl Node {
             nat_hard: nat == Some(udp::NatKind::ChangesPort),
             ipv6,
             extension: None,
-            version: crate::update::CURRENT.into(),
+            version: crate::update::current(),
             update_available: st.update_available.clone(),
             banned: st.banned.values().cloned().collect(),
             socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
@@ -2646,13 +2646,13 @@ impl Node {
         use crate::update;
         let client = self.update_client()?;
         let tag = update::latest_tag(&client).await?;
-        if !update::is_newer(&tag, update::CURRENT) {
+        if !update::is_newer(&tag, &update::current()) {
             self.state.lock().unwrap().update_available = None;
-            return Ok(format!("meshvpn {} is up to date", update::CURRENT));
+            return Ok(format!("meshvpn {} is up to date", update::current()));
         }
         self.state.lock().unwrap().update_available = Some(tag.clone());
         if check_only {
-            return Ok(format!("meshvpn {tag} is available (running {})", update::CURRENT));
+            return Ok(format!("meshvpn {tag} is available (running {})", update::current()));
         }
         if update::is_dev_build() && !force {
             bail!("this is a development build - update it with git pull && cargo build (or use --force)");
@@ -2666,7 +2666,7 @@ impl Node {
             tokio::time::sleep(Duration::from_millis(500)).await;
             node.restart(exe);
         });
-        Ok(format!("updated {} -> {tag}, restarting", update::CURRENT))
+        Ok(format!("updated {} -> {tag}, restarting", update::current()))
     }
 
     async fn update_loop(self: Arc<Self>) {

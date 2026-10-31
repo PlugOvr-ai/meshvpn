@@ -82,7 +82,7 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     c.push(check(
         "version",
         Level::Info,
-        format!("meshvpn {} ({exe})", env!("CARGO_PKG_VERSION")),
+        format!("meshvpn {} ({exe})", crate::update::current()),
         None,
     ));
     if crate::config::rootless() {
@@ -204,7 +204,7 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             Some("ask an admin for a new invite: meshvpn invite (on an admin node), then: sudo meshvpn join --force <invite>"),
         ));
     }
-    let older = crate::update::is_newer(env!("CARGO_PKG_VERSION"), &st.version);
+    let older = crate::update::is_newer(&crate::update::current(), &st.version);
     if older {
         c.push(check(
             "daemon",
@@ -212,7 +212,7 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             format!(
                 "the running daemon is meshvpn {} - older than this one ({}), so newer checks and features are missing",
                 st.version,
-                env!("CARGO_PKG_VERSION")
+                crate::update::current()
             ),
             Some("sudo meshvpn update (or restart the service after installing)"),
         ));

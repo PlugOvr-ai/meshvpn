@@ -15,7 +15,12 @@ pub fn repo() -> String {
         .and_then(|e| e.release_repo())
         .unwrap_or_else(|| REPO.to_string())
 }
-pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
+/// The version of this build: the extension's (a build with its own releases), else meshvpn's.
+pub fn current() -> String {
+    crate::ext::get()
+        .and_then(|e| e.version())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
 const TARGET: &str = env!("MESHVPN_RELEASE_TARGET");
 
 /// HTTP client; `socks` routes through e.g. the SSH tunnel of a firewalled node.

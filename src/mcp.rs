@@ -461,7 +461,7 @@ fn handle(dir: &Path, msg: &Value) -> Option<Value> {
             Ok(json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "meshvpn", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "meshvpn", "version": crate::update::current()},
                 "instructions": crate::guide::mcp_instructions(dir)
             }))
         }
