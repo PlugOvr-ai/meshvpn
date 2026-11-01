@@ -330,6 +330,28 @@ enum NetCmd {
         #[arg(long, default_value_t = 29500)]
         port: u16,
     },
+    /// Before distributed training: do all nodes agree on the path, and do real connections
+    /// work between every pair, on ports like those NCCL opens? Needs SSH to the nodes, like
+    /// `launch`. Exit code 1 if something would hang.
+    Check {
+        /// The nodes of the training job.
+        #[arg(required = true)]
+        selectors: Vec<String>,
+        /// Rank 0 (default: the first node by name).
+        #[arg(long)]
+        master: Option<String>,
+        #[arg(long, default_value_t = 29500)]
+        port: u16,
+        /// Test data per pair in MB.
+        #[arg(long, default_value_t = 32)]
+        mb: u64,
+    },
+    /// (Part of `net check`, on the node that is connected to.)
+    #[command(hide = true)]
+    ProbeListen { port: u16, secs: u64 },
+    /// (Part of `net check`, on the node that connects.)
+    #[command(hide = true)]
+    ProbeSend { addr: String, port: u16, mb: u64 },
 }
 
 #[derive(Subcommand)]
@@ -882,6 +904,16 @@ fn real_main(cli: Cli) -> Result<i32> {
                 agent::print_nodes(&list);
             }
         }
+        Cmd::Net {
+            cmd: NetCmd::ProbeListen { port, secs },
+        } => {
+            crate::netcheck::listen(port, secs)?;
+        }
+        Cmd::Net {
+            cmd: NetCmd::ProbeSend { addr, port, mb },
+        } => {
+            crate::netcheck::send(&addr, port, mb)?;
+        }
         Cmd::Net { cmd } => {
             let st = agent::status(&dir)?;
             let all = agent::nodes(&st);
@@ -922,6 +954,27 @@ fn real_main(cli: Cli) -> Result<i32> {
                                 (None, _) => format!("over the mesh, no shared LAN; mesh IP {}", r.mesh_ip),
                             }
                         );
+                    }
+                }
+                NetCmd::ProbeListen { .. } | NetCmd::ProbeSend { .. } => unreachable!(),
+                NetCmd::Check {
+                    selectors,
+                    master,
+                    port,
+                    mb,
+                } => {
+                    let group = agent::select(&all, &selectors)?;
+                    let master = match master {
+                        Some(m) => agent::select(&all, &[m])?.remove(0),
+                        None => group.iter().min_by_key(|n| n.name.clone()).unwrap().clone(),
+                    };
+                    let remote = agent::Remote {
+                        user: agent::Remote::default_user(),
+                        socks: st.socks.is_some(),
+                        timeout: std::time::Duration::from_secs(120),
+                    };
+                    if !crate::netcheck::check(&group, &master, port, mb, &remote, json)? {
+                        std::process::exit(1);
                     }
                 }
                 NetCmd::Env {

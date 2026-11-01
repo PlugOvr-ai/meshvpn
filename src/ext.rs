@@ -38,6 +38,9 @@ pub struct Peer {
     /// A client - a user's computer, a member for a time - and whose (None: a node).
     #[serde(default)]
     pub client: Option<String>,
+    /// LAN paths this node verified: the other node, and its address on a LAN both share.
+    #[serde(default)]
+    pub lan_paths: Vec<(NodeId, String)>,
 }
 
 /// The network right now (a copy: extensions never hold meshvpn's locks).
@@ -267,6 +270,11 @@ pub fn now_ms() -> u64 {
 /// given already - as `meshvpn launch` does.
 pub fn add_torchrun_args(cmd: &[String], env: &std::collections::HashMap<String, String>) -> Vec<String> {
     crate::launch::add_torchrun_args(cmd, env)
+}
+
+/// This machine's interface on the LAN of `peer`, if it has one.
+pub fn lan_interface_for(peer: Ipv4Addr) -> Option<String> {
+    crate::net::lan_interface_for(peer)
 }
 
 /// The configured name of the mesh network interface (`mesh0` by default, on Linux).

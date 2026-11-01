@@ -482,6 +482,17 @@ def test_launch(lab):
     out = ctl.mv("launch tag:gpu -- torchrun train.py", user="agent", timeout=120)
     check("rendezvous complete: rank1" in out, f"no rendezvous:\n{out}")
     check("ifname=eth0" in out, "nodes on one LAN should use it")
+    # The check before training: fine here, and it finds a firewall instead of a hang later.
+    r = ctl.mvj("net check tag:gpu --mb 8", user="agent", timeout=180)
+    check(r["ok"] and r["path"] == "lan" and r["slowest_mbps"] > 1, f"net check: {r}")
+    check({e["NCCL_SOCKET_IFNAME"] for e in r["env"].values()} == {"eth0"}, f"net check env: {r['env']}")
+    check(len(r["pairs"]) == 3, f"both directions and the master's port: {r['pairs']}")
+    out = ctl.mv("net check tag:gpu --mb 8", user="agent", timeout=180)
+    check("NCCL's TCP connections will work" in out and "slowest:" in out, f"net check says: {out}")
+    g2.sh("iptables -I INPUT -p tcp --dport 40000:60000 -j DROP")
+    p = ctl.mv("net check tag:gpu --mb 8", user="agent", ok=False, timeout=180)
+    check(p.returncode == 1 and "problem:" in p.stdout and "a firewall on g2" in p.stdout, f"a firewall: {p.stdout}{p.stderr}")
+    g2.sh("iptables -D INPUT -p tcp --dport 40000:60000 -j DROP")
     # The torchrun stand-in is a python3 script: count it by its command line.
     leftover = lambda: sum(  # noqa: E731
         int(g.sh("pgrep -fc '^python3 /usr/local/bin/torchrun' || true").strip() or 0) for g in (g1, g2)

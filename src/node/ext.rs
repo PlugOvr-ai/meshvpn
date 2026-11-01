@@ -65,6 +65,11 @@ impl Node {
                 .and_then(|r| r.last_heard)
                 .map(|t| t.elapsed().as_secs()),
             client: Self::client_of(st, &info.id).map(|c| c.user.clone()),
+            lan_paths: info
+                .perf
+                .iter()
+                .filter_map(|p| Some((p.peer, p.lan_ip.clone()?)))
+                .collect(),
         }
     }
 
@@ -82,6 +87,11 @@ impl Node {
             inventory: serde_json::to_value(&st.inventory).unwrap_or_default(),
             last_seen_secs: None,
             client: Self::client_of(&st, &self.ident.id).map(|c| c.user.clone()),
+            lan_paths: st
+                .perf
+                .values()
+                .filter_map(|p| Some((p.peer, p.lan_ip.clone()?)))
+                .collect(),
         };
         let peers = st
             .records

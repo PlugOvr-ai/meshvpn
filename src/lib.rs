@@ -28,6 +28,7 @@ mod launch;
 mod link;
 mod mcp;
 mod net;
+mod netcheck;
 mod node;
 mod proto;
 mod share;
