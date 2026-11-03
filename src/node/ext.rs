@@ -70,6 +70,7 @@ impl Node {
                 .iter()
                 .filter_map(|p| Some((p.peer, p.lan_ip.clone()?)))
                 .collect(),
+            endpoints: info.endpoints.clone(),
         }
     }
 
@@ -92,6 +93,7 @@ impl Node {
                 .values()
                 .filter_map(|p| Some((p.peer, p.lan_ip.clone()?)))
                 .collect(),
+            endpoints: st.my_endpoints.clone(),
         };
         let peers = st
             .records

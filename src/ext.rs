@@ -41,6 +41,9 @@ pub struct Peer {
     /// LAN paths this node verified: the other node, and its address on a LAN both share.
     #[serde(default)]
     pub lan_paths: Vec<(NodeId, String)>,
+    /// `host:port` addresses where the node accepts connections, as it says itself.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
 }
 
 /// The network right now (a copy: extensions never hold meshvpn's locks).
