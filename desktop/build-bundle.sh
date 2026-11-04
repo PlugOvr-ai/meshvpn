@@ -21,8 +21,8 @@ export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig"
 
 apk add --no-cache build-base meson ninja pkgconf xorgproto xtrans font-util-dev \
     pixman-dev pixman-static freetype-dev freetype-static zlib-dev zlib-static libpng-static \
-    bzip2-static brotli-static libx11-dev libx11-static libxcb-dev libxcb-static nettle-dev \
-    nettle-static libbsd-dev libbsd-static libmd xkeyboard-config font-dejavu curl xz tar >/dev/null
+    bzip2-static brotli-static libx11-dev libx11-static libxcb-dev libxcb-static \
+    libbsd-dev libbsd-static libmd-dev util-macros xkeyboard-config font-dejavu curl xz tar >/dev/null
 
 mkdir -p /src && cd /src
 # Sources from x.org, else Alpine's copy of them; either way they must match these checksums.
@@ -75,7 +75,7 @@ meson setup b --buildtype=release --default-library=static -Dprefer_static=true 
     -Dglamor=false -Dglx=false -Dxdmcp=false -Dxdm-auth-1=false -Dsecure-rpc=false \
     -Dudev=false -Dudev_kms=false -Dhal=false -Dsystemd_logind=false -Dpciaccess=false \
     -Ddrm=false -Ddri1=false -Ddri2=false -Ddri3=false -Dxselinux=false -Dlibunwind=false \
-    -Ddocs=false -Ddevel-docs=false -Ddocs-pdf=false -Dsha1=libnettle \
+    -Ddocs=false -Ddevel-docs=false -Ddocs-pdf=false -Dsha1=libmd \
     -Dxkb_output_dir=/tmp -Dxkb_bin_dir=/usr/bin -Dxkb_dir=/usr/share/X11/xkb \
     -Ddefault_font_path=built-ins -Dlisten_tcp=false -Dxf86-input-inputtest=false -Dxvmc=false \
     -Dvgahw=false -Ddga=false -Dagp=false -Dint10=false -Dlinux_apm=false -Dlinux_acpi=false >/dev/null
@@ -90,9 +90,19 @@ cp -r /usr/share/X11/xkb "$B/share/xkb"
 for f in DejaVuSans DejaVuSans-Bold DejaVuSans-Oblique DejaVuSansMono DejaVuSansMono-Bold DejaVuSerif; do
     cp "/usr/share/fonts/dejavu/$f.ttf" "$B/share/fonts/"
 done
+# Their notices have to come with them.
+L="$B/share/licenses"
+mkdir -p "$L"
+for p in "xorg-server-$XSERVER" "xkbcomp-$XKBCOMP" "libXau-$LIBXAU" "libfontenc-$LIBFONTENC" "libXfont2-$LIBXFONT2" "libxkbfile-$LIBXKBFILE"; do
+    cp "$p/COPYING" "$L/$p.txt"
+done
+# What's linked in or copied from Alpine, whose packages don't carry these.
+cp /build/notices/*.txt "$L/"
 cat > "$B/README" <<EOF
 meshvpn desktop bundle ($ARCH): static Xvfb $XSERVER, xkbcomp $XKBCOMP (X.Org, MIT/X11
-licenses), xkeyboard-config layouts (MIT), DejaVu fonts (Bitstream Vera license).
+licenses), linked with musl, pixman, FreeType, zlib, libpng, bzip2, Brotli, libX11, libxcb, libbsd
+and libmd; xkeyboard-config layouts (MIT), DejaVu fonts (Bitstream Vera license). Their licences
+are in share/licenses. How this is built: desktop/build-bundle.sh in the repository below.
 Used by \`meshvpn desktop\`; see https://github.com/PlugOvr-ai/meshvpn
 EOF
 

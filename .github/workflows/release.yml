@@ -55,6 +55,7 @@ jobs:
       - name: Package archive
         run: |
           mkdir -p dist staging
+          python3 scripts/third-party-licenses.py > staging/THIRD-PARTY-LICENSES.txt
           cp target/${{ matrix.target }}/release/meshvpn README.md LICENSE staging/
           tar -czf dist/meshvpn-${{ matrix.target }}.tar.gz -C staging .
 
@@ -96,6 +97,7 @@ jobs:
           mkdir -p dist
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
             rm -rf staging && mkdir staging
+            python3 scripts/third-party-licenses.py > staging/THIRD-PARTY-LICENSES.txt
             cp target/$t/release/meshvpn README.md LICENSE staging/
             tar -czf dist/meshvpn-$t.tar.gz -C staging .
           done
@@ -163,13 +165,52 @@ jobs:
           name: dist-desktop-${{ matrix.arch }}
           path: desktop-out/*.tar.gz
 
+  desktop-full:
+    # The one-file installer with Xfce and LibreWolf (desktop/build-full.sh), tested on a bare image.
+    name: full installer ${{ matrix.arch }}
+    needs: [build, desktop]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: in
+          merge-multiple: true
+      - name: Build Xfce and LibreWolf
+        run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/full-out:/out" nixos/nix:latest sh /build/build-full.sh
+      - name: Put the installer together
+        run: |
+          mkdir bin && tar -xzf in/meshvpn-${{ matrix.target }}.tar.gz -C bin
+          sudo chown -R "$USER" full-out
+          sh desktop/make-run.sh bin/meshvpn in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
+            full-out/meshvpn-desktop-full-${{ matrix.arch }}.tar.gz run-out bin/THIRD-PARTY-LICENSES.txt
+      - name: Test it on a bare image
+        run: |
+          sudo modprobe tun || true
+          python3 tests/e2e/run.py --binary bin/meshvpn --desktop-bundle in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
+            --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-full-${{ matrix.arch }}
+          path: |
+            run-out/*.run
+            full-out/meshvpn-full-sources-*
+          compression-level: 0
+
   e2e:
     uses: ./.github/workflows/e2e.yml
 
   release:
     # Published only when every end-to-end test passed.
     # (macOS and Windows are paused: add them back to `needs` with them)
-    needs: [build, desktop, e2e]
+    needs: [build, desktop, desktop-full, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -195,7 +236,7 @@ jobs:
         working-directory: dist
         run: |
           cp ../install.sh ../install.ps1 ../deploy.sh .
-          for f in *.tar.gz *.zip; do [ -e "$f" ] || continue; sha256sum "$f" > "$f.sha256"; done
+          for f in *.tar.gz *.zip *.run; do [ -e "$f" ] || continue; sha256sum "$f" > "$f.sha256"; done
           sha256sum -- meshvpn-* *.deb *.rpm install.sh install.ps1 deploy.sh | grep -v '\.sha256$' > SHA256SUMS
           ls -l
 
@@ -214,6 +255,12 @@ jobs:
 
           \`\`\`sh
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
+          \`\`\`
+
+          **With a full desktop** (Xfce and the LibreWolf browser in one download, any Linux distribution, x86_64 and ARM64; no H.264/H.265/MP4 playback. Source: \`meshvpn-full-sources-*\`):
+
+          \`\`\`sh
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- --full join mesh1-...
           \`\`\`
 
           **macOS** (Apple Silicon and Intel; the same installer):

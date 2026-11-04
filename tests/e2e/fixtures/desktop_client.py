@@ -161,8 +161,31 @@ def xfce(port, token):
                       "notices": v.notices + v2.notices}))
 
 
+def full(port, token):
+    """The packed desktop: Xfce, the browser as the panel opens it, typing, on an image with neither."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1280, 800))
+    v.until(lambda: v.size == [1280, 800] and v.frames >= 1, "first frame", 90)
+    v.settle(8)  # Xfce starting
+    v.send(C_LAUNCH, b"xfce4-terminal")
+    v.until(lambda: any("Terminal" in w["title"] for w in v.windows), "the Xfce terminal", 60)
+    v.settle(2)
+    for ch in "dpkg --version > /tmp/full_typed":
+        v.key(ord(ch), 1)
+    v.key(0xFF0D, 0)
+    v.settle(1)
+    v.send(C_LAUNCH, b"thunar")
+    v.until(lambda: any("Thunar" in w["title"] for w in v.windows), "Thunar", 60)
+    # What the panel's Web Browser button runs.
+    v.send(C_LAUNCH, b"exo-open --launch WebBrowser")
+    v.until(lambda: any("LibreWolf" in w["title"] for w in v.windows), "LibreWolf", 90)
+    print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
+
+
 def main():
     port, token = int(sys.argv[1]), sys.argv[2]
+    if len(sys.argv) > 3 and sys.argv[3] == "full":
+        return full(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "xfce":
         return xfce(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "fallback":

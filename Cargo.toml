@@ -78,12 +78,16 @@ Get started with `sudo meshvpn init` or `sudo meshvpn join <invite>`."""
 assets = [
     ["target/release/meshvpn", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/meshvpn/README.md", "644"],
+    ["LICENSE", "usr/share/doc/meshvpn/LICENSE", "644"],
+    ["staging/THIRD-PARTY-LICENSES.txt", "usr/share/doc/meshvpn/THIRD-PARTY-LICENSES.txt", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/meshvpn", dest = "/usr/bin/meshvpn", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/meshvpn/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/meshvpn/LICENSE", mode = "644", doc = true },
+    { source = "staging/THIRD-PARTY-LICENSES.txt", dest = "/usr/share/doc/meshvpn/THIRD-PARTY-LICENSES.txt", mode = "644", doc = true },
 ]
 [package.metadata.generate-rpm.recommends]
 openssh-clients = "*"

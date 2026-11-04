@@ -143,12 +143,17 @@ pub fn is_root() -> bool {
     }
 }
 
-/// The account this process runs as.
+/// The account this process runs as; its number if it has no name (containers often run so).
 pub fn user_name() -> Option<String> {
     #[cfg(unix)]
     unsafe {
-        let pw = libc::getpwuid(libc::geteuid());
-        (!pw.is_null()).then(|| std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
+        let me = libc::geteuid();
+        let pw = libc::getpwuid(me);
+        Some(if pw.is_null() {
+            me.to_string()
+        } else {
+            std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+        })
     }
     #[cfg(windows)]
     {

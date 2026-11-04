@@ -17,6 +17,13 @@
 #
 #   curl -fsSL .../install.sh | sudo sh -s -- --enterprise join mesh1-...
 #
+# With a full desktop: Xfce and the LibreWolf browser in one 600 MB download, for any Linux
+# distribution, with no package manager involved (1.9 GB on disk; x86_64 and ARM64): --full first, e.g.
+#
+#   curl -fsSL .../install.sh | sudo sh -s -- --full join mesh1-...
+# Without root as well (for this user alone, in ~/.local):
+#   curl -fsSL .../install.sh | sh -s -- --user --full join mesh1-...
+#
 # Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin,
 # MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub,
 # MESHVPN_ROOTLESS=1 for the same as --user.
@@ -30,11 +37,13 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 ROOTLESS="${MESHVPN_ROOTLESS:-}"
 [ "$ROOTLESS" = 0 ] && ROOTLESS=""
+FULL=""
 [ "${MESHVPN_EDITION:-}" = enterprise ] && REPO="PlugOvr-ai/meshvpn-enterprise-releases"
 while [ $# -gt 0 ]; do
     case "$1" in
         --user | --rootless) ROOTLESS=1 ;;
         --enterprise) REPO="PlugOvr-ai/meshvpn-enterprise-releases" ;;
+        --full) FULL=1 ;;
         *) break ;;
     esac
     shift
@@ -152,6 +161,34 @@ fetch() {
         die "curl or wget is required"
     fi
 }
+
+if [ -n "$FULL" ]; then
+    [ "$REPO" = "PlugOvr-ai/meshvpn" ] || die "--full is for the open source edition"
+    case "$TARGET" in
+        x86_64-unknown-linux-musl) ARCH=x86_64 ;;
+        aarch64-unknown-linux-musl) ARCH=aarch64 ;;
+        *) die "--full exists for x86_64 and ARM64 Linux, not $TARGET" ;;
+    esac
+    # /var/tmp: /tmp is often kept in memory, too small for this.
+    TMP="$(mktemp -d "${TMPDIR:-/var/tmp}/meshvpn-full.XXXXXX")"
+    trap 'rm -rf "$TMP"' EXIT INT TERM
+    RUN="meshvpn-full-$ARCH.run"
+    say "Downloading meshvpn with Xfce and LibreWolf ($VERSION, $ARCH, 600 MB)..."
+    fetch "$BASE/$RUN" "$TMP/$RUN" || die "download failed: $BASE/$RUN"
+    fetch "$BASE/$RUN.sha256" "$TMP/$RUN.sha256" || die "download failed: $BASE/$RUN.sha256"
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$TMP" && sha256sum -c "$RUN.sha256" >/dev/null) || die "checksum mismatch - download corrupted?"
+    else
+        say "(sha256sum not found, skipping checksum verification)"
+    fi
+    # Without root it installs for this user alone, by itself.
+    if [ -n "$ROOTLESS" ]; then
+        sh "$TMP/$RUN" "$@"
+    else
+        $SUDO sh "$TMP/$RUN" "$@"
+    fi
+    exit $?
+fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM

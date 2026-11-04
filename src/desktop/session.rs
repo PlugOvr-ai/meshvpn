@@ -106,11 +106,22 @@ fn write_xauthority(path: &Path, cookie: &[u8; 16]) -> Result<()> {
 }
 
 /// Fonts for applications: the system's, plus the bundled ones (bare images often have none).
+/// Without a system configuration "Monospace" is no font at all, and terminals space out a
+/// proportional one; `default` leaves the choice to the system's configuration if there is one.
 fn write_fonts_conf(path: &Path, bundle: &Bundle, cache: &Path) -> Result<()> {
+    let generic: String = [
+        ("monospace", "DejaVu Sans Mono"),
+        ("sans-serif", "DejaVu Sans"),
+        ("sans", "DejaVu Sans"),
+        ("serif", "DejaVu Serif"),
+    ]
+    .iter()
+    .map(|(name, font)| format!("<alias><family>{name}</family><default><family>{font}</family></default></alias>\n"))
+    .collect();
     let text = format!(
         "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n<fontconfig>\n\
          <include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>\n\
-         <dir>{}</dir>\n<cachedir>{}</cachedir>\n</fontconfig>\n",
+         <dir>{}</dir>\n<cachedir>{}</cachedir>\n{generic}</fontconfig>\n",
         bundle.fonts_dir().display(),
         cache.display()
     );
@@ -158,7 +169,29 @@ pub fn resolve_mode(want: &str) -> Result<Mode> {
     }
 }
 
+/// A desktop installed without root is in ~/.local/bin, which a login or a daemon often doesn't
+/// have in its PATH. Called first thing in `attach`: nothing else runs yet, and the session and
+/// its programs inherit this.
+fn find_user_desktop() {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let bin = PathBuf::from(home).join(".local/bin");
+    if has_xfce() || !bin.join("xfce4-session").is_file() {
+        return;
+    }
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    paths.push(bin);
+    if let Ok(path) = std::env::join_paths(paths) {
+        // Safety: see above, there are no other threads yet.
+        unsafe { std::env::set_var("PATH", path) };
+    }
+}
+
 pub fn attach(want: &str) -> Result<()> {
+    find_user_desktop();
     let notice = |text: &str| {
         let mut out = std::io::stdout();
         let _ = out.write_all(&frame(S_NOTICE, text.as_bytes()));

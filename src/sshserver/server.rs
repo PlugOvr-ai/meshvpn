@@ -153,9 +153,30 @@ fn lookup(name: &str) -> Option<Account> {
 
 /// The account `user` logs in as, if this meshvpn may start processes for it.
 fn account_for(user: &str) -> Option<Account> {
-    let acct = lookup(user)?;
     let me = unsafe { libc::geteuid() };
-    (me == 0 || acct.uid == me).then_some(acct)
+    match lookup(user) {
+        Some(acct) => (me == 0 || acct.uid == me).then_some(acct),
+        None => unnamed_account(user, me),
+    }
+}
+
+/// Containers often run with a number for a user, with no line in /etc/passwd: this meshvpn itself
+/// can then log in under that number, and nobody else. Who may do so is still up to `ssh allow`.
+fn unnamed_account(user: &str, me: libc::uid_t) -> Option<Account> {
+    if me == 0 || crate::sys::user_name_of(me).is_some() || user != me.to_string() {
+        return None;
+    }
+    let gid = unsafe { libc::getegid() };
+    Some(Account {
+        name: user.to_string(),
+        uid: me,
+        gid,
+        home: std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| PathBuf::from("/"), PathBuf::from),
+        shell: "/bin/sh".into(),
+        groups: vec![gid],
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
