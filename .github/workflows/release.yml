@@ -195,7 +195,7 @@ jobs:
         run: |
           sudo modprobe tun || true
           python3 tests/e2e/run.py --binary bin/meshvpn --desktop-bundle in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
-            --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless
+            --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless desktop_full_container
       - uses: actions/upload-artifact@v7
         with:
           name: dist-full-${{ matrix.arch }}

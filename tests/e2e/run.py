@@ -1166,6 +1166,80 @@ def test_desktop_full_nameless(lab):
     check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, "a terminal of this desktop runs the machine's programs")
 
 
+def full_user_session(hub, box, port, label):
+    """A desktop on `box` as its user dev, opened from the hub, used and closed again."""
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+    wait(lambda: hub.sh(f"ssh {o} dev@box.mesh whoami", user="agent", ok=False).stdout.strip() == "dev", f"{label}: login", 90)
+    hub.sh(f"rm -f /tmp/desktop.out; cd /home/agent && (meshvpn desktop box --user dev --no-browser --port {port} > /tmp/desktop.out 2>&1 &)",
+           user="agent")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), f"{label}: viewer link", 30)
+    token = out.split("#", 1)[1].split()[0]
+    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py {port} {token} full", user="agent", ok=False, timeout=300)
+    log = box.sh("tail -30 /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
+    check(p.returncode == 0, f"{label}: {p.stdout[-1500:]}{p.stderr[-800:]}{log}")
+    check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, f"{label}: a terminal runs the machine's programs")
+    check("using the built-in desktop" not in log, f"{label}: Xfce should have stayed up: {log[-600:]}")
+    box.sh("$HOME/.local/bin/meshvpn desktop stop", ok=False)
+
+
+@test
+def test_desktop_full_container(lab):
+    """A non-root image: read-only root with the home on a volume, a restart, and the desktop built into an image."""
+    check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    base, baked, vol = f"{lab.prefix}-base", f"{lab.prefix}-baked", f"{lab.prefix}-home"
+
+    def start(image, *extra):
+        c = f"{lab.prefix}-box"
+        run(["docker", "rm", "-f", c], ok=False)
+        run(["docker", "run", "-d", "--name", c, "--hostname", "box", "--network", net, *extra, image, "sleep", "infinity"])
+        if c not in lab.containers:
+            lab.containers.append(c)
+        return Node(lab, "box", c)
+
+    def up(box):
+        run(["docker", "exec", "-d", box.c, "sh", "-c", "$HOME/.local/bin/meshvpn up >> /tmp/meshvpn.log 2>&1"])
+
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(FULL_RUN)) as d:
+        os.link(FULL_RUN, f"{d}/full.run")
+        open(f"{d}/Dockerfile", "w").write(
+            "FROM debian:12-slim\nRUN useradd -m -u 1000 dev\nUSER dev\nENV HOME=/home/dev\n")
+        run(["docker", "build", "-q", "-t", base, d], timeout=300)
+        # What the README tells people to write.
+        open(f"{d}/Dockerfile", "w").write(
+            f"FROM {base}\nCOPY --chown=1000:1000 full.run /tmp/full.run\nRUN sh /tmp/full.run && rm -f /tmp/full.run\n")
+        run(["docker", "build", "-q", "-t", baked, d], timeout=600)
+    run(["docker", "volume", "create", vol])
+    try:
+        # Built into the image: /tmp is empty when it starts, and it joins only now.
+        home = f"{vol}:/home/dev"
+        box = start(baked, "--tmpfs", "/tmp", "-v", home)
+        check(box.sh("id -u").strip() == "1000", "should run as the image's user")
+        box.sh(f"$HOME/.local/bin/meshvpn join {invite(hub)} --name box")
+        up(box)
+        wait(lambda: hub.online("box"), "box online at hub")
+        box.sh("$HOME/.local/bin/meshvpn ssh allow agent@hub --as dev")
+        full_user_session(hub, box, 18086, "built into the image")
+        # docker restart: started again by the entrypoint, as there's nothing else to do it.
+        run(["docker", "restart", box.c])
+        up(box)
+        full_user_session(hub, box, 18087, "after a restart")
+        # A new container, nothing writable but the home and /tmp: the same node.
+        box = start(baked, "--read-only", "--tmpfs", "/tmp", "-v", home)
+        up(box)
+        full_user_session(hub, box, 18088, "read-only root, new container")
+        nodes = [n["name"] for n in hub.mvj("nodes")]
+        check(nodes.count("box") == 1, f"the same node, not a second one: {nodes}")
+    finally:
+        run(["docker", "rm", "-f", f"{lab.prefix}-box"], ok=False)
+        run(["docker", "volume", "rm", vol], ok=False)
+        run(["docker", "rmi", "-f", baked, base], ok=False)
+
+
 @test
 def test_desktop_xfce(lab):
     """meshvpn desktop setup --xfce, then an Xfce desktop: windows as tabs, typing, persistence, log out."""

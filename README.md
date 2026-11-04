@@ -343,6 +343,16 @@ applications you want to run.
   Allow logins with `meshvpn ssh allow <user>@<node> --as <you>`, then `meshvpn desktop <node> --user <you>` from the
   other node. Container users with no name (not in `/etc/passwd`, such as `docker run --user 54321`) log in by number:
   `--as 54321`, with `HOME` set. Without `/dev/net/tun` this runs in userspace mode, see above.
+* **Built into a Docker image,** so that nobody has to install it and the 1.9 GB survives new containers (use your
+  image's user in `--chown`: without it, a non-root user can't delete the file from `/tmp`):
+  ```dockerfile
+  COPY --chown=1000:1000 meshvpn-full-x86_64.run /tmp/full.run
+  RUN sh /tmp/full.run && rm -f /tmp/full.run
+  ```
+  Containers usually have no systemd or cron, so **nothing starts meshvpn after a restart: run `~/.local/bin/meshvpn up`
+  in the background from your entrypoint.** Join when the container first starts, not in the Dockerfile, or all containers of
+  the image would be the same node, and keep `~/.config/meshvpn` on a volume so that a new container stays that node.
+  A read-only root works (`--read-only --tmpfs /tmp`) as long as the home is writable.
 * **Logged in over SSH** (e.g. on your main node from outside the mesh)? `meshvpn desktop` notices and prints the
   matching forward, e.g. `ssh -L 7880:127.0.0.1:7880 you@main-node` - run it on your computer (or add it to the open
   session with Enter `~C`), then open the link in your local browser.
