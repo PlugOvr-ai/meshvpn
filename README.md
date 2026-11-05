@@ -408,6 +408,7 @@ same instructions automatically when they connect.
 | `meshvpn exec tag:gpu -- nvidia-smi` | Run a command on many nodes in parallel; output and exit code per node (uses the password-less SSH logins) |
 | `meshvpn cp ./code tag:gpu:/srv/` / `meshvpn cp tag:gpu:/srv/out.log ./logs` | Copy to or from many nodes (the destination is a directory; downloads go to `logs/<node>/`) |
 | `meshvpn net matrix --measure` | RTT, mesh throughput and **direct LAN paths** between all nodes |
+| `meshvpn net why <node>` | **Why there's no direct connection** to a node: tests from both ends for about 10 seconds, says what got through and what to do. Exit code 1 without a direct connection; both nodes need this version for the full answer |
 | `meshvpn net route <node>` | The best address for heavy traffic to a node: its LAN address if both share one, otherwise the mesh |
 | `eval $(meshvpn net env --master gpu1 tag:gpu)` | On each node of a training job: `MASTER_ADDR`, `NODE_RANK`, `NNODES`, `NCCL_SOCKET_IFNAME`... for torchrun. Uses the LAN only if every pair of nodes shares one (mixed paths make NCCL hang), otherwise the mesh |
 | `meshvpn launch tag:gpu -- torchrun --nproc_per_node=8 train.py` | Start a distributed job on all selected nodes. Every node gets its environment (`MASTER_ADDR`, `NODE_RANK`, `NCCL_SOCKET_IFNAME`...), torchrun gets `--nnodes/--node_rank/--master_addr/--master_port` added, output is streamed and logged per node, and if one node fails the others are stopped. Ctrl+C, a lost connection or a killed launcher stop the job's whole process tree on every node |
@@ -502,6 +503,7 @@ and a CycloneDX software bill of materials (`meshvpn-<version>.cdx.json`).
   "Hard" NATs that use a new port for every destination (some carrier-grade NATs and corporate firewalls) can't be
   punched through. Those nodes keep using TCP and relays, which is slower on lossy links (TCP-over-TCP). For the best
   results, allow UDP on port 7870 in front of public nodes, as you do for TCP. Switch it off with `udp = false`.
+  `meshvpn net why <node>` tells you which case you're in.
 * The mesh is full-mesh by design, which suits networks of up to a few dozen nodes.
 * Overlay IPs come from a 22-bit hash. A collision is unlikely in small networks; if one happens, the node with the
   lower id keeps the address.

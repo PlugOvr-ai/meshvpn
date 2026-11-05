@@ -315,6 +315,9 @@ enum NetCmd {
         #[arg(long, default_value_t = 16)]
         mb: u64,
     },
+    /// Why is there no direct connection to a node? Tests it from both ends for about 10 seconds,
+    /// and says what got through and what to do. Exit code 1 without a direct connection.
+    Why { node: String },
     /// The best address to reach a node from here: its LAN address if both share one, else
     /// its mesh address.
     Route { node: String },
@@ -949,6 +952,27 @@ fn real_main(cli: Cli) -> Result<i32> {
                         println!("{}", serde_json::to_string_pretty(&edges)?);
                     } else {
                         agent::print_matrix(&edges);
+                    }
+                }
+                NetCmd::Why { node } => {
+                    if !json {
+                        eprintln!("testing the direct path to {node} from both ends (about 10 seconds)...");
+                    }
+                    let text = match tokio::runtime::Runtime::new()?
+                        .block_on(control::request(&dir, &control::Request::NetWhy { node }))?
+                    {
+                        control::Response::Message { text } => text,
+                        control::Response::Error { message } => bail!("{message}"),
+                        _ => bail!("unexpected answer from meshvpn"),
+                    };
+                    let report: node::why::WhyReport = serde_json::from_str(&text)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        print!("{}", report.render());
+                    }
+                    if !report.direct {
+                        std::process::exit(1);
                     }
                 }
                 NetCmd::Route { node } => {

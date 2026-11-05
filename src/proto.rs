@@ -28,6 +28,9 @@ pub const T_REJECT: u8 = 15;
 pub const T_DOC: u8 = 16;
 /// A signed message from one node's extension to another's (routed like data).
 pub const T_EXT: u8 = 17;
+/// `meshvpn net why`: test the direct path together, and what each side saw.
+pub const T_WHY: u8 = 18;
+pub const T_WHY_REPLY: u8 = 19;
 
 /// A JSON document signed by a node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -116,6 +119,34 @@ pub struct MeasureReq {
     pub nonce: u64,
     pub nodes: Vec<NodeId>,
     pub bytes: u64,
+}
+
+/// `meshvpn net why`, flooded: `to` tests its direct path to `from` together with it.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WhyReq {
+    pub nonce: u64,
+    pub from: NodeId,
+    pub to: NodeId,
+}
+
+/// What one side of a direct path saw during `meshvpn net why`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WhySide {
+    pub nonce: u64,
+    pub name: String,
+    pub udp_on: bool,
+    /// See `NatKind::code`.
+    pub nat: String,
+    pub nat_text: String,
+    pub ipv6: Vec<String>,
+    /// The other side's addresses this side tries.
+    pub candidates: Vec<String>,
+    /// Probes this side sent during the test.
+    pub sent: u32,
+    /// Probes from the other side that arrived here.
+    pub heard: u32,
+    /// Answers to this side's probes that arrived here.
+    pub answers: u32,
 }
 
 /// Header of a data frame: dst(32) src(32) ttl(1) nonce(24), followed by the sealed IP packet.

@@ -24,6 +24,10 @@ pub enum Request {
         user: String,
     },
     SshList,
+    /// `meshvpn net why`: test the direct path to a node; the answer is a `WhyReport` as JSON.
+    NetWhy {
+        node: String,
+    },
     SshOverview,
     SshSetRules {
         rules: Vec<crate::config::SshAllow>,
@@ -294,6 +298,14 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
             text: node.authorized_keys(&user),
         },
         Ok(Request::SshList) => Response::Message { text: node.ssh_list() },
+        Ok(Request::NetWhy { node: who }) => match node.why(&who).await {
+            Ok(report) => Response::Message {
+                text: serde_json::to_string(&report).unwrap_or_default(),
+            },
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
         Ok(Request::GpuReserve {
             count,
             indices,

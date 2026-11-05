@@ -169,7 +169,7 @@ impl Node {
 
     /// The peer's candidates, plus the hosts of its TCP endpoints on its UDP port (servers
     /// behind 1:1 NAT know only their private address).
-    fn peer_candidates(info: &NodeInfo) -> Vec<SocketAddr> {
+    pub(super) fn peer_candidates(info: &NodeInfo) -> Vec<SocketAddr> {
         let mut out: Vec<SocketAddr> = info.udp.iter().filter_map(|c| c.parse().ok()).collect();
         // The first candidates are the node's own addresses, so their port is its UDP port.
         // NATs that map per destination (Linux, many routers) usually keep the original port
@@ -308,6 +308,9 @@ impl Node {
                 }
             };
             debug!("udp: probing {peer} at {targets:?}");
+            if let Some(c) = st.why_counts.get_mut(&peer) {
+                c.sent += targets.len() as u32;
+            }
             let d = self.probe_datagram(PROBE, &peer, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
             for t in targets {
                 self.udp_send(&d, t);
@@ -459,6 +462,13 @@ impl Node {
         }
         let ts = u64::from_be_bytes(d[65..73].try_into().unwrap());
         let nonce = u64::from_be_bytes(d[73..81].try_into().unwrap());
+        if let Some(c) = st.why_counts.get_mut(&src) {
+            if ack {
+                c.answers += 1;
+            } else {
+                c.heard += 1;
+            }
+        }
         if !ack {
             // The MAC proves the sender. The timestamp is only echoed back for the RTT, so
             // clocks that differ between machines don't matter.
@@ -617,6 +627,16 @@ pub(crate) enum NatKind {
 }
 
 impl NatKind {
+    /// For `meshvpn net why`, from either side.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            NatKind::Unknown => "unknown",
+            NatKind::Public => "public",
+            NatKind::OneObservation | NatKind::KeepsPort { .. } => "keeps-port",
+            NatKind::ChangesPort => "changes-port",
+        }
+    }
+
     pub(crate) fn describe(&self) -> String {
         match self {
             NatKind::Unknown => "not known yet (no direct path to a node outside this network so far)".into(),

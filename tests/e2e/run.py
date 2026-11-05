@@ -567,6 +567,75 @@ def test_ssh_authorized_keys(lab):
 
 
 @test
+def test_net_why(lab):
+    """net why: nothing wrong on a direct path; tells one-way from no way, from both ends."""
+    pub = lab.network("pub", subnet="198.51.102.0/24")
+    nets = {x: lab.network(f"lan{x}", internal=True) for x in "AB"}
+    hub = lab.node("hub", [pub], ip="198.51.102.10")
+    routers, clients = {}, {}
+    for x in "AB":
+        r = lab.node(f"nat{x}", [pub, nets[x]], caps=False, net_admin=True,
+                     sysctls=["net.ipv4.ip_forward=1"], install=False)
+        out_if = r.sh("ip -o -4 addr | awk '/198.51.102/ {print $2}'").strip()
+        pub_ip = r.net_ip(pub)
+        r.sh(f"""
+            iptables -t nat -A POSTROUTING -o {out_if} -p udp --sport 7870 -j SNAT --to-source {pub_ip}:7870
+            iptables -t nat -A POSTROUTING -o {out_if} -j MASQUERADE
+            iptables -A INPUT -i {out_if} -m conntrack --ctstate NEW,INVALID -j DROP
+        """)
+        routers[x] = r
+        c = lab.node(f"client{x.lower()}", [nets[x]])
+        c.sh(f"ip route add default via {r.net_ip(nets[x])}")
+        clients[x] = c
+    hub.mv("init --name hub --endpoint 198.51.102.10:7870")
+    hub.up()
+    for c in clients.values():
+        c.mv(f"join {invite(hub)} --name {c.name}")
+        c.up()
+    a, b = clients["A"], clients["B"]
+    wait(lambda: a.online("clientb"), "clients see each other", timeout=60)
+    wait(lambda: "UDP" in (a.peer("clientb") or {}).get("path", ""), "direct UDP path", timeout=90)
+
+    # Nothing to find out.
+    r = a.mvj("net why clientb", timeout=30)
+    check(r["verdict"] == "direct-udp" and r["direct"], f"direct: {r}")
+    check("nothing is wrong" in a.mv("net why clientb", timeout=30), "should say so")
+
+    # Only B's packets are dropped, on the way into A's network: A's still reach B.
+    b_pub = routers["B"].net_ip(pub)
+    routers["A"].sh(f"iptables -I FORWARD -p udp -s {b_pub} -j DROP")
+    wait(lambda: "UDP" not in (a.peer("clientb") or {}).get("path", ""), "A loses the path", timeout=60)
+    wait(lambda: "UDP" not in (b.peer("clienta") or {}).get("path", ""), "B loses the path", timeout=60)
+    p = a.mv("net why clientb --json", ok=False, timeout=30)
+    r = json.loads(p.stdout)
+    check(p.returncode == 1, "no direct connection: exit code 1")
+    check(r["verdict"] == "one-way", f"one-way: {r}")
+    check(r["there"] and r["there"]["heard"] > 0 and r["here"]["heard"] == 0, f"who heard whom: {r}")
+    check(r["here"]["sent"] > 0 and r["there"]["sent"] > 0, f"both sides test: {r}")
+    check("clienta's probes reach clientb" in r["why"], r["why"])
+
+    # Now nothing gets through. Either side can ask.
+    routers["A"].sh(f"iptables -I FORWARD -p udp -d {b_pub} -j DROP")
+    p = b.mv("net why clienta --json", ok=False, timeout=30)
+    r = json.loads(p.stdout)
+    check(r["verdict"] == "firewall" and r["here"]["heard"] == 0 and r["there"]["heard"] == 0, f"no way: {r}")
+    p = b.mv("net why clienta", ok=False, timeout=30)
+    check(p.returncode == 1 and "Why:" in p.stdout and "tcpdump" in p.stdout and "relay" in p.stdout, f"says: {p.stdout}")
+
+    # Unblocked, the test brings the path back at once: both sides probe together.
+    routers["A"].sh(f"iptables -D FORWARD -p udp -d {b_pub} -j DROP; iptables -D FORWARD -p udp -s {b_pub} -j DROP")
+    routers["A"].sh("conntrack -F 2>/dev/null; true")
+    r = json.loads(a.mv("net why clientb --json", ok=False, timeout=30).stdout)
+    check(r["verdict"] in ("direct-udp", "unstable"), f"after unblocking: {r}")
+
+    # What can't be tested.
+    p = a.mv("net why nosuchnode", ok=False, timeout=30)
+    check(p.returncode != 0 and "no node named" in p.stderr, p.stderr)
+    p = a.mv("net why clienta", ok=False, timeout=30)
+    check(p.returncode != 0 and "this machine" in p.stderr, p.stderr)
+
+
+@test
 def test_exec_cp(lab):
     """exec on tags with exit codes; cp up and down with intact data."""
     net, (ctl, g1, g2) = mesh(lab, ["ctl", "g1", "g2"], tags="gpu", join_args="--ssh-allow-all agent")

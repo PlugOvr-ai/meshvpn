@@ -26,6 +26,7 @@ mod exit;
 mod ext;
 mod gpu;
 mod udp;
+pub mod why;
 
 /// Where IP packets for this node go: the kernel, or the TCP/IP stack in this process.
 enum PacketIo {
@@ -183,6 +184,10 @@ struct State {
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
     bench_ip_done: HashMap<u64, (f32, Instant)>,
     measure_seen: HashSet<u64>,
+    why_seen: HashSet<u64>,
+    why_counts: HashMap<NodeId, why::WhyCount>,
+    why_replies: HashMap<u64, WhySide>,
+    why_running: u32,
     /// A measurement of ours is running (one at a time, whoever asks).
     measuring: bool,
     measured: u64,
@@ -2219,6 +2224,8 @@ impl Node {
                 T_GOSSIP => self.handle_gossip(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
                 T_MEASURE => self.handle_measure(peer, payload),
+                T_WHY => self.handle_why(peer, payload),
+                T_WHY_REPLY => self.handle_why_reply(peer, payload),
                 T_ROSTER | T_CLAIM => {
                     self.dispatch_admin(kind, peer, payload);
                 }

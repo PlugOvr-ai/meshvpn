@@ -344,7 +344,7 @@ impl Node {
         ))
     }
 
-    fn resolve_node(&self, st: &State, who: &str) -> Result<(NodeId, String)> {
+    pub(super) fn resolve_node(&self, st: &State, who: &str) -> Result<(NodeId, String)> {
         let w = who.trim().to_lowercase();
         if w == st.my_name || (w.len() >= 4 && self.ident.id.hex().starts_with(&w)) {
             return Ok((self.ident.id, st.my_name.clone()));
