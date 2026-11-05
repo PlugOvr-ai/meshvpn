@@ -17,8 +17,8 @@
 #
 #   curl -fsSL .../install.sh | sudo sh -s -- --enterprise join mesh1-...
 #
-# With a full desktop: Xfce and the LibreWolf browser in one 600 MB download, for any Linux
-# distribution, with no package manager involved (1.9 GB on disk; x86_64 and ARM64): --full first, e.g.
+# With a full desktop: Xfce and the Chromium browser in one 650 MB download, for any Linux
+# distribution, with no package manager involved (2.2 GB on disk; x86_64 and ARM64): --full first, e.g.
 #
 #   curl -fsSL .../install.sh | sudo sh -s -- --full join mesh1-...
 # Without root as well (for this user alone, in ~/.local):
@@ -173,7 +173,7 @@ if [ -n "$FULL" ]; then
     TMP="$(mktemp -d "${TMPDIR:-/var/tmp}/meshvpn-full.XXXXXX")"
     trap 'rm -rf "$TMP"' EXIT INT TERM
     RUN="meshvpn-full-$ARCH.run"
-    say "Downloading meshvpn with Xfce and LibreWolf ($VERSION, $ARCH, 600 MB)..."
+    say "Downloading meshvpn with Xfce and Chromium ($VERSION, $ARCH, 650 MB)..."
     fetch "$BASE/$RUN" "$TMP/$RUN" || die "download failed: $BASE/$RUN"
     fetch "$BASE/$RUN.sha256" "$TMP/$RUN.sha256" || die "download failed: $BASE/$RUN.sha256"
     if command -v sha256sum >/dev/null 2>&1; then

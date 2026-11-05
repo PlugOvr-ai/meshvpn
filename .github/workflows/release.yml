@@ -166,7 +166,7 @@ jobs:
           path: desktop-out/*.tar.gz
 
   desktop-full:
-    # The one-file installer with Xfce and LibreWolf (desktop/build-full.sh), tested on a bare image.
+    # The one-file installer with Xfce and Chromium (desktop/build-full.sh), tested on a bare image.
     name: full installer ${{ matrix.arch }}
     needs: [build, desktop]
     runs-on: ${{ matrix.runner }}
@@ -183,7 +183,7 @@ jobs:
           pattern: dist-*
           path: in
           merge-multiple: true
-      - name: Build Xfce and LibreWolf
+      - name: Build Xfce and Chromium
         run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/full-out:/out" nixos/nix:latest sh /build/build-full.sh
       - name: Put the installer together
         run: |
@@ -260,7 +260,7 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
           \`\`\`
 
-          **With a full desktop** (Xfce and the LibreWolf browser in one download, any Linux distribution, x86_64 and ARM64; no H.264/H.265/MP4 playback. Source: \`meshvpn-full-sources-*\`):
+          **With a full desktop** (Xfce and the Chromium browser in one download, any Linux distribution, x86_64 and ARM64. Source: \`meshvpn-full-sources-*\`):
 
           \`\`\`sh
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- --full join mesh1-...

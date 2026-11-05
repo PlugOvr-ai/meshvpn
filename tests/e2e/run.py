@@ -1141,7 +1141,7 @@ def test_desktop(lab):
 
 @test
 def test_desktop_full(lab):
-    """The one-file installer on a bare image: Xfce and LibreWolf with no package manager, then removed again."""
+    """The one-file installer on a bare image: Xfce and Chromium with no package manager, then removed again."""
     check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
     net = lab.network("net")
     hub = lab.node("hub", [net])
@@ -1152,7 +1152,7 @@ def test_desktop_full(lab):
     run(["docker", "cp", FULL_RUN, f"{box.c}:/tmp/full.run"])
     # No apt-get update ran in this image: nothing could have come from a package manager.
     out = box.sh(f"sh /tmp/full.run join {invite(hub)} --name box --ssh-allow-all agent", timeout=600)
-    check("with Xfce and LibreWolf" in out, out[-500:])
+    check("with Xfce and Chromium" in out, out[-500:])
     box.sh("useradd -m agent")
     wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
          "ssh from hub to box", 60)
@@ -1175,7 +1175,7 @@ def test_desktop_full(lab):
     box.sh("cd /home/agent; su agent -s /bin/sh -c 'meshvpn desktop stop'", ok=False)
     box.sh("sh /tmp/full.run --uninstall")
     left = box.sh("ls /usr/local/bin; ls /nix /opt/meshvpn-desktop-full 2>&1", ok=False).stdout
-    check("librewolf" not in left and "xfce4" not in left and "store" not in left, f"left behind: {left}")
+    check("chromium" not in left and "xfce4" not in left and "store" not in left, f"left behind: {left}")
     check("meshvpn" in left, "meshvpn stays")
 
 
@@ -1198,7 +1198,7 @@ def test_desktop_full_user(lab):
     # A daemon whose PATH doesn't have ~/.local/bin, as is usual.
     home = "export HOME=/home/dev; "
     out = box.sh(home + f"sh /tmp/full.run join {invite(hub)} --name box", user="dev", timeout=600)
-    check("with Xfce and LibreWolf" in out and "for this user alone" in out, out[-800:])
+    check("with Xfce and Chromium" in out and "for this user alone" in out, out[-800:])
     check(box.sh("test -e /nix -o -e /usr/local/bin/meshvpn -o -e /opt/meshvpn-desktop-full && echo root || echo clean").strip() == "clean",
           "without root nothing goes in the system's places")
     mv = "/home/dev/.local/bin/meshvpn"
@@ -1223,7 +1223,7 @@ def test_desktop_full_user(lab):
     box.sh("cd /home/dev/.local/share/meshvpn/desktop-full/opt/meshvpn-desktop-full && test -s README "
            "&& test -s THIRD-PARTY-LICENSES.txt && ls licenses | grep -q ^glibc")
     # /tmp emptied: the link comes back. Someone else's link: refused, nothing of theirs runs.
-    wrapper = "/home/dev/.local/bin/librewolf --version"
+    wrapper = "/home/dev/.local/bin/chromium --version"
     box.sh(f"rm -f {prefix}")
     box.sh(home + wrapper, user="dev")
     check(box.sh(f"stat -c %U {prefix}").strip() == "dev", "the link should be back")
@@ -1233,7 +1233,7 @@ def test_desktop_full_user(lab):
     check(p.returncode != 0 and "not ours" in p.stderr, f"someone else's link: {p.stdout}{p.stderr}")
     # Installing again gets out of the way of it.
     out = box.sh(home + "sh /tmp/full.run", user="dev", timeout=600)
-    check("with Xfce and LibreWolf" in out, out[-500:])
+    check("with Xfce and Chromium" in out, out[-500:])
     new = box.sh("cat /home/dev/.local/share/meshvpn/desktop-full/prefix").strip()
     check(new != prefix, "should have taken another name")
     box.sh(home + wrapper, user="dev")
@@ -1244,9 +1244,9 @@ def test_desktop_full_user(lab):
     # Removing it: the desktop goes, meshvpn stays, the other user's stays.
     box.sh(home + "sh /tmp/full.run --uninstall", user="dev")
     left = box.sh(f"ls /home/dev/.local/bin; ls /home/dev/.local/share/meshvpn; test -e {new} && echo LINK; true")
-    check("xfce4" not in left and "librewolf" not in left and "desktop-full" not in left and "LINK" not in left, f"left behind: {left}")
+    check("xfce4" not in left and "chromium" not in left and "desktop-full" not in left and "LINK" not in left, f"left behind: {left}")
     check("meshvpn" in left, "meshvpn stays")
-    box.sh("export HOME=/home/other; /home/other/.local/bin/librewolf --version", user="other")
+    box.sh("export HOME=/home/other; /home/other/.local/bin/chromium --version", user="other")
 
 
 @test

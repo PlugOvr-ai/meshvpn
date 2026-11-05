@@ -178,7 +178,7 @@ def full(port, token):
     v.until(lambda: any("Thunar" in w["title"] for w in v.windows), "Thunar", 60)
     # What the panel's Web Browser button runs.
     v.send(C_LAUNCH, b"exo-open --launch WebBrowser")
-    v.until(lambda: any("LibreWolf" in w["title"] for w in v.windows), "LibreWolf", 90)
+    v.until(lambda: any("Chromium" in w["title"] for w in v.windows), "Chromium", 90)
     print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
 
 

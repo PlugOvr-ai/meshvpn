@@ -37,7 +37,7 @@ sed 's|^|/|' "$L/members" > "$D/paths"
 cp "$L/packages" "$D/packages"
 cp -r "$L/licenses" "$D/licenses"
 cat > "$D/README" <<EOT
-meshvpn packed desktop ($ARCH): Xfce and the LibreWolf browser, from nixpkgs $REV.
+meshvpn packed desktop ($ARCH): Xfce and the Chromium browser, from nixpkgs $REV.
 
 packages    what's inside
 licenses/   each package's licence and copyright files, from its source

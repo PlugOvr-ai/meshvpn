@@ -5,32 +5,58 @@ let
   # From the xfce set by name: top-level `exo` is an unrelated program.
   x = name: pkgs.xfce.${name};
 
-  # A browser with no H.264 of its own: it plays that through FFmpeg, which it doesn't get here, and
-  # Chromium has it compiled in. It has an AAC decoder of its own, switched off here with MP4. It
-  # also doesn't fetch the codec plugins (OpenH264, Widevine).
-  browser = pkgs.wrapFirefox (pkgs.librewolf-unwrapped // { ffmpegSupport = false; }) {
-    extraPrefs = ''
-      lockPref("media.gmp-provider.enabled", false);
-      lockPref("media.gmp-gmpopenh264.enabled", false);
-      lockPref("media.gmp-widevinecdm.enabled", false);
-      lockPref("media.eme.enabled", false);
-      lockPref("media.mp4.enabled", false);
-    '';
-  };
+  # Chromium as nixpkgs builds it: H.264 and AAC are compiled into the browser itself, so removing
+  # the codec packages (desktop/legal.py) doesn't remove those. Its sandbox needs user namespaces,
+  # which default Docker blocks, and it refuses to run as root with one. It then runs without, and
+  # shows its warning about that.
+  # nixpkgs' start script, without the search paths into GTK4, which isn't shipped (desktop/legal.py)
+  # and which Chromium doesn't link to: it uses GTK3 here.
+  launcher = pkgs.runCommand "chromium-launcher" { } ''
+    mkdir -p $out/bin $out/share
+    sed -E 's#:/nix/store/[a-z0-9]{32}-gtk4-[^:"]*##g' ${pkgs.chromium}/bin/chromium > $out/bin/chromium
+    chmod +x $out/bin/chromium
+    if grep -q -- '-gtk4-' $out/bin/chromium; then
+        echo "GTK4 is still in the start script" >&2
+        exit 1
+    fi
+    cp -r --no-preserve=mode ${pkgs.chromium}/share/icons $out/share/icons
+  '';
+  browser = pkgs.writeShellScriptBin "chromium" ''
+    flags=""
+    if [ "$(id -u)" = 0 ] || ! ${pkgs.util-linux}/bin/unshare -Ur true 2>/dev/null; then
+        flags="--no-sandbox"
+    fi
+    exec ${launcher}/bin/chromium $flags --disable-dev-shm-usage --disable-gpu --no-first-run \
+        --no-default-browser-check --password-store=basic "$@"
+  '';
+  browserAlias = pkgs.writeShellScriptBin "chromium-browser" ''
+    exec ${browser}/bin/chromium "$@"
+  '';
+  menuEntry = pkgs.writeTextDir "share/applications/chromium-browser.desktop" ''
+    [Desktop Entry]
+    Version=1.0
+    Type=Application
+    Name=Chromium
+    Icon=chromium
+    Exec=chromium %U
+    Terminal=false
+    Categories=Network;WebBrowser;
+    MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+  '';
 
   # What exo-open and the panel's launchers use.
   helpers = pkgs.writeTextDir "etc/xdg/xfce4/helpers.rc" ''
-    WebBrowser=librewolf
+    WebBrowser=chromium
     TerminalEmulator=xfce4-terminal
     FileManager=thunar
   '';
-  browserHelper = pkgs.writeTextDir "share/xfce4/helpers/librewolf.desktop" ''
+  browserHelper = pkgs.writeTextDir "share/xfce4/helpers/chromium.desktop" ''
     [Desktop Entry]
     Version=1.0
     Type=X-XFCE-Helper
-    Name=LibreWolf
-    Icon=librewolf
-    X-XFCE-Binaries=librewolf;
+    Name=Chromium
+    Icon=chromium
+    X-XFCE-Binaries=chromium;
     X-XFCE-Category=WebBrowser
     X-XFCE-Commands=%B;
     X-XFCE-CommandsWithParameter=%B "%s";
@@ -39,7 +65,10 @@ in
 pkgs.buildEnv {
   name = "meshvpn-desktop-full";
   paths = [
-    browser
+    (pkgs.hiPrio browser)
+    (pkgs.hiPrio browserAlias)
+    (pkgs.hiPrio menuEntry)
+    (pkgs.lowPrio launcher)
     helpers
     browserHelper
     (x "xfce4-session")

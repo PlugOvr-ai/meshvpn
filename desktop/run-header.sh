@@ -1,5 +1,5 @@
 #!/bin/sh
-# meshvpn with a full desktop: this one file holds meshvpn, Xfce and the LibreWolf browser, with
+# meshvpn with a full desktop: this one file holds meshvpn, Xfce and the Chromium browser, with
 # everything they need. Nothing is downloaded and no package manager is involved, so it works on
 # any Linux distribution of this CPU architecture, in containers too.
 #
@@ -66,11 +66,11 @@ else
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
-    for c in xfce4-session librewolf $COMMANDS; do
+    for c in xfce4-session chromium $COMMANDS; do
         # Only what we put there.
         [ -f "$BIN/$c" ] && grep -q "$HOME_DIR" "$BIN/$c" 2>/dev/null && rm -f "$BIN/$c"
     done
-    rm -f "$APPS/meshvpn-librewolf.desktop"
+    rm -f "$APPS/meshvpn-chromium.desktop"
     if [ -n "$USER_MODE" ]; then
         if [ -f "$BASE/prefix" ]; then
             # Only our own: /tmp is shared, and it may be someone else's by now.
@@ -114,7 +114,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 [ -f "$HOME_DIR/paths" ] && cp "$HOME_DIR/paths" "$TMP/old-paths"
 
-say "Unpacking meshvpn, Xfce and LibreWolf (about $NEEDS_MB MB, this takes a minute)..."
+say "Unpacking meshvpn, Xfce and Chromium (about $NEEDS_MB MB, this takes a minute)..."
 # After this script come two archives: meshvpn and the X server, then the desktop.
 tail -n +"$LINES" "$0" | head -c "$SMALL" | tar -xzf - -C "$UNPACK" || die "unpacking failed: is this file complete?"
 tail -n +"$LINES" "$0" | tail -c +"$((SMALL + 1))" | tar -xzf - -C "$UNPACK" || die "unpacking failed: is this file complete?"
@@ -190,7 +190,7 @@ exec "\$E/bin/dbus-run-session" --config-file="\$E/share/dbus-1/session.conf" --
 EOS
 chmod 0755 "$BIN/xfce4-session"
 
-for c in librewolf $COMMANDS; do
+for c in chromium $COMMANDS; do
     cat > "$BIN/$c" <<EOS
 #!/bin/sh
 # Installed by meshvpn: $c from $HOME_DIR
@@ -205,14 +205,14 @@ done
 
 # The browser bar's list of applications.
 mkdir -p "$APPS"
-cp -f "$HOME_DIR/env/share/applications/librewolf.desktop" "$APPS/meshvpn-librewolf.desktop"
-chmod 644 "$APPS/meshvpn-librewolf.desktop"
+cp -f "$HOME_DIR/env/share/applications/chromium-browser.desktop" "$APPS/meshvpn-chromium.desktop"
+chmod 644 "$APPS/meshvpn-chromium.desktop"
 
 "$BIN/meshvpn" desktop setup --from "$HOME_DIR/x-bundle.tar.gz" >/dev/null || die "installing the X server failed"
 # Users without their own copy of the X server use the machine's, set up just now.
 rm -f "$HOME_DIR/x-bundle.tar.gz"
 
-say "Installed $("$BIN/meshvpn" --version) with Xfce and LibreWolf."
+say "Installed $("$BIN/meshvpn" --version) with Xfce and Chromium."
 echo "Licences and where to get the source code: $HOME_DIR/README"
 if [ -n "$USER_MODE" ]; then
     case ":$PATH:" in

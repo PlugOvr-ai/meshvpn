@@ -333,13 +333,13 @@ applications you want to run.
   The tabs in the browser bar follow Xfce's windows; logging out of Xfce ends the session. `--plain` keeps the
   built-in minimal desktop, `--xfce` insists on Xfce. A running session keeps its desktop until `meshvpn desktop stop`.
 * **Everything in one file:** `install.sh --full` (or `meshvpn-full-<arch>.run` from the release, for machines without
-  internet) brings meshvpn, Xfce and the LibreWolf browser with all their libraries, so the node needs no package manager
+  internet) brings meshvpn, Xfce and the Chromium browser with all their libraries, so the node needs no package manager
   and it works the same on Debian, Ubuntu, Fedora and Alpine: `curl -fsSL .../install.sh | sudo sh -s -- --full join mesh1-...`.
-  x86_64 and ARM64, 600 MB to download, 1.9 GB on disk (in `/nix/store`, but Nix isn't needed). Terminals keep using the machine's own programs.
+  x86_64 and ARM64, about 650 MB to download, 2.2 GB on disk (in `/nix/store`, but Nix isn't needed). Terminals keep using the machine's own programs.
   **It doesn't update itself:** a new meshvpn release brings a new browser, so install the newest release regularly.
-  **No H.264, H.265 or MP4 playback:** those formats have patent licences we don't hold, so such video doesn't play;
-  VP8, VP9, AV1, Opus, Vorbis, FLAC and MP3 do. Install a browser from your distribution if you need them. In most
-  containers the browser's sandbox has less to work with than on a real machine. Licences are in
+  The browser is Chromium as nixpkgs builds it, with H.264 and AAC playback compiled in. Where the machine blocks user
+  namespaces (default Docker) or as root, it runs without its sandbox and shows a warning, so only open sites you trust
+  there. Licences are in
   `/opt/meshvpn-desktop-full`, the complete source is on the release page as `meshvpn-full-sources-<arch>.tar.gz.part*`.
   `sudo sh meshvpn-full-<arch>.run --uninstall` removes the desktop and keeps meshvpn.
 * **The same without root,** for example in a Docker image where you aren't root:
