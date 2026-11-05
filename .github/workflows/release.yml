@@ -196,12 +196,15 @@ jobs:
           sudo modprobe tun || true
           python3 tests/e2e/run.py --binary bin/meshvpn --desktop-bundle in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
             --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless desktop_full_container
+      - name: Gather what gets published
+        # In one directory: paths from several would arrive as subdirectories, which can't be published.
+        run: |
+          mkdir publish
+          mv run-out/*.run full-out/meshvpn-full-sources-* publish/
       - uses: actions/upload-artifact@v7
         with:
           name: dist-full-${{ matrix.arch }}
-          path: |
-            run-out/*.run
-            full-out/meshvpn-full-sources-*
+          path: publish/*
           compression-level: 0
 
   e2e:
@@ -296,6 +299,12 @@ jobs:
 
           Then: \`sudo meshvpn init\` to create a network, or \`sudo meshvpn join <invite>\` to join one.
           NOTES
+
+      - name: Nothing but files to publish
+        run: |
+          # A directory fails only at the very end, an hour in.
+          if [ -n "$(find dist -mindepth 1 -type d)" ]; then find dist -mindepth 1 -type d; exit 1; fi
+          ls dist/meshvpn-full-x86_64.run dist/meshvpn-full-aarch64.run dist/meshvpn-full-sources-x86_64.tar.gz.part00 dist/meshvpn-full-sources-aarch64.tar.gz.part00
 
       - name: Publish release
         env:
