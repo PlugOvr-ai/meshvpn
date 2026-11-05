@@ -1,0 +1,172 @@
+name: Browser age
+
+# The packed desktop's Chromium doesn't update itself, and security fixes come about weekly. Once a
+# week this compares what the latest release ships with what's available, and if it's behind, builds
+# the installer with the newest packages and tests it. The result lands in one issue, kept up to
+# date. Nothing is released from here: to release, move the revision in desktop/build-full.sh.
+#
+# GitHub turns scheduled workflows off after 60 days without activity in a repository, and emails
+# about it. This workflow failing also emails: it fails if it can't tell.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build and test even if the release isn't behind (opens no issue then)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  # The branch desktop/build-full.sh follows: move it along with the revision.
+  BRANCH: nixos-26.05
+  OLD_DAYS: 30
+  # A release branch of nixpkgs gets no updates after its end of life.
+  BRANCH_QUIET_DAYS: 21
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    outputs:
+      behind: ${{ steps.c.outputs.behind }}
+      build: ${{ steps.c.outputs.build }}
+      tip: ${{ steps.c.outputs.tip }}
+      tag: ${{ steps.c.outputs.tag }}
+    steps:
+      - id: c
+        name: What's released, what's available
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" -q .tag_name)
+          pinned=$(gh api "repos/$GITHUB_REPOSITORY/contents/desktop/build-full.sh?ref=$tag" -H 'Accept: application/vnd.github.raw' \
+            | sed -n 's/^REV="${NIXPKGS_REV:-\([0-9a-f]\{40\}\)}".*/\1/p')
+          test -n "$pinned"
+          pinned_date=$(gh api "repos/NixOS/nixpkgs/commits/$pinned" -q .commit.committer.date)
+          tip=$(gh api "repos/NixOS/nixpkgs/commits/$BRANCH" -q .sha)
+          tip_date=$(gh api "repos/NixOS/nixpkgs/commits/$BRANCH" -q .commit.committer.date)
+          version() {
+            docker run --rm nixos/nix:latest nix --extra-experimental-features 'nix-command flakes' eval --raw --impure --expr \
+              "(import (builtins.getFlake \"github:NixOS/nixpkgs/$1\") { system = \"x86_64-linux\"; }).chromium.version"
+          }
+          shipped=$(version "$pinned")
+          available=$(version "$tip")
+          upstream=$(curl -fsSL 'https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions?order_by=version%20desc&pageSize=1' | jq -r '.versions[0].version')
+          test -n "$shipped" && test -n "$available" && test -n "$upstream"
+          now=$(date +%s)
+          age=$(( (now - $(date -d "$pinned_date" +%s)) / 86400 ))
+          quiet=$(( (now - $(date -d "$tip_date" +%s)) / 86400 ))
+
+          behind=false
+          # Newer in nixpkgs, or simply old: either way a new installer is due.
+          if [ "$shipped" != "$available" ] || [ "$age" -gt "$OLD_DAYS" ]; then behind=true; fi
+          if [ "$quiet" -gt "$BRANCH_QUIET_DAYS" ]; then behind=true; fi
+          build=$behind
+          [ "$FORCE" != true ] || build=true
+          {
+            echo "behind=$behind"
+            echo "build=$build"
+            echo "tip=$tip"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "| | Chromium | nixpkgs |"
+            echo "|---|---|---|"
+            echo "| Latest release ($tag) | $shipped | \`${pinned:0:12}\`, $age days old |"
+            echo "| \`$BRANCH\` now | $available | \`${tip:0:12}\`, $quiet days old |"
+            echo "| Google's stable channel | $upstream | |"
+            if [ "$quiet" -gt "$BRANCH_QUIET_DAYS" ]; then
+              echo
+              echo "**\`$BRANCH\` has had no update for $quiet days: it may have reached its end of life. Move to the next NixOS release branch.**"
+            fi
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: summary
+          path: summary.md
+
+  try:
+    # The newest packages with the latest release's meshvpn: does a new installer work?
+    needs: compare
+    if: needs.compare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Make room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+      # The release's own scripts and tests, as they go with its meshvpn.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.compare.outputs.tag }}
+      - name: The latest release's meshvpn and X server
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.compare.outputs.tag }}
+        run: |
+          gh release download "$TAG" -p meshvpn-x86_64-unknown-linux-musl.tar.gz -p meshvpn-desktop-x86_64.tar.gz -D in
+          mkdir bin && tar -xzf in/meshvpn-x86_64-unknown-linux-musl.tar.gz -C bin
+      - name: Build with the newest packages
+        env:
+          NIXPKGS_REV: ${{ needs.compare.outputs.tip }}
+        run: docker run --rm -e NIXPKGS_REV -v "$PWD/desktop:/build:ro" -v "$PWD/full-out:/out" nixos/nix:latest sh /build/build-full.sh
+      - name: Put the installer together
+        run: |
+          sudo chown -R "$USER" full-out
+          sh desktop/make-run.sh bin/meshvpn in/meshvpn-desktop-x86_64.tar.gz \
+            full-out/meshvpn-desktop-full-x86_64.tar.gz run-out bin/THIRD-PARTY-LICENSES.txt
+      - name: Test it on a bare image
+        run: |
+          sudo modprobe tun || true
+          python3 tests/e2e/run.py --binary bin/meshvpn --desktop-bundle in/meshvpn-desktop-x86_64.tar.gz \
+            --desktop-full run-out/meshvpn-full-x86_64.run desktop_full desktop_full_user desktop_full_nameless desktop_full_container
+
+  report:
+    needs: [compare, try]
+    # Also when the build failed: that's what needs saying most. Not if comparing failed: the run's failure says it.
+    if: always() && needs.compare.result == 'success' && needs.compare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: summary
+      - name: One issue, kept up to date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TRY: ${{ needs.try.result }}
+          BEHIND: ${{ needs.compare.outputs.behind }}
+          TIP: ${{ needs.compare.outputs.tip }}
+        run: |
+          set -eu
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            cat summary.md
+            echo
+            if [ "$TRY" = success ]; then
+              echo "An installer with \`$TIP\` built and passed the desktop tests on x86_64 ([run]($run))."
+              echo "To release: set this revision in \`desktop/build-full.sh\` and tag. The release tests ARM too."
+            else
+              echo "An installer with \`$TIP\` did **not** get through ([run]($run)): result \`$TRY\`."
+            fi
+          } > body.md
+          title="The packed desktop's browser is behind"
+          n=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number -q '.[0].number // empty')
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$BEHIND" != true ]; then
+            echo "The release isn't behind: no issue. Open issue found: ${n:-none}"
+          elif [ -n "$n" ]; then
+            gh issue edit "$n" -R "$GITHUB_REPOSITORY" --body-file body.md
+            gh issue comment "$n" -R "$GITHUB_REPOSITORY" --body "Checked again: [run]($run), result \`$TRY\`."
+          else
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+          fi
+          # The owner hears about a failed run by email, without watching the issues.
+          [ "$TRY" = success ]

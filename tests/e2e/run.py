@@ -1240,6 +1240,10 @@ def test_desktop_full(lab):
            "&& ls /opt/meshvpn-desktop-full/licenses | grep -q ^glibc")
     found = box.sh("ls /nix/store | grep -E -- '-(x264|x265|openh264|ffmpeg|gst-plugins-bad|gst-plugins-ugly|gst-libav|fdk-aac|faad2|libde265|ldacBT|libfreeaptx|gtk4)-' ; true")
     check(not found.strip(), f"should not be shipped: {found}")
+    # An old browser gets a warning, and stops nothing.
+    check("Chromium" in box.mv("doctor", ok=False).stdout and "security fixes" not in box.mv("doctor", ok=False).stdout, "doctor names the browser")
+    box.sh("sed -i 's/^date=.*/date=1000/' /opt/meshvpn-desktop-full/browser")
+    check("missed security fixes" in box.mv("doctor", ok=False).stdout, "doctor warns about an old browser")
     # Removing it leaves meshvpn, and nothing of the desktop.
     box.sh("cd /home/agent; su agent -s /bin/sh -c 'meshvpn desktop stop'", ok=False)
     box.sh("sh /tmp/full.run --uninstall")

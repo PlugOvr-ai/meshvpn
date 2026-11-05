@@ -214,6 +214,17 @@ rm -f "$HOME_DIR/x-bundle.tar.gz"
 
 say "Installed $("$BIN/meshvpn" --version) with Xfce and Chromium."
 echo "Licences and where to get the source code: $HOME_DIR/README"
+# A note and no more: an old browser is still better than no desktop.
+BUILT="$(sed -n 's/^date=//p' "$HOME_DIR/browser" 2>/dev/null || true)"
+NOW="$(date +%s 2>/dev/null || true)"
+case "$BUILT$NOW" in
+    "" | *[!0-9]*) ;;
+    *)
+        if [ -n "$BUILT" ] && [ -n "$NOW" ] && [ "$((NOW - BUILT))" -gt $((30 * 86400)) ]; then
+            say "note: its Chromium is $(((NOW - BUILT) / 86400)) days old and has missed security fixes. See if there's a newer release: https://github.com/PlugOvr-ai/meshvpn/releases"
+        fi
+        ;;
+esac
 if [ -n "$USER_MODE" ]; then
     case ":$PATH:" in
         *":$BIN:"*) ;;

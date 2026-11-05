@@ -53,6 +53,47 @@ pub fn find() -> Option<Bundle> {
         .map(|dir| Bundle { dir })
 }
 
+/// A browser older than this has missed security fixes: Chromium publishes them about weekly.
+const BROWSER_OLD_DAYS: u64 = 30;
+
+/// The browser of a packed desktop, as its installer describes it (desktop/build-full.sh).
+#[derive(Debug, PartialEq)]
+pub struct PackedBrowser {
+    pub version: String,
+    pub days_old: u64,
+}
+
+impl PackedBrowser {
+    pub fn is_old(&self) -> bool {
+        self.days_old > BROWSER_OLD_DAYS
+    }
+}
+
+fn parse_packed_browser(text: &str, now_secs: u64) -> Option<PackedBrowser> {
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::trim))
+    };
+    let date: u64 = field("date")?.parse().ok()?;
+    Some(PackedBrowser {
+        version: field("chromium")?.to_string(),
+        days_old: now_secs.saturating_sub(date) / 86400,
+    })
+}
+
+/// The installed packed desktop's browser, if there is one (the user's own wins, as in `find`).
+pub fn packed_browser() -> Option<PackedBrowser> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let own = user_base().map(|b| b.with_file_name("desktop-full/opt/meshvpn-desktop-full/browser"));
+    [own, Some(PathBuf::from("/opt/meshvpn-desktop-full/browser"))]
+        .into_iter()
+        .flatten()
+        .find_map(|f| parse_packed_browser(&std::fs::read_to_string(f).ok()?, now))
+}
+
 /// `meshvpn desktop setup --xfce`: Xfce from the system's package manager - a real desktop
 /// (panel with the applications menu, file manager, terminal) instead of the built-in one.
 pub fn install_xfce() -> Result<()> {
@@ -224,6 +265,24 @@ fn install(data: &[u8]) -> Result<Bundle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_browser_age() {
+        let day = 86400;
+        let b = parse_packed_browser("chromium=156.0.1\nnixpkgs=abc\ndate=1000\n", 1000 + 31 * day).unwrap();
+        assert_eq!(b.version, "156.0.1");
+        assert_eq!(b.days_old, 31);
+        assert!(b.is_old());
+        assert!(
+            !parse_packed_browser("chromium=1\ndate=1000\n", 1000 + 30 * day)
+                .unwrap()
+                .is_old()
+        );
+        // A clock behind the build isn't old, and a file we can't read isn't anything.
+        assert_eq!(parse_packed_browser("chromium=1\ndate=1000\n", 5).unwrap().days_old, 0);
+        assert!(parse_packed_browser("chromium=1\n", 5).is_none());
+        assert!(parse_packed_browser("chromium=1\ndate=soon\n", 5).is_none());
+    }
 
     #[test]
     fn relocating_keeps_every_offset() {

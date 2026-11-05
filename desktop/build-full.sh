@@ -35,16 +35,26 @@ rm -rf "$STAGE" && mkdir -p "$D"
 ln -s "$ROOT" "$D/env"
 sed 's|^|/|' "$L/members" > "$D/paths"
 cp "$L/packages" "$D/packages"
+# How old the browser is, for `meshvpn doctor` and the installer: from the revision, so that the
+# same revision still gives the same desktop.
+cat > "$D/browser" <<EOT
+chromium=$(nix eval --raw --impure --expr "(import (builtins.getFlake \"github:NixOS/nixpkgs/$REV\") { system = builtins.currentSystem; }).chromium.version")
+nixpkgs=$REV
+date=$(nix eval --raw --impure --expr "toString (builtins.getFlake \"github:NixOS/nixpkgs/$REV\").lastModified")
+EOT
+cat "$D/browser"
 cp -r "$L/licenses" "$D/licenses"
 cat > "$D/README" <<EOT
 meshvpn packed desktop ($ARCH): Xfce and the Chromium browser, from nixpkgs $REV.
 
 packages    what's inside
+browser     the browser's version and how old it is
 licenses/   each package's licence and copyright files, from its source
 
 Everything is free software under its own licence, with NO WARRANTY. The complete source of all of
-it, with what's needed to build it, is published next to the installer you got this from, as
+it, with the recipes that build it, is published next to the installer you got this from, as
 meshvpn-full-sources-$ARCH.tar.gz.part*: https://github.com/PlugOvr-ai/meshvpn/releases
+Compilers and other build tools aren't in there: Nix gets those by itself.
 Used by \`meshvpn desktop\`; see https://github.com/PlugOvr-ai/meshvpn
 
 Installed without root, the path /nix/store inside these files was replaced by one of the same
@@ -72,6 +82,7 @@ The complete source of the meshvpn packed desktop ($ARCH).
 nix/store/      each package's source archives and patches, with Nix's names for them
 nixpkgs-$REV/   how each package is built, with the remaining patches
 build/          how the desktop is put together: docker run ... nixos/nix sh build-full.sh
+                (with network: Nix gets the compilers and other build tools, which aren't in here)
 packages        what's in the desktop
 report          what was removed from it, and why
 EOT
