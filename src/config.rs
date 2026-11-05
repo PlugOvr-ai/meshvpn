@@ -138,6 +138,80 @@ pub struct SshAllow {
     pub users: Vec<String>,
 }
 
+/// `meshvpn ssh allow "ssh-ed25519 AAAA..."`: whoever holds this key may log in, from any node of
+/// the network. Names can be taken by another device; a key can't.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SshAllowKey {
+    /// `type base64`, checked: nothing else ever reaches an authorized_keys line from here.
+    pub key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    pub users: Vec<String>,
+}
+
+impl SshAllowKey {
+    /// A line of a `.pub` file. Refuses authorized_keys options and more than one key.
+    pub fn parse(line: &str) -> Result<(String, String)> {
+        let line = line.trim();
+        let mut parts = line.split_whitespace();
+        let key = format!("{} {}", parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        if line.contains(['\n', '\r'])
+            || !crate::proto::valid_ssh_key(&key)
+            || russh::keys::PublicKey::from_openssh(&key).is_err()
+        {
+            bail!("that is not one SSH public key (expected a line of a .pub file: ssh-ed25519 AAAA... comment)");
+        }
+        let comment: String = parts
+            .collect::<Vec<_>>()
+            .join("_")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "@._-".contains(*c))
+            .take(64)
+            .collect();
+        Ok((key, comment))
+    }
+
+    pub fn allow(rules: &mut Vec<SshAllowKey>, line: &str, users: &[String]) -> Result<String> {
+        let (key, comment) = Self::parse(line)?;
+        match rules.iter_mut().find(|r| r.key == key) {
+            Some(r) => {
+                for u in users {
+                    if !r.users.contains(u) {
+                        r.users.push(u.clone());
+                    }
+                }
+                if !comment.is_empty() {
+                    r.comment = comment;
+                }
+            }
+            None => rules.push(SshAllowKey {
+                key,
+                comment,
+                users: users.to_vec(),
+            }),
+        }
+        Ok(format!(
+            "this key may log in here as {} from any node of the network, without a password",
+            users.join(", ")
+        ))
+    }
+
+    /// Takes accounts away from a key (none named: all of them).
+    pub fn deny(rules: &mut Vec<SshAllowKey>, line: &str, users: &[String]) -> Result<String> {
+        let (key, _) = Self::parse(line)?;
+        let Some(rule) = rules.iter_mut().find(|r| r.key == key) else {
+            bail!("no rule for this key (see meshvpn ssh list)");
+        };
+        if users.is_empty() {
+            rule.users.clear();
+        } else {
+            rule.users.retain(|u| !users.contains(u));
+        }
+        rules.retain(|r| !r.users.is_empty());
+        Ok("updated password-less logins with this key".into())
+    }
+}
+
 /// A network key used before the current one (see `meshvpn ban`).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OldKey {
@@ -220,6 +294,10 @@ pub struct Config {
     pub publish_ssh_keys: bool,
     #[serde(default)]
     pub userspace: Userspace,
+    /// Built-in SSH server: also accept the keys in the account's own ~/.ssh/authorized_keys, as
+    /// sshd does (from mesh nodes only; never with an extension, whose rules decide who logs in).
+    #[serde(default = "default_true")]
+    pub ssh_authorized_keys: bool,
     /// Built-in SSH server: "auto" (where there is no sshd), "always" or "never".
     #[serde(default)]
     pub ssh_server: SshServer,
@@ -271,6 +349,9 @@ pub struct Config {
     /// without a password - e.g. for cluster machines everybody works on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_allow_all: Vec<String>,
+    /// SSH keys that may log in, whichever node they come from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_allow_keys: Vec<SshAllowKey>,
 }
 
 impl Config {
@@ -289,6 +370,7 @@ impl Config {
             mtu: default_mtu(),
             manage_hosts: !rootless(),
             publish_ssh_keys: true,
+            ssh_authorized_keys: true,
             userspace: if rootless() { Userspace::Always } else { Userspace::Auto },
             ssh_server: SshServer::Auto,
             udp: true,
@@ -299,6 +381,7 @@ impl Config {
             ticket: None,
             claim: None,
             ssh_allow_all: vec![],
+            ssh_allow_keys: vec![],
             ssh_default_user: None,
             exit_offer: false,
             exit_node: None,
@@ -553,5 +636,39 @@ mod tests {
     fn names_are_sanitized() {
         assert_eq!(sanitize_name("My Laptop!\n"), "my-laptop");
         assert_eq!(sanitize_name("---"), "node");
+    }
+}
+
+#[cfg(test)]
+mod ssh_key_rule_tests {
+    use super::SshAllowKey;
+
+    const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+
+    #[test]
+    fn only_a_plain_key_gets_through() {
+        let (key, comment) = SshAllowKey::parse(&format!("  {KEY} alice@laptop (work)\n")).unwrap();
+        assert_eq!(key, KEY);
+        assert_eq!(comment, "alice@laptop_work");
+        // Options would run a command at login; a second line would be a second key.
+        assert!(SshAllowKey::parse(&format!("command=\"sh\" {KEY}")).is_err());
+        assert!(SshAllowKey::parse(&format!("{KEY} a\n{KEY} b")).is_err());
+        assert!(SshAllowKey::parse("ssh-ed25519 AAAAnotakeyatallnotakey").is_err());
+        assert!(SshAllowKey::parse("ssh-ed25519").is_err());
+    }
+
+    #[test]
+    fn allow_adds_and_deny_takes_away() {
+        let mut rules = vec![];
+        let users = |u: &[&str]| u.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        SshAllowKey::allow(&mut rules, KEY, &users(&["a"])).unwrap();
+        SshAllowKey::allow(&mut rules, &format!("{KEY} other-comment"), &users(&["a", "b"])).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].users, ["a", "b"]);
+        SshAllowKey::deny(&mut rules, KEY, &users(&["a"])).unwrap();
+        assert_eq!(rules[0].users, ["b"]);
+        SshAllowKey::deny(&mut rules, KEY, &[]).unwrap();
+        assert!(rules.is_empty());
+        assert!(SshAllowKey::deny(&mut rules, KEY, &[]).is_err());
     }
 }

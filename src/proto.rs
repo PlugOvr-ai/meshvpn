@@ -300,21 +300,27 @@ pub fn valid_host_key(k: &str) -> bool {
         && b.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
 }
 
+const SSH_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+/// Does this start like an SSH public key (as opposed to a node name)?
+pub fn looks_like_ssh_key(s: &str) -> bool {
+    s.split_whitespace().next().is_some_and(|t| SSH_KEY_TYPES.contains(&t))
+}
+
 pub fn valid_ssh_key(k: &str) -> bool {
-    const TYPES: &[&str] = &[
-        "ssh-ed25519",
-        "ssh-rsa",
-        "ecdsa-sha2-nistp256",
-        "ecdsa-sha2-nistp384",
-        "ecdsa-sha2-nistp521",
-        "sk-ssh-ed25519@openssh.com",
-        "sk-ecdsa-sha2-nistp256@openssh.com",
-    ];
     let mut parts = k.split(' ');
     let (Some(t), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
     };
-    TYPES.contains(&t)
+    SSH_KEY_TYPES.contains(&t)
         && (16..=4096).contains(&b.len())
         && b.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
 }

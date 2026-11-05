@@ -158,6 +158,7 @@ struct State {
     banned: HashMap<NodeId, String>,
     ssh_allow: Vec<crate::config::SshAllow>,
     ssh_allow_all: Vec<String>,
+    ssh_allow_keys: Vec<crate::config::SshAllowKey>,
     /// This node's name (can change at runtime: `meshvpn rename`).
     my_name: String,
     my_tags: Vec<String>,
@@ -460,6 +461,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         st.objects_ad = node.shares.ads();
         st.ssh_allow = node.cfg.ssh_allow.clone();
         st.ssh_allow_all = node.cfg.ssh_allow_all.clone();
+        st.ssh_allow_keys = node.cfg.ssh_allow_keys.clone();
         st.login_user = node.cfg.ssh_default_user.clone();
         st.exit_offer = node.cfg.exit_offer;
         st.exit_via = node.cfg.exit_node.as_deref().and_then(|h| NodeId::from_hex(h).ok());
@@ -500,7 +502,11 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     );
 
     // An extension may grant logins too (e.g. bench reservations).
-    if !node.cfg.ssh_allow.is_empty() || !node.cfg.ssh_allow_all.is_empty() || crate::ext::get().is_some() {
+    if !node.cfg.ssh_allow.is_empty()
+        || !node.cfg.ssh_allow_all.is_empty()
+        || !node.cfg.ssh_allow_keys.is_empty()
+        || crate::ext::get().is_some()
+    {
         match crate::sshd::enable_if_installed() {
             Ok(true) => info!(
                 "enabled password-less SSH logins from mesh nodes in sshd ({})",
@@ -962,6 +968,15 @@ impl Node {
         }
         let all_rules = Self::ssh_rules(&st, &access);
         let in_scope = access.only.as_ref().is_none_or(|o| o.contains(&rec.info.id));
+        if in_scope {
+            for k in st.ssh_allow_keys.iter().filter(|k| k.users.iter().any(|u| u == user)) {
+                if let Ok(pk) = russh::keys::PublicKey::from_openssh(&k.key)
+                    && pk.key_data() == key.key_data()
+                {
+                    return Ok(format!("key {} via {node}", k.comment));
+                }
+            }
+        }
         let everyone = in_scope && st.ssh_allow_all.iter().any(|u| u == user);
         let rules: Vec<_> = all_rules
             .iter()
@@ -1004,6 +1019,17 @@ impl Node {
         ))
     }
 
+    /// May the account's own authorized_keys let in someone coming from mesh address `ip`?
+    /// Returns the node's name.
+    pub fn ssh_own_keys_from(&self, ip: Ipv4Addr) -> Option<String> {
+        if !self.cfg.ssh_authorized_keys || crate::ext::get().is_some() {
+            return None;
+        }
+        let st = self.state.lock().unwrap();
+        let rec = st.records.values().find(|r| overlay_ip(&r.info.id) == ip)?;
+        (!st.banned.contains_key(&rec.info.id)).then(|| rec.info.name.clone())
+    }
+
     /// A refused login to the built-in SSH server, for doctor and `meshvpn ssh list`.
     pub fn ssh_refused(&self, text: String) {
         let mut st = self.state.lock().unwrap();
@@ -1028,6 +1054,11 @@ impl Node {
                 .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
                 .collect();
             let ip = overlay_ip(&rec.info.id);
+            if in_scope && !st.banned.contains_key(&rec.info.id) {
+                for k in st.ssh_allow_keys.iter().filter(|k| k.users.iter().any(|u| u == user)) {
+                    lines.push(format!("from=\"{ip}\" {} meshvpn:key:{}\n", k.key, k.comment));
+                }
+            }
             for k in &rec.info.ssh_keys {
                 if everyone || rules.iter().any(|r| r.from_user.as_ref().is_none_or(|u| *u == k.user)) {
                     let line = format!("from=\"{ip}\" {} meshvpn:{}@{}\n", k.key, k.user, rec.info.name);
@@ -1071,8 +1102,26 @@ impl Node {
             .values()
             .filter(|r| r.info.name == node || (node.len() >= 4 && r.info.id.hex().starts_with(&node)))
             .collect();
-        // Same name twice (e.g. a re-installed machine): the online, newest one is meant.
         matches.sort_by_key(|r| (!self.is_online(st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+        // A permission must not land on whichever device took that name last.
+        if matches.len() > 1 {
+            let ids: Vec<String> = matches
+                .iter()
+                .map(|r| {
+                    let state = if self.is_online(st, &r.info.id) {
+                        "online"
+                    } else {
+                        "offline"
+                    };
+                    format!("  {} ({}, {state})", r.info.id.hex(), r.info.name)
+                })
+                .collect();
+            bail!(
+                "{} nodes match {node:?}. Say which one by its id, or by the user's SSH public key:\n{}",
+                matches.len(),
+                ids.join("\n")
+            );
+        }
         let Some(rec) = matches.first() else {
             bail!("no node named {node:?} (see meshvpn status)");
         };
@@ -1083,6 +1132,7 @@ impl Node {
         let mut cfg = Config::load(&self.dir)?;
         cfg.ssh_allow = st.ssh_allow.clone();
         cfg.ssh_allow_all = st.ssh_allow_all.clone();
+        cfg.ssh_allow_keys = st.ssh_allow_keys.clone();
         cfg.save(&self.dir)
     }
 
@@ -1104,6 +1154,11 @@ impl Node {
                  (also nodes that join later)",
                 users.join(", ")
             ));
+        }
+        if crate::proto::looks_like_ssh_key(who) {
+            let msg = crate::config::SshAllowKey::allow(&mut st.ssh_allow_keys, who, &users)?;
+            self.save_ssh_rules(&st)?;
+            return Ok(msg);
         }
         let (node, name, from_user) = self.resolve_ssh_source(&st, who)?;
         let keys = st.records[&node]
@@ -1162,17 +1217,30 @@ impl Node {
             self.save_ssh_rules(&st)?;
             return Ok("updated password-less logins for everyone".into());
         }
+        if crate::proto::looks_like_ssh_key(who) {
+            let msg = crate::config::SshAllowKey::deny(&mut st.ssh_allow_keys, who, &users)?;
+            self.save_ssh_rules(&st)?;
+            return Ok(msg);
+        }
         let (node, name, from_user) = match self.resolve_ssh_source(&st, who) {
             Ok(r) => r,
-            // The node may be gone already: match the rules by name.
+            // The node may be gone already, or its name not unique: match the rules.
             Err(_) => {
                 let (u, n) = match who.split_once('@') {
                     Some((u, n)) => (Some(u.to_string()), n.to_string()),
                     None => (None, who.to_string()),
                 };
-                let rule = st.ssh_allow.iter().find(|r| r.name == n && r.from_user == u);
-                let rule = rule.ok_or_else(|| anyhow!("no rule for {who} (see meshvpn ssh list)"))?;
-                (rule.node, n, u)
+                let n = n.trim().to_lowercase();
+                let rules: Vec<_> = st
+                    .ssh_allow
+                    .iter()
+                    .filter(|r| (r.name == n || (n.len() >= 4 && r.node.hex().starts_with(&n))) && r.from_user == u)
+                    .collect();
+                match rules[..] {
+                    [] => bail!("no rule for {who} (see meshvpn ssh list)"),
+                    [rule] => (rule.node, n, u),
+                    _ => bail!("several rules match {who}: say which node by its id (see meshvpn ssh list)"),
+                }
             }
         };
         let before = st.ssh_allow.clone();
@@ -1211,7 +1279,7 @@ impl Node {
                 st.ssh_allow_all.join(", ")
             ));
         }
-        if st.ssh_allow.is_empty() && st.ssh_allow_all.is_empty() {
+        if st.ssh_allow.is_empty() && st.ssh_allow_all.is_empty() && st.ssh_allow_keys.is_empty() {
             out.push_str("  (none) - allow some with: sudo meshvpn ssh allow [user@]node --as <local user>\n");
         }
         for r in &st.ssh_allow {
@@ -1227,7 +1295,25 @@ impl Node {
             } else {
                 "  [node unknown/offline]"
             };
-            out.push_str(&format!("  {src:<32} -> {}{gone}\n", r.users.join(", ")));
+            out.push_str(&format!(
+                "  {src:<32} -> {}  [id {}]{gone}\n",
+                r.users.join(", "),
+                r.node.short()
+            ));
+        }
+        for k in &st.ssh_allow_keys {
+            let fp = russh::keys::PublicKey::from_openssh(&k.key)
+                .map(|p| p.fingerprint(russh::keys::HashAlg::Sha256).to_string())
+                .unwrap_or_default();
+            let label = if k.comment.is_empty() {
+                "key".to_string()
+            } else {
+                format!("key {}", k.comment)
+            };
+            out.push_str(&format!(
+                "  {label:<32} -> {}  [{fp}, from any node]\n",
+                k.users.join(", ")
+            ));
         }
         out.push_str("\nSSH keys this machine offers to other nodes:\n");
         let keys = if self.cfg.publish_ssh_keys {

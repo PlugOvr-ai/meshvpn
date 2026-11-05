@@ -526,19 +526,22 @@ enum TagCmd {
 
 #[derive(Subcommand)]
 enum SshCmd {
-    /// Let a node - or one user on it (`user@node`) - log in here without a password.
+    /// Let a node, one user on it (`user@node`) or an SSH key log in here without a password.
     ///
     /// Example: `sudo meshvpn ssh allow cornelius@desktop --as cornelius`
+    /// or, not depending on any device's name: `sudo meshvpn ssh allow ssh-ed25519 AAAA... --as cornelius`
     Allow {
-        /// `node` (any of its users) or `user@node`.
-        who: String,
+        /// `node` (any of its users), `user@node`, a node's id, or an SSH public key (a line of a .pub file).
+        #[arg(required = true, num_args = 1..)]
+        who: Vec<String>,
         /// Local account(s) they may log in as.
         #[arg(long = "as", required = true, num_args = 1..)]
         users: Vec<String>,
     },
     /// Take a permission back (without --as: all accounts).
     Deny {
-        who: String,
+        #[arg(required = true, num_args = 1..)]
+        who: Vec<String>,
         #[arg(long = "as", num_args = 1..)]
         users: Vec<String>,
     },
@@ -1485,7 +1488,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             let req = match cmd.unwrap_or(SshCmd::List) {
                 SshCmd::Allow { who, users } if !control::is_running(&dir) => {
                     require_owner()?;
-                    let msg = ssh_rules_offline(&dir, &who, users, true)?;
+                    let msg = ssh_rules_offline(&dir, &who.join(" "), users, true)?;
                     if let Err(e) = sshd::enable_if_installed() {
                         println!("note: sshd is not set up yet ({e:#}); meshvpn retries when it starts");
                     }
@@ -1494,7 +1497,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 }
                 SshCmd::Deny { who, users } if !control::is_running(&dir) => {
                     require_owner()?;
-                    say(json, &ssh_rules_offline(&dir, &who, users, false)?);
+                    say(json, &ssh_rules_offline(&dir, &who.join(" "), users, false)?);
                     return Ok(0);
                 }
                 SshCmd::Allow { who, users } => {
@@ -1508,11 +1511,17 @@ fn real_main(cli: Cli) -> Result<i32> {
                         Ok(false) => {}
                         Err(e) => println!("note: logins through sshd are not active yet: {e:#}"),
                     }
-                    control::Request::SshAllow { who, users }
+                    control::Request::SshAllow {
+                        who: who.join(" "),
+                        users,
+                    }
                 }
                 SshCmd::Deny { who, users } => {
                     require_owner()?;
-                    control::Request::SshDeny { who, users }
+                    control::Request::SshDeny {
+                        who: who.join(" "),
+                        users,
+                    }
                 }
                 SshCmd::List => control::Request::SshList,
                 SshCmd::DefaultUser { .. } => unreachable!("handled above"),
@@ -1805,7 +1814,7 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
 /// Sets up sshd right away if the config asks for password-less logins. If that isn't possible
 /// yet (e.g. meshvpn not installed to /usr/local/bin), the daemon retries at startup.
 fn enable_ssh_logins(cfg: &Config) {
-    if cfg.ssh_allow_all.is_empty() && cfg.ssh_allow.is_empty() {
+    if cfg.ssh_allow_all.is_empty() && cfg.ssh_allow.is_empty() && cfg.ssh_allow_keys.is_empty() {
         return;
     }
     match sshd::enable_if_installed() {
@@ -2170,6 +2179,18 @@ fn ssh_rules_offline(dir: &Path, who: &str, users: Vec<String>, allow: bool) -> 
             "updated password-less logins for everyone (takes effect when meshvpn starts)".into()
         });
     }
+    if proto::looks_like_ssh_key(who) {
+        if allow && users.is_empty() {
+            bail!("say which account: --as <user>");
+        }
+        let msg = if allow {
+            config::SshAllowKey::allow(&mut cfg.ssh_allow_keys, who, &users)?
+        } else {
+            config::SshAllowKey::deny(&mut cfg.ssh_allow_keys, who, &users)?
+        };
+        cfg.save(dir)?;
+        return Ok(format!("{msg} (takes effect when meshvpn starts)"));
+    }
     let (from_user, node) = match who.split_once('@') {
         Some((u, n)) => (Some(u.to_string()), n.trim().to_lowercase()),
         None => (None, who.trim().to_lowercase()),
@@ -2213,6 +2234,16 @@ fn ssh_rules_offline(dir: &Path, who: &str, users: Vec<String>, allow: bool) -> 
         .filter(|i| i.name == node || (node.len() >= 4 && i.id.hex().starts_with(&node)))
         .collect();
     known.sort_by_key(|i| std::cmp::Reverse(i.seq));
+    known.dedup_by_key(|i| i.id);
+    // A permission must not land on whichever device took that name last.
+    if known.len() > 1 {
+        let ids: Vec<String> = known.iter().map(|i| format!("  {} ({})", i.id.hex(), i.name)).collect();
+        bail!(
+            "{} nodes match {node:?}. Say which one by its id, or by the user's SSH public key:\n{}",
+            known.len(),
+            ids.join("\n")
+        );
+    }
     let Some(info) = known.first() else {
         bail!(
             "meshvpn doesn't know a node named {node:?} yet - it learns the other nodes once it runs. Start it \

@@ -449,6 +449,124 @@ def test_ssh_logins(lab):
 
 
 @test
+def test_ssh_allow_key(lab):
+    """ssh allow with a public key: through sshd and the built-in server, not depending on names; a shared name is refused."""
+    net, (server, laptop, other) = mesh(lab, ["server", "laptop", "other"])
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])  # no sshd: the built-in server
+    box.mv(f"join {invite(server)} --name box")
+    pair = lambda n, u, f: n.sh(f"su {u} -c 'ssh-keygen -q -t ed25519 -N \"\" -C {u}@device -f ~/{f}; cat ~/{f}.pub'").strip()  # noqa: E731
+    server.sh("useradd -m -s /bin/bash bob")
+    laptop.sh("useradd -m -s /bin/bash alice; useradd -m -s /bin/bash eve")
+    # Not ~/.ssh/id_*: published by no node, so only this rule can let them in.
+    alice = pair(laptop, "alice", "secret")
+    pair(laptop, "eve", "secret")
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o IdentitiesOnly=yes -i ~/secret"
+    login = lambda n, user, target: n.sh(f"su {user} -c 'ssh {o} {target} whoami'", ok=False).stdout.strip()  # noqa: E731
+    check(login(laptop, "alice", "bob@server.mesh") != "bob", "no rule yet")
+
+    # The way a .pub file is pasted: unquoted, with its comment.
+    p = server.mv(f"ssh allow {alice} --as bob")
+    check("this key may log in here as bob" in p, p)
+    check("meshvpn:key:alice@device" in server.mv("ssh-authorized-keys bob"), "no authorized_keys line")
+    check("alice@device" in server.mv("ssh list"), "ssh list should show the key")
+    check(login(laptop, "alice", "bob@server.mesh") == "bob", "the key should get in through sshd")
+    check(login(laptop, "eve", "bob@server.mesh") != "bob", "another key must not get in")
+    check(login(laptop, "alice", "root@server.mesh") != "root", "only the account named")
+    check(login(laptop, "alice", f"bob@{server.net_ip(net)}") != "bob", "only over the mesh")
+    # From another device with the same key: the rule is the key, not the device.
+    other.sh("useradd -m -s /bin/bash carol")
+    run(["docker", "cp", f"{laptop.c}:/home/alice/secret", "/tmp/mv-e2e-secret"])
+    try:
+        run(["docker", "cp", "/tmp/mv-e2e-secret", f"{other.c}:/home/carol/secret"])
+    finally:
+        os.remove("/tmp/mv-e2e-secret")
+    other.sh("chown carol /home/carol/secret; chmod 600 /home/carol/secret")
+    check(login(other, "carol", "bob@server.mesh") == "bob", "the key from another node")
+
+    # Nothing but a plain key gets into authorized_keys.
+    p = server.mv(f"ssh allow 'command=\"id\" {alice}' --as bob", ok=False)
+    check(p.returncode != 0, f"a key with options was accepted: {p.stdout}")
+    p = server.mv("ssh allow ssh-ed25519 AAAAbroken --as bob", ok=False)
+    check(p.returncode != 0 and "not one SSH public key" in p.stderr, f"a broken key: {p.stderr}")
+    check("command=" not in server.mv("ssh-authorized-keys bob"), "options reached authorized_keys")
+
+    server.mv(f"ssh deny {alice}")
+    check(login(laptop, "alice", "bob@server.mesh") != "bob", "deny didn't take effect")
+
+    # The built-in server; set before meshvpn ever ran, so the rule comes from the config.
+    check("takes effect" in box.mv(f"ssh allow {alice} --as agent"), "ssh allow before the first start")
+    box.up()
+    wait(lambda: box.status().get("ssh_server") == "built-in", "built-in ssh server active")
+    wait(lambda: laptop.online("box"), "box online at laptop")
+    check(wait(lambda: login(laptop, "alice", "agent@box.mesh") == "agent" or None, "key through the built-in server", 60),
+          "the key should get in through the built-in server")
+    check(login(laptop, "eve", "agent@box.mesh") != "agent", "another key must not get in the built-in server")
+
+    # A second device calling itself laptop: no guessing which one is meant.
+    twin = lab.node("twin", [net])
+    twin.mv(f"join {invite(server)} --name laptop")
+    twin.up()
+    wait(lambda: len([p for p in server.status()["peers"] if p["name"].startswith("laptop")]) == 2, "server sees both", 60)
+    p = server.mv("ssh allow laptop --as bob", ok=False)
+    check(p.returncode != 0 and "nodes match" in p.stderr, f"a shared name should be refused: {p.stdout}{p.stderr}")
+    check("-> bob" not in server.mv("ssh list"), "no rule should be left behind")
+    ident = [p for p in server.status()["peers"] if p["name"].startswith("laptop")][0]["id"]
+    check("may now log in" in server.mv(f"ssh allow {ident} --as bob"), "by id should work")
+
+
+@test
+def test_ssh_authorized_keys(lab):
+    """The built-in server takes keys from the account's authorized_keys, as sshd would, and only what it can honour."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])  # no sshd: the built-in server
+    off = lab.node("off", [net], caps=False, cmd=["sleep", "infinity"])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    box.mv(f"join {invite(hub)} --name box")
+    off.mv(f"join {invite(hub)} --name off")
+    off.sh("sed -i 's/^ssh_authorized_keys = true/ssh_authorized_keys = false/' /etc/meshvpn/config.toml")
+    for n in (box, off):
+        n.up()
+        wait(lambda n=n: n.status().get("ssh_server") == "built-in", f"{n.name}: built-in ssh server active")
+        wait(lambda n=n: hub.online(n.name), f"{n.name} online")
+    # Not id_*: published by no node, so no meshvpn rule can be what lets it in.
+    pub = hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -C other-service -f ~/secret; cat ~/secret.pub'").strip()
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o IdentitiesOnly=yes -i ~/secret"
+    login = lambda n: hub.sh(f"su agent -c 'ssh {o} agent@{n}.mesh whoami'", ok=False).stdout.strip()  # noqa: E731
+    put = lambda n, line: n.sh(  # noqa: E731
+        f"mkdir -p /home/agent/.ssh; cat > /home/agent/.ssh/authorized_keys <<'EOT'\n{line}\nEOT\n"
+        "chown -R agent /home/agent/.ssh; chmod 700 /home/agent/.ssh; chmod 600 /home/agent/.ssh/authorized_keys")
+    check(login("box") != "agent", "no key yet")
+    put(box, pub)
+    check(login("box") == "agent", "a key in authorized_keys should get in")
+    # Options can't be honoured here: refused, not given more than they were meant to have.
+    put(box, f'command="/bin/false" {pub}')
+    check(login("box") != "agent", "a key limited by options must not get a shell")
+    check("only sshd can apply" in box.mv("ssh list") + box.mv("doctor", ok=False).stdout, "should say why")
+    # Writable by others: anyone could add themselves.
+    put(box, pub)
+    box.sh("chmod 666 /home/agent/.ssh/authorized_keys")
+    check(login("box") != "agent", "a file others can write to must not count")
+    box.sh("chmod 600 /home/agent/.ssh/authorized_keys")
+    box.sh("chmod 777 /home/agent/.ssh")
+    check(login("box") != "agent", "a directory others can write to must not count")
+    box.sh("chmod 700 /home/agent/.ssh")
+    check(login("box") == "agent", "back to normal")
+    # Every account by its own file.
+    box.sh("useradd -m -s /bin/bash victim; mkdir -p /home/victim/.ssh; "
+           f"echo '{pub}' > /home/victim/.ssh/authorized_keys; chown -R victim /home/victim/.ssh; "
+           "chmod 700 /home/victim/.ssh; chmod 755 /home/victim")
+    check(hub.sh(f"su agent -c 'ssh {o} victim@box.mesh whoami'", ok=False).stdout.strip() == "victim",
+          "each account uses its own file")
+    box.sh("rm /home/victim/.ssh/authorized_keys")
+    check(hub.sh(f"su agent -c 'ssh {o} victim@box.mesh whoami'", ok=False).stdout.strip() != "victim",
+          "removed from the file: out")
+    put(off, pub)
+    check(login("off") != "agent", "ssh_authorized_keys = false turns it off")
+
+
+@test
 def test_exec_cp(lab):
     """exec on tags with exit codes; cp up and down with intact data."""
     net, (ctl, g1, g2) = mesh(lab, ["ctl", "g1", "g2"], tags="gpu", join_args="--ssh-allow-all agent")

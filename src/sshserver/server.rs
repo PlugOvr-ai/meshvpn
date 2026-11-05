@@ -180,6 +180,98 @@ fn unnamed_account(user: &str, me: libc::uid_t) -> Option<Account> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The account's own authorized_keys
+
+const MAX_AUTHORIZED_KEYS: u64 = 1 << 20;
+
+/// Is `key` in the account's ~/.ssh/authorized_keys? Err says why the file or the line can't count,
+/// under the rules sshd has for it: nobody else may be able to change the file.
+fn own_authorized_keys(acct: &Account, key: &PublicKey) -> std::result::Result<bool, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let ssh_dir = acct.home.join(".ssh");
+    let path = ssh_dir.join("authorized_keys");
+    let safe = |m: &std::fs::Metadata| (m.uid() == acct.uid || m.uid() == 0) && m.mode() & 0o022 == 0;
+    // Non-blocking: as root this opens a path the user chose, which could be a pipe nobody writes to.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let meta = file.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.is_file() || meta.len() > MAX_AUTHORIZED_KEYS {
+        return Err(format!("{} is not a plain file of a sensible size", path.display()));
+    }
+    for (what, m) in [
+        (path.as_path(), Ok(meta)),
+        (ssh_dir.as_path(), std::fs::metadata(&ssh_dir)),
+        (acct.home.as_path(), std::fs::metadata(&acct.home)),
+    ] {
+        match m {
+            Ok(m) if safe(&m) => {}
+            _ => {
+                return Err(format!(
+                    "{} is not used: others can write to {}",
+                    path.display(),
+                    what.display()
+                ));
+            }
+        }
+    }
+    let mut text = String::new();
+    file.take(MAX_AUTHORIZED_KEYS)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match authorized_keys_lookup(&text, key) {
+        Lookup::Listed => Ok(true),
+        Lookup::Absent => Ok(false),
+        Lookup::HasOptions => Err(format!(
+            "this key has options in {}, which only sshd can apply",
+            path.display()
+        )),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Lookup {
+    Listed,
+    Absent,
+    HasOptions,
+}
+
+/// Options (`command=`, `from=`, `restrict`...) limit what a key may do, and this server can't
+/// apply them: such a key doesn't count, rather than getting more than it was given.
+fn authorized_keys_lookup(text: &str, key: &PublicKey) -> Lookup {
+    let same = |t: &str, b: &str| {
+        let k = format!("{t} {b}");
+        crate::proto::valid_ssh_key(&k) && PublicKey::from_openssh(&k).is_ok_and(|p| p.key_data() == key.key_data())
+    };
+    let mut with_options = false;
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if crate::proto::looks_like_ssh_key(line) {
+            if tokens.len() >= 2 && same(tokens[0], tokens[1]) {
+                return Lookup::Listed;
+            }
+        } else if tokens.windows(2).any(|w| same(w[0], w[1])) {
+            with_options = true;
+        }
+    }
+    if with_options {
+        Lookup::HasOptions
+    } else {
+        Lookup::Absent
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Connections
 
 struct PtyReq {
@@ -233,6 +325,16 @@ impl Conn {
         match self.node.ssh_login_check(user, ip, key) {
             Ok(who) => Some(who),
             Err(why) => {
+                if let (Some(node), Some(acct)) = (self.node.ssh_own_keys_from(ip), account_for(user)) {
+                    match own_authorized_keys(&acct, key) {
+                        Ok(true) => return Some(format!("a key in {user}'s authorized_keys via {node}")),
+                        Ok(false) => {}
+                        Err(about_file) => {
+                            self.attempts.lock().unwrap().note(user, format!("{why}; {about_file}"));
+                            return None;
+                        }
+                    }
+                }
                 self.attempts.lock().unwrap().note(user, why);
                 None
             }
@@ -1096,5 +1198,42 @@ impl russh_sftp::server::Handler for Sftp {
         // OpenSSH's sftp-server swaps the arguments compared to the draft; clients expect that.
         std::os::unix::fs::symlink(&linkpath, &targetpath).map_err(io_status)?;
         Ok(ok(id))
+    }
+}
+
+#[cfg(test)]
+mod authorized_keys_tests {
+    use super::*;
+
+    const A: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+    const B: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+
+    #[test]
+    fn plain_lines_count_and_lines_with_options_do_not() {
+        let a = PublicKey::from_openssh(A).unwrap();
+        assert_eq!(
+            authorized_keys_lookup(&format!("# me\n\n{B} b\n{A} a\n"), &a),
+            Lookup::Listed
+        );
+        assert_eq!(authorized_keys_lookup(&format!("{B} b\n"), &a), Lookup::Absent);
+        assert_eq!(authorized_keys_lookup("", &a), Lookup::Absent);
+        assert_eq!(authorized_keys_lookup(&format!("# {A}\n"), &a), Lookup::Absent);
+        for opts in [
+            "command=\"/bin/backup\"",
+            "restrict",
+            "from=\"10.0.0.1\"",
+            "cert-authority",
+        ] {
+            assert_eq!(
+                authorized_keys_lookup(&format!("{opts} {A} a\n"), &a),
+                Lookup::HasOptions,
+                "{opts}"
+            );
+        }
+        // Limited on one line, plain on another: the plain line is what sshd would use too.
+        assert_eq!(
+            authorized_keys_lookup(&format!("restrict {A}\n{A}\n"), &a),
+            Lookup::Listed
+        );
     }
 }

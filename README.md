@@ -250,6 +250,8 @@ Then, on the laptop, alice just runs `ssh carol@server.mesh`. The same works fro
 sudo meshvpn ssh allow alice@laptop --as carol   # one user of a node
 sudo meshvpn ssh allow laptop --as bob           # any user of a node
 sudo meshvpn ssh allow everyone --as ubuntu      # every node, also ones that join later
+sudo meshvpn ssh allow ssh-ed25519 AAAA... --as carol   # whoever holds this key, from any node
+sudo meshvpn ssh allow 3f9a2c81 --as carol       # a node by its id
 sudo meshvpn ssh deny alice@laptop               # take it back
 meshvpn ssh list                                 # show rules and the keys this machine offers
 ```
@@ -268,7 +270,9 @@ How it works: every node publishes the SSH public keys of its users (`~/.ssh/id_
 with `publish_ssh_keys = false`. The first `allow` adds `/etc/ssh/sshd_config.d/meshvpn.conf`, which makes your normal
 OpenSSH server ask meshvpn for additional keys at each login. meshvpn answers only with keys you allowed, each limited
 to `from="<that node's mesh IP>"`, which meshvpn guarantees can't be spoofed. Rules are bound to the node's identity,
-not its name. Your other SSH settings and existing logins stay as they are. Needs OpenSSH with `sshd_config.d` support
+not its name, and if two nodes match a name, `allow` refuses and lists their ids instead of guessing. A key allowed
+directly doesn't have to be published by any node, and also works from nodes that join later, but only from inside the
+network. Your other SSH settings and existing logins stay as they are. Needs OpenSSH with `sshd_config.d` support
 (Debian/Ubuntu/Fedora); a user without a key creates one with `ssh-keygen`.
 
 ### Machines without an SSH server (built-in SSH server)
@@ -284,6 +288,11 @@ shows `ssh server: built-in` when it is active.
 * **When:** `ssh_server = "auto"` (default) uses it where no sshd serves port 22: in userspace mode when nothing
   listens on port 22, in kernel mode when no sshd is installed (so an sshd starting later never finds its port taken).
   `"always"` / `"never"` in the config force it on or off.
+* **Keys already on the machine:** it also accepts the keys in the account's `~/.ssh/authorized_keys`, for example ones
+  an image or another SSH service put there, as sshd would. They work from mesh nodes only. Lines with options
+  (`command=`, `restrict`...) don't count, because only sshd can apply those, and neither does a file others can write to;
+  `meshvpn ssh list` and `doctor` show why a login was refused. Off with `ssh_authorized_keys = false`; always off with the
+  enterprise edition, whose rules decide who logs in.
 * **No host key prompts:** every node publishes the host key of whatever answers SSH there (the built-in server's key is
   derived from the node identity; for sshd its ed25519 host key), and meshvpn keeps them in
   `/var/lib/meshvpn/known_hosts`, which ssh reads through `/etc/ssh/ssh_config.d/meshvpn.conf`. `ssh` to a mesh node
