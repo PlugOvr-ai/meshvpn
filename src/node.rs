@@ -82,10 +82,15 @@ pub(crate) fn fmt_time(ms: u64) -> String {
 /// Other interfaces holding addresses in our overlay range. Their routes and firewall rules
 /// win over ours: e.g. Tailscale drops every packet from 100.64.0.0/10 not arriving on
 /// tailscale0, which silently breaks all incoming mesh traffic.
-pub fn range_conflicts(own_iface: &str) -> Vec<String> {
+pub fn range_conflicts(dir: &std::path::Path, own_iface: &str) -> Vec<String> {
     let mut out = vec![];
+    // This machine's other networks: set up to share the range (see networks.rs).
+    let ours: Vec<String> = crate::networks::all(&crate::networks::base(dir))
+        .iter()
+        .filter_map(|(_, d)| Config::load(d).ok().map(|c| c.interface))
+        .collect();
     for (name, ip, _) in crate::sys::ipv4_interfaces() {
-        if name == own_iface || !is_overlay(IpAddr::V4(ip)) {
+        if name == own_iface || ours.contains(&name) || !is_overlay(IpAddr::V4(ip)) {
             continue;
         }
         let hint = if name.starts_with("tailscale") {
@@ -148,6 +153,10 @@ struct State {
     my_endpoints: Vec<String>,
     hosts_written: String,
     known_hosts_written: String,
+    /// A further network of this machine: the addresses routed through its interface.
+    kernel_routes: HashSet<Ipv4Addr>,
+    /// Addresses of this network that are another node's in the machine's first network.
+    address_clashes: Vec<String>,
     /// Host key of whatever answers SSH here (published in our record).
     my_ssh_host_key: Option<String>,
     update_available: Option<String>,
@@ -413,7 +422,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     if cfg.userspace == Userspace::Always {
         userspace_reason = Some("userspace = \"always\" in the config".to_string());
     } else {
-        match create_tun(&mut cfg, my_ip) {
+        match create_tun(&mut cfg, my_ip, crate::networks::is_extra(&dir)) {
             Ok(t) => tun_dev = Some(t),
             Err(msg) if cfg.userspace == Userspace::Auto && tun_unavailable(&msg) => userspace_reason = Some(msg),
             Err(msg) => return Err(tun_error(&cfg, &msg)),
@@ -521,7 +530,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
             Err(e) => warn!("password-less SSH logins are configured but not active: {e:#}"),
         }
     }
-    for w in range_conflicts(&node.cfg.interface) {
+    for w in range_conflicts(&node.dir, &node.cfg.interface) {
         warn!("{w}");
     }
     if let Some(listen) = node.cfg.listen.clone() {
@@ -568,12 +577,12 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
             if crate::config::rootless() {
                 user_ssh_config(&node.dir, true);
             } else {
-                ssh_client_config(true);
+                ssh_client_config(&node.dir, true);
             }
         }
         _ => {
             tokio::spawn(node.clone().tun_loop());
-            ssh_client_config(false);
+            ssh_client_config(&node.dir, false);
         }
     }
     if node.cfg.ssh_server != crate::config::SshServer::Never && matches!(node.io, PacketIo::Tun(_)) {
@@ -622,7 +631,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     node.exit_stop();
     node.save_state();
     if node.cfg.manage_hosts
-        && let Err(e) = crate::hosts::write(None)
+        && let Err(e) = crate::hosts::write(crate::networks::name(&dir).as_deref(), None)
     {
         warn!("cleaning /etc/hosts: {e}");
     }
@@ -890,8 +899,9 @@ impl Node {
         if st.my_ssh_host_key != key {
             if builtin && st.my_ssh_host_key.is_none() {
                 info!(
-                    "built-in SSH server active: ssh <user>@{}.mesh (logins as set with meshvpn ssh allow)",
-                    st.my_name
+                    "built-in SSH server active: ssh <user>@{}.{} (logins as set with meshvpn ssh allow)",
+                    st.my_name,
+                    crate::networks::suffix(&self.dir)
                 );
             }
             st.my_ssh_host_key = key;
@@ -1745,6 +1755,7 @@ impl Node {
         }
         st.ip_conflicts = conflicts;
         st.ip_map = ip_map;
+        self.sync_routes(st);
         st.id_prefix = st
             .records
             .keys()
@@ -1928,10 +1939,36 @@ impl Node {
         self.my_ip
     }
 
+    /// Userspace mode: where a connection from the mesh to `port` here goes. The share server of
+    /// a further network has its own address, as the first network's has 127.0.0.1.
+    pub fn local_service(&self, port: u16) -> std::net::SocketAddr {
+        let ip = match crate::networks::share_loopback(&self.dir) {
+            Some(ip) if port == crate::share::PORT => ip,
+            _ => Ipv4Addr::LOCALHOST,
+        };
+        std::net::SocketAddr::from((ip, port))
+    }
+
+    /// Where this network's share server listens: everywhere for the first network (other nodes
+    /// fetch from its LAN addresses too), on its own address for a further one.
+    pub fn share_listen(&self) -> std::net::SocketAddr {
+        let ip = match (crate::networks::is_extra(&self.dir), self.kernel_interface()) {
+            (false, _) => Ipv4Addr::UNSPECIFIED,
+            (true, true) => self.my_ip,
+            (true, false) => crate::networks::share_loopback(&self.dir).unwrap_or(Ipv4Addr::LOCALHOST),
+        };
+        std::net::SocketAddr::from((ip, crate::share::PORT))
+    }
+
+    /// A kernel network interface (not the userspace stack).
+    pub fn kernel_interface(&self) -> bool {
+        matches!(self.io, PacketIo::Tun(_))
+    }
+
     /// Mesh address of `host` (`name`, `name.mesh` or a mesh IP); None if it isn't in the mesh.
     pub fn resolve(&self, host: &str) -> Option<Ipv4Addr> {
         let h = host.trim_end_matches('.').to_lowercase();
-        let h = h.strip_suffix(".mesh").unwrap_or(&h);
+        let h = crate::networks::strip_suffix(&self.dir, &h);
         if let Ok(ip) = h.parse::<Ipv4Addr>() {
             return is_overlay(IpAddr::V4(ip)).then_some(ip);
         }
@@ -2520,12 +2557,13 @@ impl Node {
                 continue;
             };
             // Plain names only where /etc/hosts maps them to the mesh (else they may be LAN hosts).
-            let plain = if self.cfg.manage_hosts {
-                format!(",{name}")
-            } else {
-                String::new()
+            let suffix = crate::networks::suffix(&self.dir);
+            let plain = match (self.cfg.manage_hosts, suffix.strip_suffix(".mesh")) {
+                (false, _) => String::new(),
+                (true, Some(net)) => format!(",{name}.{net}"),
+                (true, None) => format!(",{name}"),
             };
-            text.push_str(&format!("{name}.mesh,{ip}{plain} {key}\n"));
+            text.push_str(&format!("{name}.{suffix},{ip}{plain} {key}\n"));
         }
         if text == st.known_hosts_written {
             return;
@@ -2547,6 +2585,81 @@ impl Node {
                 st.known_hosts_written = text;
             }
         }
+    }
+
+    /// A further network of this machine: one route per node of it, through its interface (the
+    /// whole range belongs to the machine's first network). Linux only, as are further networks.
+    fn sync_routes(&self, st: &mut State) {
+        let PacketIo::Tun(_) = &self.io else { return };
+        if !crate::networks::is_extra(&self.dir) {
+            return;
+        }
+        let want: HashSet<Ipv4Addr> = st.ip_map.keys().copied().filter(|ip| *ip != self.my_ip).collect();
+        if want == st.kernel_routes {
+            return;
+        }
+        let iface = &self.cfg.interface;
+        let src = self.my_ip.to_string();
+        let ip = |args: &[&str]| {
+            let out = std::process::Command::new("ip").args(args).output();
+            match out {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    warn!("ip {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "ip {}: {e} (a further network needs the ip command, iproute2)",
+                        args.join(" ")
+                    );
+                    false
+                }
+            }
+        };
+        for gone in st.kernel_routes.difference(&want) {
+            ip(&["route", "del", &format!("{gone}/32"), "dev", iface]);
+        }
+        // The same address in this machine's first network: this route takes it over here.
+        let first = crate::networks::base(&self.dir);
+        let theirs: HashMap<Ipv4Addr, String> = Config::load(&first)
+            .map(|c| {
+                let net = c.network_id();
+                crate::config::SavedState::load(&first)
+                    .peers
+                    .iter()
+                    .filter_map(|p| p.verify(&net).ok())
+                    .map(|i| (overlay_ip(&i.id), i.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut clashes = vec![];
+        for ip in &want {
+            if let Some(other) = theirs.get(ip) {
+                let ours = st
+                    .ip_map
+                    .get(ip)
+                    .and_then(|id| st.records.get(id))
+                    .map_or("?", |r| r.info.name.as_str());
+                let text = format!(
+                    "address clash: {ip} is {ours} in this network and {other} in this machine's first network - \
+                     here it reaches {ours}, so {other} can't be reached from this machine"
+                );
+                if !st.kernel_routes.contains(ip) {
+                    warn!("{text}");
+                }
+                clashes.push(text);
+            }
+        }
+        st.address_clashes = clashes;
+        let mut done = HashSet::new();
+        for new in want.iter().filter(|w| !st.kernel_routes.contains(*w)) {
+            if ip(&["route", "replace", &format!("{new}/32"), "dev", iface, "src", &src]) {
+                done.insert(*new);
+            }
+        }
+        // What failed is tried again next time.
+        st.kernel_routes = st.kernel_routes.intersection(&want).copied().chain(done).collect();
     }
 
     fn update_hosts(&self) {
@@ -2573,11 +2686,12 @@ impl Node {
             .collect();
         entries.extend(others);
         let taken: HashSet<String> = entries.iter().map(|e| e.0.clone()).collect();
-        let block = crate::hosts::render(&entries) + &crate::hosts::render_aliases(&aliases, &taken);
+        let suffix = crate::networks::suffix(&self.dir);
+        let block = crate::hosts::render(&entries, &suffix) + &crate::hosts::render_aliases(&aliases, &taken, &suffix);
         if block == st.hosts_written {
             return;
         }
-        match crate::hosts::write(Some(&block)) {
+        match crate::hosts::write(crate::networks::name(&self.dir).as_deref(), Some(&block)) {
             Ok(()) => st.hosts_written = block,
             Err(e) => warn!("updating /etc/hosts: {e} (set manage_hosts = false to disable)"),
         }
@@ -2652,7 +2766,7 @@ impl Node {
                 self.socks.clone()
             },
             warnings: {
-                let mut w = range_conflicts(&self.cfg.interface);
+                let mut w = range_conflicts(&self.dir, &self.cfg.interface);
                 for (ip, owners) in &st.ip_conflicts {
                     let names: Vec<String> = owners
                         .iter()
@@ -2681,6 +2795,7 @@ impl Node {
                     ));
                 }
                 w.extend(self.exit_status(&st).1);
+                w.extend(st.address_clashes.iter().cloned());
                 w
             },
             exit_offer: st.exit_offer,
@@ -3263,7 +3378,10 @@ impl Node {
         drop(st);
         self.update_hosts();
         info!("renamed this node: {old} -> {name}");
-        let mut msg = format!("renamed {old} -> {name}; the other nodes see it as {name}.mesh within seconds");
+        let mut msg = format!(
+            "renamed {old} -> {name}; the other nodes see it as {name}.{} within seconds",
+            crate::networks::suffix(&self.dir)
+        );
         if name != new.trim() {
             msg.push_str(&format!(
                 " (names may only contain a-z, 0-9 and -, so {new:?} became {name:?})"
@@ -3314,9 +3432,12 @@ pub fn check_name_free<'a>(name: &str, mut others: impl Iterator<Item = &'a Stri
 }
 
 /// The TUN device; `cfg.interface` becomes its real name (macOS picks `utunN` itself).
-fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr) -> std::result::Result<tun::AsyncDevice, String> {
+fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr, extra: bool) -> std::result::Result<tun::AsyncDevice, String> {
     let mut tcfg = tun::Configuration::default();
-    tcfg.address(my_ip).netmask(OVERLAY_NETMASK).mtu(cfg.mtu).up();
+    // A further network of this machine routes only its own nodes (see networks.rs): the
+    // machine's first network has the whole range.
+    let netmask = if extra { Ipv4Addr::BROADCAST } else { OVERLAY_NETMASK };
+    tcfg.address(my_ip).netmask(netmask).mtu(cfg.mtu).up();
     #[cfg(any(target_os = "linux", windows))]
     tcfg.tun_name(&cfg.interface);
     // Wintun's driver comes as wintun.dll next to meshvpn.exe.
@@ -3400,6 +3521,8 @@ const SSH_CLIENT_DROPIN: &str = "/etc/ssh/ssh_config.d/meshvpn.conf";
 fn known_hosts_path(dir: &std::path::Path) -> PathBuf {
     if crate::config::rootless() || cfg!(windows) {
         dir.join("known_hosts")
+    } else if let Some(n) = crate::networks::name(dir) {
+        PathBuf::from(format!("/var/lib/meshvpn/networks/{n}/known_hosts"))
     } else {
         PathBuf::from("/var/lib/meshvpn/known_hosts")
     }
@@ -3407,11 +3530,55 @@ fn known_hosts_path(dir: &std::path::Path) -> PathBuf {
 
 /// An ssh client drop-in: mesh host keys are known (no "are you sure" prompts), and in
 /// userspace mode `ssh user@host.mesh` goes through meshvpn.
-fn ssh_client_config(userspace: bool) {
+fn ssh_client_config(dir: &std::path::Path, userspace: bool) {
     #[cfg(windows)]
     windows_ssh_config(true, userspace);
     #[cfg(unix)]
-    unix_ssh_client_config(userspace);
+    match crate::networks::name(dir) {
+        Some(n) => unix_ssh_client_config_extra(dir, &n, userspace),
+        None => unix_ssh_client_config(userspace),
+    }
+}
+
+/// The ssh client drop-in of a further network: its own known hosts, and its own way in. Read
+/// before the first network's (`meshvpn-<name>.conf` sorts before `meshvpn.conf`), whose `*.mesh`
+/// would otherwise match these names too.
+#[cfg(unix)]
+fn unix_ssh_client_config_extra(dir: &std::path::Path, name: &str, userspace: bool) {
+    if !std::path::Path::new("/etc/ssh/ssh_config.d").is_dir() {
+        return;
+    }
+    let known = known_hosts_path(dir);
+    let proxy = if userspace {
+        let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/meshvpn"));
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        format!(
+            "{} --dir {} nc %h %p",
+            crate::agent::sh_quote(&exe.to_string_lossy()),
+            crate::agent::sh_quote(&dir.to_string_lossy())
+        )
+    } else {
+        "none".into()
+    };
+    let text = format!(
+        "# Managed by meshvpn: the nodes of network {name}.
+Host *.{name}.mesh *.{name}
+             GlobalKnownHostsFile {}
+    ProxyCommand {proxy}
+",
+        known.display()
+    );
+    let path = ssh_client_dropin_extra(name);
+    if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, text) {
+        debug!("writing {path}: {e}");
+    }
+}
+
+pub fn ssh_client_dropin_extra(name: &str) -> String {
+    format!("/etc/ssh/ssh_config.d/meshvpn-{name}.conf")
 }
 
 #[cfg(unix)]
@@ -3464,7 +3631,23 @@ fn windows_ssh_config(enable: bool, userspace: bool) {
 
 /// `old` with the block from `begin` to `end` replaced by `block` (appended if missing).
 fn replace_block(old: &str, begin: &str, end: &str, block: &str) -> String {
-    match (old.find(begin), old.find(end)) {
+    // Whole lines, the end after the begin: one block's marker may start another's.
+    let line_at = |from: usize, marker: &str| {
+        let mut at = from;
+        while let Some(i) = old[at..].find(marker) {
+            let i = at + i;
+            let starts = i == 0 || old.as_bytes()[i - 1] == b'\n';
+            let ends = old[i + marker.len()..].is_empty() || old[i + marker.len()..].starts_with('\n');
+            if starts && ends {
+                return Some(i);
+            }
+            at = i + marker.len();
+        }
+        None
+    };
+    let b = line_at(0, begin);
+    let e = b.and_then(|b| line_at(b, end));
+    match (b, e) {
         (Some(b), Some(e)) if e > b => {
             let stop = old[e..].find('\n').map_or(old.len(), |n| e + n + 1);
             format!("{}{block}{}", &old[..b], &old[stop..])
@@ -3486,8 +3669,21 @@ pub fn remove_ssh_client_config() {
 /// Rootless: the same for this user, as a marked block in ~/.ssh/config (system files are off
 /// limits). Kept up to date when the binary or directory moves.
 pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
-    const BEGIN: &str = "# >>> meshvpn (rootless userspace mode): ssh to *.mesh goes through meshvpn";
-    const END: &str = "# <<< meshvpn";
+    // A further network has its own block, before the first network's (whose *.mesh would
+    // match its names too: ssh takes the first value it finds).
+    let net = crate::networks::name(dir);
+    let (begin, end, hosts) = match &net {
+        Some(n) => (
+            format!("# >>> meshvpn network {n} (rootless userspace mode): ssh to *.{n}.mesh goes through meshvpn"),
+            format!("# <<< meshvpn network {n}"),
+            format!("*.{n}.mesh *.{n}"),
+        ),
+        None => (
+            "# >>> meshvpn (rootless userspace mode): ssh to *.mesh goes through meshvpn".to_string(),
+            "# <<< meshvpn".to_string(),
+            "*.mesh".to_string(),
+        ),
+    };
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
         return;
     };
@@ -3496,13 +3692,17 @@ pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
     let exe = crate::update::current_exe().unwrap_or_else(|_| PathBuf::from("meshvpn"));
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
     let block = format!(
-        "{BEGIN}\nHost *.mesh\n    ProxyCommand {} --dir {} nc %h %p\n    UserKnownHostsFile ~/.ssh/known_hosts {}\n{END}\n",
+        "{begin}\nHost {hosts}\n    ProxyCommand {} --dir {} nc %h %p\n    UserKnownHostsFile ~/.ssh/known_hosts {}\n{end}\n",
         crate::agent::sh_quote(&exe.to_string_lossy()),
         crate::agent::sh_quote(&dir.to_string_lossy()),
         crate::agent::sh_quote(&known_hosts_path(&dir).to_string_lossy())
     );
     let old = std::fs::read_to_string(&file).unwrap_or_default();
-    let new = replace_block(&old, BEGIN, END, if enable { &block } else { "" });
+    let new = if net.is_some() && enable && !old.contains(&begin) {
+        format!("{block}{old}")
+    } else {
+        replace_block(&old, &begin, &end, if enable { &block } else { "" })
+    };
     if new == old {
         return;
     }
@@ -3611,6 +3811,21 @@ fn primary_ip() -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocks_of_several_networks() {
+        let lab = "# >>> lab\nHost *.lab.mesh\n# <<< meshvpn network lab\n";
+        let first = "# >>> first\nHost *.mesh\n# <<< meshvpn\n";
+        let old = format!("{lab}{first}");
+        let new = replace_block(
+            &old,
+            "# >>> first",
+            "# <<< meshvpn",
+            "# >>> first\nnew\n# <<< meshvpn\n",
+        );
+        assert_eq!(new, format!("{lab}# >>> first\nnew\n# <<< meshvpn\n"));
+        assert_eq!(replace_block(&old, "# >>> first", "# <<< meshvpn", ""), lab);
+    }
 
     #[test]
     fn contested_addresses_belong_to_nobody() {

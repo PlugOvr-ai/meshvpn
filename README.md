@@ -170,6 +170,35 @@ sudo meshvpn exit off            # back to direct
 * While the exit node is offline there is no internet (status shows a warning), so nothing leaks
   out directly. The setting survives restarts.
 
+## Several networks on one machine
+
+A notebook can be in two independent networks at once, e.g. your lab's and a customer's. Join the
+second one as you joined the first:
+
+```sh
+sudo meshvpn join mesh1-...       # an invite of another network: set up next to the first one
+meshvpn networks                  # the networks of this machine, their addresses and state
+meshvpn exec gpu1 -- nvidia-smi   # commands find each node's network by its name
+sudo meshvpn --net lab invite     # anything else for a further network takes --net
+sudo meshvpn networks leave lab   # leave it again; the first network doesn't notice
+```
+
+* The networks know nothing of each other: nothing is routed or relayed between them, and a node
+  of one can't reach the other through this machine.
+* Each one has its own interface (`mesh1`, ...), port (7872, ...), service (`meshvpn-lab`) and
+  names: the nodes of a further network are `<node>.lab.mesh` (and `<node>.lab`), the first
+  network's stay `<node>.mesh`. Its name comes from the invite; `--net <name>` on `join` sets it.
+* `meshvpn install` and `uninstall` take care of all networks of the machine, or the one of `--net`.
+  `ssh user@<node>.lab.mesh` works as usual, and so do `meshvpn ssh allow` and the built-in SSH
+  server: each network's logins come only from its own nodes.
+* Addresses are from the same range in every network. The first network routes the range as a whole;
+  a further network adds a route per node of its own, so the other nodes of both need nothing new.
+  Addresses are 22 bits of a hash, so the same address can turn up in both networks: about once in
+  400 for two networks of 100 nodes each, and likely for two of a thousand. Then the further
+  network's node wins on this machine, and its log and `meshvpn doctor` name both nodes.
+* Linux only for now, and exit nodes only in the first network. Without root, the networks are
+  the user's own, in userspace mode, each with its own SOCKS port (1055, 1056, ...).
+
 ## Devices without internet access
 
 If a device can't reach the internet at all, but you can SSH into it from a jump host (e.g. through its existing reverse
@@ -440,6 +469,7 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
 | `sudo meshvpn rename <name>` | Give this node a new name. It becomes `<name>.mesh` on every node within seconds; its IP, SSH permissions and links stay. Names already taken are refused |
 | `sudo meshvpn exit offer` / `exit use <node>` / `exit off` | Internet through another node (exit nodes) |
+| `meshvpn networks` / `sudo meshvpn networks leave <name>` | The networks this machine is in ([several networks](#several-networks-on-one-machine)); `--net <name>` picks one for any command |
 | `sudo meshvpn connect host[:port]` | Connect the network to a node it can reach but that can't reach it (alias: `add-peer`) |
 
 ### Admins and invites
@@ -479,10 +509,11 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 | Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers) or the SSH tunnel's public port. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
 | Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key bound to the network id). Relays can't read or forge traffic, and the inner source IP must match the sender. |
-| Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable). |
+| Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable); `<name>.<network>.mesh` for a further network of the machine. |
 
 Files: `/etc/meshvpn/config.toml` (settings and secret keys, mode 0600), `state.json` (known nodes) and `/run/meshvpn.sock`
-(control socket: anyone may ask for the status, but changes need root). Use `--dir` or `MESHVPN_DIR` to put them elsewhere, e.g. to run several nodes on one machine.
+(control socket: anyone may ask for the status, but changes need root). Use `--dir` or `MESHVPN_DIR` to put them elsewhere, e.g. to run several nodes on one machine. A further network of the
+machine lives in `/etc/meshvpn/networks/<name>/`.
 Set `RUST_LOG=meshvpn=debug` for verbose logs.
 
 ## Security model and limitations

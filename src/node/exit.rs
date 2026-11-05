@@ -308,6 +308,7 @@ impl Node {
 
     /// `meshvpn exit offer` / `meshvpn exit offer --stop`.
     pub fn set_exit_offer(&self, on: bool) -> Result<String> {
+        self.exit_only_in_first()?;
         if on && self.state.lock().unwrap().exit_via.is_some() {
             bail!("this node uses an exit node itself - `meshvpn exit off` first");
         }
@@ -330,7 +331,19 @@ impl Node {
     }
 
     /// `meshvpn exit use <node>` / `meshvpn exit off`.
+    /// Exit nodes change how this machine reaches the internet and the whole mesh range: that's
+    /// for one network to do, the machine's first.
+    fn exit_only_in_first(&self) -> Result<()> {
+        if crate::networks::is_extra(&self.dir) {
+            bail!("exit nodes work in this machine's first network only, not in a further one like this");
+        }
+        Ok(())
+    }
+
     pub fn set_exit_via(&self, node: Option<String>) -> Result<String> {
+        if node.is_some() {
+            self.exit_only_in_first()?;
+        }
         let target = match &node {
             None => None,
             Some(n) => {

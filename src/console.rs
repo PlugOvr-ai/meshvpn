@@ -655,7 +655,12 @@ impl App {
                 };
                 let mut l = vec![Line::from(vec![
                     Span::styled(n.name.clone(), Style::new().bold()),
-                    Span::raw(format!("  {}.mesh  {}{login}", n.name, n.ip)),
+                    Span::raw(format!(
+                        "  {}.{}  {}{login}",
+                        n.name,
+                        crate::networks::current_suffix(),
+                        n.ip
+                    )),
                 ])];
                 if let Some(i) = &n.inventory {
                     l.push(Line::raw(format!(

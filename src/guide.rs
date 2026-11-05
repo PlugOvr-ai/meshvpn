@@ -24,6 +24,9 @@ their GPUs and start distributed jobs - from the node you are on, over SSH login
 - Clean up what you start: release GPU reservations (`gpu release`), stop jobs you no longer need
   (`jobs stop`). Other people share these machines.
 - Commands that need root say so (exit 4). Don't retry them with sudo unless the human allows it.
+- A machine can be in several independent networks (`meshvpn --json networks`). Commands find a
+  node's network by its name; for the rest, `--net <network>` right after `meshvpn` picks one. A
+  further network's nodes are `<name>.<network>.mesh`.
 
 ## Find machines
 
@@ -120,10 +123,11 @@ pub fn context(dir: &Path) -> String {
         .sum();
     let free: usize = nodes.iter().filter(|n| n.online).map(|n| n.free_gpus()).sum();
     let mut out = format!(
-        "## Right now\n\n- You are on node **{}** ({}.mesh, {}), meshvpn {}, network \"{}\", as user `{}`.\n\
+        "## Right now\n\n- You are on node **{}** ({}.{}, {}), meshvpn {}, network \"{}\", as user `{}`.\n\
          - {} other node(s), {} online.\n",
         st.name,
         st.name,
+        crate::networks::current_suffix(),
         st.ip,
         st.version,
         st.network,
@@ -131,6 +135,18 @@ pub fn context(dir: &Path) -> String {
         nodes.len() - 1,
         online
     );
+    let others: Vec<String> = crate::networks::all(&crate::networks::base(dir))
+        .iter()
+        .filter(|(_, d)| crate::networks::name(d) != crate::networks::name(dir))
+        .map(|(_, d)| format!("`{}`", crate::networks::display_name(d)))
+        .collect();
+    if !others.is_empty() {
+        out.push_str(&format!(
+            "- This machine is also in network(s) {}: this is about \"{}\" alone.\n",
+            others.join(", "),
+            crate::networks::display_name(dir)
+        ));
+    }
     if !tags.is_empty() {
         let t: Vec<String> = tags.iter().map(|(t, n)| format!("`tag:{t}` ({n})")).collect();
         out.push_str(&format!("- Tags: {}.\n", t.join(", ")));

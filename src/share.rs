@@ -292,8 +292,19 @@ enum Req {
     Chunk { id: String, file: usize, index: usize },
 }
 
+fn listen(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let s = tokio::net::TcpSocket::new_v4()?;
+    s.set_reuseaddr(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    s.set_reuseport(true)?;
+    s.bind(addr)?;
+    s.listen(128)
+}
+
 pub async fn serve(node: Arc<Node>) {
-    let listener = match TcpListener::bind(("0.0.0.0", PORT)).await {
+    // Every network of this machine has a server on this port: the first one's on all addresses,
+    // a further one's on its own (the more specific address gets its connections).
+    let listener = match listen(node.share_listen()) {
         Ok(l) => l,
         Err(e) => {
             warn!("sharing: cannot listen on port {PORT}: {e}");

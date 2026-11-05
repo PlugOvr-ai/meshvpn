@@ -13,7 +13,15 @@ const HOSTS: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const BEGIN: &str = "# BEGIN meshvpn (managed automatically, do not edit)";
 const END: &str = "# END meshvpn";
 
-pub fn render(entries: &[(String, Ipv4Addr, NodeId)]) -> String {
+/// `suffix`: `mesh`, or `<network>.mesh` for a further network of this machine.
+fn names(name: &str, suffix: &str) -> String {
+    match suffix.strip_suffix(".mesh") {
+        Some(net) => format!("{name}.{suffix} {name}.{net}"),
+        None => format!("{name}.{suffix} {name}"),
+    }
+}
+
+pub fn render(entries: &[(String, Ipv4Addr, NodeId)], suffix: &str) -> String {
     let mut used = HashSet::new();
     let mut out = String::new();
     for (name, ip, id) in entries {
@@ -23,31 +31,40 @@ pub fn render(entries: &[(String, Ipv4Addr, NodeId)]) -> String {
         } else {
             format!("{name}-{}", id.short())
         };
-        out.push_str(&format!("{ip}\t{name}.mesh {name}\n"));
+        out.push_str(&format!("{ip}\t{}\n", names(&name, suffix)));
     }
     out
 }
 
 /// An extension's extra names; names of nodes (`taken`) win.
-pub fn render_aliases(aliases: &[(String, Ipv4Addr)], taken: &HashSet<String>) -> String {
+pub fn render_aliases(aliases: &[(String, Ipv4Addr)], taken: &HashSet<String>, suffix: &str) -> String {
     let mut used = taken.clone();
     let mut out = String::new();
     for (name, ip) in aliases {
         if used.insert(name.clone()) {
-            out.push_str(&format!("{ip}\t{name}.mesh {name}\n"));
+            out.push_str(&format!("{ip}\t{}\n", names(name, suffix)));
         }
     }
     out
 }
 
-pub fn write(block: Option<&str>) -> Result<()> {
+/// `network`: None for the machine's first network, else the further network's name; each has
+/// its own block.
+pub fn write(network: Option<&str>, block: Option<&str>) -> Result<()> {
+    let (begin, end) = match network {
+        Some(n) => (
+            format!("# BEGIN meshvpn network {n} (managed automatically, do not edit)"),
+            format!("# END meshvpn network {n}"),
+        ),
+        None => (BEGIN.to_string(), END.to_string()),
+    };
     let current = std::fs::read_to_string(HOSTS).unwrap_or_default();
     let mut kept = String::new();
     let mut inside = false;
     for line in current.lines() {
-        if line == BEGIN {
+        if line == begin {
             inside = true;
-        } else if line == END {
+        } else if line == end {
             inside = false;
         } else if !inside {
             kept.push_str(line);
@@ -55,7 +72,7 @@ pub fn write(block: Option<&str>) -> Result<()> {
         }
     }
     if let Some(b) = block {
-        kept.push_str(&format!("{BEGIN}\n{b}{END}\n"));
+        kept.push_str(&format!("{begin}\n{b}{end}\n"));
     }
     if kept != current {
         // Written in place: /etc/hosts is often a bind mount (containers).
@@ -92,7 +109,17 @@ mod tests {
                 ("train42".into(), ip(4)),
             ],
             &taken,
+            "mesh",
         );
         assert_eq!(out, "100.64.0.2\ttrain42.mesh train42\n");
+    }
+
+    #[test]
+    fn further_networks_have_their_own_names() {
+        let id = crate::keys::Key32([7; 32]);
+        let out = render(&[("gpu1".into(), Ipv4Addr::new(100, 64, 0, 9), id)], "lab.mesh");
+        assert_eq!(out, "100.64.0.9\tgpu1.lab.mesh gpu1.lab\n");
+        let out = render(&[("gpu1".into(), Ipv4Addr::new(100, 64, 0, 9), id)], "mesh");
+        assert_eq!(out, "100.64.0.9\tgpu1.mesh gpu1\n");
     }
 }

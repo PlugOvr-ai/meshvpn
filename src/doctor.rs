@@ -124,6 +124,21 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
 
     // Before anything that ends the checks early: it has nothing to do with the network.
     c.extend(packed_browser());
+    let all = crate::networks::all(&crate::networks::base(dir));
+    if all.len() > 1 {
+        let names: Vec<String> = all.iter().map(|(_, d)| crate::networks::display_name(d)).collect();
+        c.push(check(
+            "networks",
+            Level::Info,
+            format!(
+                "this machine is in {} networks: {}; these checks are for {}",
+                all.len(),
+                names.join(", "),
+                crate::networks::display_name(dir)
+            ),
+            Some("the others: meshvpn --net <network> doctor"),
+        ));
+    }
 
     // --- configuration
     let cfg = match Config::load(dir) {
@@ -155,7 +170,8 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     let st = status(dir);
     let procs = daemons();
     let user: &[&str] = if crate::config::rootless() { &["--user"] } else { &[] };
-    let service = run("systemctl", &[user, &["is-active", "meshvpn"]].concat()).map(|s| s.trim().to_string());
+    let svc = crate::networks::service(dir);
+    let service = run("systemctl", &[user, &["is-active", svc.as_str()]].concat()).map(|s| s.trim().to_string());
     match &st {
         Some(st) => c.push(check(
             "daemon",
@@ -166,7 +182,7 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
         None => {
             let journal = run(
                 "journalctl",
-                &[user, &["-u", "meshvpn", "-n", "30", "--no-pager"]].concat(),
+                &[user, &["-u", svc.as_str(), "-n", "30", "--no-pager"]].concat(),
             )
             .unwrap_or_default();
             let last_error = journal
@@ -188,17 +204,25 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
                             format!("; running: {}", blockers.join(", "))
                         }
                     ),
-                    Some("stop other copies and restart: sudo pkill -f 'meshvpn.* up'; sudo systemctl restart meshvpn"),
+                    Some(&format!(
+                        "stop other copies of this network's meshvpn and restart: sudo systemctl restart {svc}"
+                    )),
                 ));
             } else {
                 c.push(check(
                     "daemon",
                     Level::Fail,
                     "meshvpn is not running",
-                    Some(if crate::cli::systemd_running() {
-                        "start it: sudo systemctl start meshvpn (or sudo meshvpn install / sudo meshvpn up)"
+                    Some(&if crate::cli::systemd_running() {
+                        format!(
+                            "start it: sudo systemctl start {svc} (or sudo meshvpn{net} install / sudo meshvpn{net} up)",
+                            net = crate::networks::flag(dir)
+                        )
                     } else {
-                        "start it: sudo meshvpn install (no systemd here: runs it in the background) or sudo meshvpn up"
+                        format!(
+                            "start it: sudo meshvpn{net} install (no systemd here: runs it in the background) or sudo meshvpn{net} up",
+                            net = crate::networks::flag(dir)
+                        )
                     }),
                 ));
             }

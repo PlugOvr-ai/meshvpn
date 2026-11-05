@@ -224,6 +224,104 @@ def test_basics(lab):
 
 
 @test
+def test_two_networks(lab):
+    """A laptop in two independent networks: joining the second sets it up next to the first, both
+    work at once, commands find each node's network by its name, and leaving one keeps the other."""
+    net_a, net_b = lab.network("a"), lab.network("b")
+    hub_a = lab.node("huba", [net_a])
+    hub_b = lab.node("hubb", [net_b])
+    laptop = lab.node("laptop", [net_a, net_b])
+    hub_a.mv(f"init --name huba --endpoint {hub_a.c}:7870")
+    hub_a.up()
+    hub_b.mv(f"init --name hubb --network lab --endpoint {hub_b.c}:7870 --ssh-allow-all root")
+    hub_b.up()
+    laptop.sh("mkdir -p /root/.ssh && ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519")
+    laptop.mv(f"join {invite(hub_a)} --name laptop")
+    out = laptop.mv(f"join {invite(hub_b)} --name laptop")
+    check("further network" in out and "--net lab" in out, f"second join: {out}")
+    # Without systemd: both in the background, each on its own interface and port.
+    out = laptop.mv("install", timeout=60)
+    check(out.count("running in the background") == 2, f"install: {out}")
+    nets = laptop.mvj("networks")
+    check([n["name"] for n in nets] == ["mesh", "lab"], f"networks: {nets}")
+    check([n["interface"] for n in nets] == ["mesh0", "mesh1"] and [n["port"] for n in nets] == [7870, 7872], f"networks: {nets}")
+    wait(lambda: hub_a.online("laptop") and hub_b.online("laptop"), "laptop online in both", 60)
+    ip_a, ip_b = hub_a.ip(), hub_b.ip()
+    check(ping(laptop, ip_a) and ping(laptop, ip_b), "laptop reaches both hubs")
+    check(ping(laptop, "huba.mesh") and ping(laptop, "hubb.lab.mesh"), "names of both networks")
+    lab_ip = laptop.mvj("--net lab status")["ip"]
+    check(ping(hub_b, lab_ip) and ping(hub_a, laptop.ip()), "both hubs reach the laptop")
+    routes = laptop.sh("ip route show dev mesh1")
+    check(ip_b in routes and "100.64.0.0/10" not in routes, f"the further network routes its nodes only: {routes}")
+    check("also in: lab" in laptop.mv("status"), "status names the other network")
+    # Datasets: the laptop serves one in each network, and each hub gets its own.
+    for net_flag, hub, tag in (("", hub_a, "first"), ("--net lab ", hub_b, "second")):
+        laptop.sh(f"mkdir -p /data/{tag} && head -c 3000000 /dev/urandom > /data/{tag}/blob")
+        oid = laptop.mvj(f"{net_flag}share /data/{tag}")["id"]
+        wait(lambda oid=oid, hub=hub: any(o["id"] == oid for o in hub.mvj("objects")), f"{hub.name} sees the {tag} dataset", 30)
+        hub.mvj(f"fetch {oid} /srv")
+        check(sha(hub, f"/srv/{tag}") == sha(laptop, f"/data/{tag}"), f"dataset of the {tag} network")
+    # The node's network, found by name.
+    p = laptop.mv("exec hubb -u root -- hostname", ok=False)
+    check(p.returncode == 0 and "hubb" in p.stdout and "in network lab" in p.stderr, f"exec in the other network: {p.stdout}{p.stderr}")
+    p = laptop.mv("exec hubb.lab.mesh -u root -- hostname", ok=False)
+    check(p.returncode == 0 and "hubb" in p.stdout, f"exec by full name: {p.stdout}{p.stderr}")
+    p = laptop.mv("nodes nope", ok=False)
+    check(p.returncode == 5, f"unknown node: {p.returncode}")
+    # Leaving the further network: the first one doesn't notice.
+    out = laptop.mv("networks leave lab", timeout=60)
+    check("left network lab" in out, out)
+    check([n["name"] for n in laptop.mvj("networks")] == ["mesh"], "only the first network left")
+    hosts = laptop.sh("cat /etc/hosts")
+    check("hubb" not in hosts and "huba.mesh" in hosts, f"/etc/hosts: {hosts}")
+    check(laptop.sh("ip link show mesh1", ok=False).returncode != 0, "mesh1 is gone")
+    check(ping(laptop, "huba.mesh"), "the first network still works")
+    p = laptop.mv("networks leave mesh", ok=False)
+    check(p.returncode != 0 and "first network" in p.stdout + p.stderr, "the first network can't be left like that")
+
+
+@test
+def test_two_networks_rootless(lab):
+    """The same without root: a user's own two networks, both in userspace mode, ssh to each
+    network's nodes through the right one."""
+    net_a, net_b = lab.network("a"), lab.network("b")
+    hub_a = lab.node("huba", [net_a])
+    hub_b = lab.node("hubb", [net_b])
+    box = lab.node("box", [net_a, net_b], caps=False)
+    hub_a.mv(f"init --name huba --endpoint {hub_a.c}:7870")
+    hub_a.up()
+    hub_b.mv(f"init --name hubb --network lab --endpoint {hub_b.c}:7870")
+    hub_b.up()
+    for hub in (hub_a, hub_b):
+        hub.sh("mkdir -p /srv && echo hello-$(hostname) > /srv/index.html && (cd /srv && python3 -m http.server 8000 >/dev/null 2>&1 &)")
+    box.mv(f"join {invite(hub_a)} --name box", user="agent")
+    out = box.mv(f"join {invite(hub_b)} --name box", user="agent")
+    check("further network" in out, out)
+    box.mv("install", user="agent", timeout=60)
+    nets = box.mvj("networks", user="agent")
+    check([n["running"] for n in nets] == [True, True], f"networks: {nets}")
+    wait(lambda: hub_a.online("box") and hub_b.online("box"), "box online in both", 60)
+    # Each network's own SOCKS proxy.
+    check("hello-huba" in box.sh("curl -s -m5 -x socks5h://127.0.0.1:1055 http://huba.mesh:8000/", user="agent"), "SOCKS of the first")
+    check("hello-hubb" in box.sh("curl -s -m5 -x socks5h://127.0.0.1:1056 http://hubb.lab.mesh:8000/", user="agent"), "SOCKS of the second")
+    # ssh: each name through its own network (both hubs' sshd answer, without a key for us).
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+    for host in ("huba.mesh", "hubb.lab.mesh"):
+        p = box.sh(f"ssh {o} nobody@{host} true", user="agent", ok=False)
+        check("Permission denied" in p.stderr, f"ssh to {host}: {p.stderr}")
+    box.sh("mkdir -p ~/ds && head -c 2000000 /dev/urandom > ~/ds/blob", user="agent")
+    oid = box.mvj("--net lab share /home/agent/ds", user="agent")["id"]
+    wait(lambda: any(o["id"] == oid for o in hub_b.mvj("objects")), "hubb sees the dataset", 30)
+    hub_b.mvj(f"fetch {oid} /srv")
+    check(sha(hub_b, "/srv/ds") == sha(box, "/home/agent/ds", user="agent"), "dataset from a rootless further network")
+    box.mv("networks leave lab", user="agent", timeout=60)
+    cfg = box.sh("cat /home/agent/.ssh/config", user="agent")
+    check("network lab" not in cfg and "Host *.mesh" in cfg, f"~/.ssh/config: {cfg}")
+    p = box.sh(f"ssh {o} nobody@huba.mesh true", user="agent", ok=False)
+    check("Permission denied" in p.stderr, f"the first network after leaving the other: {p.stderr}")
+
+
+@test
 def test_admin_invites(lab):
     """Managed networks: single-use, expiring, forged invites; admin-only actions; admin changes."""
     net, (hub, a) = mesh(lab, ["hub", "a"])

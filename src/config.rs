@@ -44,7 +44,7 @@ static ROOTLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 /// Decided once at startup: a non-root user working with a directory other than the system one.
 pub fn set_rootless(dir: &Path) {
-    let rootless = !crate::sys::is_root() && dir != Path::new(SYSTEM_DIR);
+    let rootless = !crate::sys::is_root() && !dir.starts_with(SYSTEM_DIR);
     ROOTLESS.store(rootless, std::sync::atomic::Ordering::Relaxed);
 }
 

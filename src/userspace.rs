@@ -429,8 +429,9 @@ impl Stack {
                         wake.notify_one();
                         continue;
                     }
+                    let target = self.node.local_service(port);
                     tokio::spawn(async move {
-                        let local = TcpStream::connect(("127.0.0.1", port))
+                        let local = TcpStream::connect(target)
                             .await
                             .ok()
                             .map(|s| Box::new(s) as Box<dyn LocalStream>);
@@ -663,7 +664,7 @@ async fn socks_client(mut c: TcpStream, node: &Node, stack: &StackTx) -> Result<
     let mesh_ip = node.resolve(&host);
     match mesh_ip {
         Some(ip) if ip == node.my_ip() => {
-            let local = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await;
+            let local = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(node.local_service(port))).await;
             direct(c, local.ok().and_then(|r| r.ok())).await
         }
         Some(ip) => {

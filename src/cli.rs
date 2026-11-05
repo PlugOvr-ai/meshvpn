@@ -23,6 +23,10 @@ struct Cli {
     /// ~/.config/meshvpn for a rootless install, or /etc/meshvpn if only that exists].
     #[arg(long, global = true, env = "MESHVPN_DIR")]
     dir: Option<PathBuf>,
+    /// Which of this machine's networks a command is for, when it's in several (`meshvpn
+    /// networks`). Commands find a node's network by themselves; this is for the rest.
+    #[arg(long, global = true, env = "MESHVPN_NET", value_name = "NAME")]
+    net: Option<String>,
     /// Machine readable output (JSON on stdout, also for errors). Exit codes: 0 ok, 1 error,
     /// 2 usage, 3 meshvpn not running, 4 needs root, 5 node/rule not found.
     #[arg(long, global = true)]
@@ -32,7 +36,21 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum NetworksCmd {
+    /// Leave a further network: stops it here and removes its configuration.
+    Leave {
+        /// The network (as `meshvpn networks` lists it).
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// The networks this machine is in. To be in another one too, join it: `meshvpn join <invite>`.
+    Networks {
+        #[command(subcommand)]
+        cmd: Option<NetworksCmd>,
+    },
     /// Create a brand new network with this machine as its first node.
     Init {
         /// Name of the network.
@@ -293,9 +311,10 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Install and start a systemd service so the VPN runs at boot.
+    /// Install and start a systemd service so the VPN runs at boot (one per network: all of
+    /// this machine's networks, or the one of --net).
     Install,
-    /// Stop and remove the systemd service.
+    /// Stop and remove the systemd service (of all networks, or the one of --net).
     Uninstall,
     /// Commands of an installed extension.
     #[command(external_subcommand)]
@@ -641,7 +660,27 @@ pub fn main() {
         Cli::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit())
     };
     let json = cli.json;
-    match real_main(cli) {
+    let base = cli.dir.clone().unwrap_or_else(config::default_dir);
+    let chosen = cli.net.is_some();
+    let result = match (chosen, node_elsewhere(&base, &cli)) {
+        // Named as a node of a further network (`gpu1.lab.mesh`): there right away.
+        (false, Some((net, true))) => rerun_in(&net),
+        _ => real_main(cli),
+    };
+    let result = match result {
+        // A node the first network doesn't know: the further network that does.
+        Err(e) if !chosen && exit_code(&format!("{e:#}")) == 5 => match node_elsewhere_args(&base) {
+            Some(net) => {
+                if !json {
+                    eprintln!("(in network {net})");
+                }
+                rerun_in(&net)
+            }
+            None => Err(e),
+        },
+        r => r,
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             let msg = format!("{e:#}");
@@ -655,6 +694,47 @@ pub fn main() {
             std::process::exit(code);
         }
     }
+}
+
+/// The words of the command line that may name a node.
+fn arg_words() -> Vec<String> {
+    std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect()
+}
+
+/// A further network named in the command line itself (`<node>.<network>.mesh`): (network, true).
+fn node_elsewhere(base: &Path, cli: &Cli) -> Option<(String, bool)> {
+    if cli.cmd.is_none() || networks::all(base).len() < 2 {
+        return None;
+    }
+    arg_words().iter().find_map(|w| {
+        let n = networks::all(base)
+            .into_iter()
+            .map(|(n, _)| n)
+            .find(|n| !n.is_empty() && (w.contains(&format!(".{n}.mesh")) || w.ends_with(&format!(".{n}"))))?;
+        Some((n, true))
+    })
+}
+
+/// After "not found": the one further network that knows a node named in the command line.
+fn node_elsewhere_args(base: &Path) -> Option<String> {
+    if networks::all(base).len() < 2 {
+        return None;
+    }
+    // `user@node`, `node:path`: the node part.
+    arg_words().iter().find_map(|w| {
+        let w = w.rsplit('@').next().unwrap_or(w);
+        let w = w.split(':').next().unwrap_or(w);
+        networks::network_of_node(base, w)
+    })
+}
+
+/// The same command again, for network `net`.
+fn rerun_in(net: &str) -> Result<i32> {
+    use clap::{CommandFactory, FromArgMatches};
+    let mut args: Vec<String> = std::env::args().collect();
+    args.insert(1, format!("--net={net}"));
+    let matches = Cli::command().try_get_matches_from(args)?;
+    real_main(Cli::from_arg_matches(&matches)?)
 }
 
 /// Stable exit codes, so scripts and agents can tell failures apart.
@@ -676,6 +756,49 @@ fn exit_code(msg: &str) -> i32 {
     } else {
         1
     }
+}
+
+/// The directory of network `name` of this machine (`--net`).
+fn network_dir(base: &Path, name: &str, creating: bool) -> Result<PathBuf> {
+    let name = name.trim().to_lowercase();
+    let extra = networks::dir_of(base, &name);
+    if Config::path(&extra).exists() {
+        return Ok(extra);
+    }
+    // The first network, by its own name.
+    if Config::load(base).is_ok_and(|c| c.network == name) || name.is_empty() {
+        return Ok(base.to_path_buf());
+    }
+    networks::check_name(&name)?;
+    if creating {
+        return Ok(extra);
+    }
+    let known: Vec<String> = networks::all(base)
+        .iter()
+        .map(|(_, d)| networks::display_name(d))
+        .collect();
+    if known.is_empty() {
+        bail!("no network called {name} here: this machine isn't in any network yet");
+    }
+    bail!(
+        "no network called {name} here (not found) - this machine's networks: {}; to join another: meshvpn join <invite>",
+        known.join(", ")
+    )
+}
+
+/// Where `meshvpn join` puts a network: with the others if this machine is already in one.
+fn join_dir(base: &Path, dir: &Path, net_given: bool, inv: &Invite, force: bool) -> Result<PathBuf> {
+    if net_given || force {
+        return Ok(dir.to_path_buf());
+    }
+    // Already in it (a renewal, or joining again).
+    if let Some(d) = networks::find_id(base, &inv.id) {
+        return Ok(d);
+    }
+    if !Config::path(dir).exists() {
+        return Ok(dir.to_path_buf());
+    }
+    Ok(networks::dir_of(base, &networks::new_name(base, &inv.network)))
 }
 
 /// Prints a plain message, or `{"ok": true, "message": ...}` with --json.
@@ -738,8 +861,15 @@ fn say(json: bool, text: &str) {
 }
 
 fn real_main(cli: Cli) -> Result<i32> {
-    let dir = cli.dir.unwrap_or_else(config::default_dir);
+    let base = cli.dir.clone().unwrap_or_else(config::default_dir);
+    let creating = matches!(cli.cmd, Some(Cmd::Join { .. } | Cmd::Init { .. }));
+    let dir = match &cli.net {
+        Some(n) => network_dir(&base, n, creating)?,
+        None => base.clone(),
+    };
+    let net_given = cli.net.is_some();
     config::set_rootless(&dir);
+    networks::set_current(&dir);
     let json = cli.json;
     load_proxy_env(&dir);
     // Plain `meshvpn` in a terminal of a set-up machine: the console.
@@ -754,6 +884,21 @@ fn real_main(cli: Cli) -> Result<i32> {
     };
     match cmd {
         Cmd::Init { network, open, node } => {
+            if !net_given
+                && !node.force
+                && let Ok(cfg) = Config::load(&dir)
+            {
+                bail!(
+                    "this machine is already in network \"{}\" - to create another network next to it: {}",
+                    cfg.network,
+                    config::hint("sudo meshvpn --net <name> init")
+                );
+            }
+            // A further network is called what --net says, unless --network says otherwise.
+            let network = match networks::name(&dir) {
+                Some(n) if network == "mesh" => n,
+                _ => network,
+            };
             let key = keys::random32();
             let cfg = create(&dir, node, config::sanitize_name(&network), key, vec![])?;
             if !open {
@@ -780,6 +925,9 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Join { invite, node } => {
             let inv = Invite::decode(&invite)?;
             check_invite_expiry(&inv)?;
+            let first = Config::load(&base).ok();
+            let dir = join_dir(&base, &dir, net_given, &inv, node.force)?;
+            networks::set_current(&dir);
             // Already a member of this network (a client renewing): a new admission only.
             if let Ok(cfg) = Config::load(&dir)
                 && !node.force
@@ -812,6 +960,14 @@ fn real_main(cli: Cli) -> Result<i32> {
             cfg.ticket = inv.ticket;
             cfg.save(&dir)?;
             println!("Joined network \"{}\".\n", cfg.network);
+            if let (Some(n), Some(first)) = (networks::name(&dir), first.filter(|_| !net_given)) {
+                println!(
+                    "This machine is also in network \"{}\", so this one is a further network here, called {n}:\n  \
+                     its nodes are <node>.{n}.mesh, and meshvpn finds them by name in commands as usual\n  \
+                     anything else for it takes --net {n}, e.g. meshvpn --net {n} status\n",
+                    first.network
+                );
+            }
             print_node_summary(&cfg)?;
             println!("It will connect to: {}", cfg.bootstrap.join(", "));
             enable_ssh_logins(&cfg);
@@ -1451,6 +1607,18 @@ fn real_main(cli: Cli) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 print_status(&st);
+                let others: Vec<String> = networks::all(&base)
+                    .iter()
+                    .filter(|(_, d)| *d != dir)
+                    .map(|(_, d)| networks::display_name(d))
+                    .collect();
+                if !others.is_empty() {
+                    println!(
+                        "\nThis machine is also in: {} (meshvpn networks; meshvpn --net {} status)",
+                        others.join(", "),
+                        others[0]
+                    );
+                }
             }
         }
         Cmd::Connect { addr } => {
@@ -1668,10 +1836,13 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::SshAuthorizedKeys { user } => {
             // Called by sshd for every login attempt: never fail loudly, just offer nothing.
             let req = control::Request::AuthorizedKeys { user };
-            if let Ok(rt) = tokio::runtime::Runtime::new()
-                && let Ok(control::Response::Message { text }) = rt.block_on(control::request(&dir, &req))
-            {
-                print!("{text}");
+            // One sshd for all of this machine's networks: each one's keys, pinned to its addresses.
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                for d in chosen_networks(&base, &dir, net_given) {
+                    if let Ok(control::Response::Message { text }) = rt.block_on(control::request(&d, &req)) {
+                        print!("{text}");
+                    }
+                }
             }
         }
         Cmd::Rename { name } => {
@@ -1727,10 +1898,132 @@ fn real_main(cli: Cli) -> Result<i32> {
                 ),
             };
         }
-        Cmd::Install => install(&dir)?,
-        Cmd::Uninstall => uninstall(&dir)?,
+        // Without --net: every network of this machine.
+        Cmd::Install => {
+            for d in chosen_networks(&base, &dir, net_given) {
+                install(&d)?;
+            }
+        }
+        Cmd::Uninstall => {
+            // The further ones first: the first network's goes last, with sshd's setup.
+            for d in chosen_networks(&base, &dir, net_given).iter().rev() {
+                uninstall(d)?;
+            }
+        }
+        Cmd::Networks { cmd: None } => print_networks(&base, json)?,
+        Cmd::Networks {
+            cmd: Some(NetworksCmd::Leave { name }),
+        } => leave_network(&base, &name, json)?,
     }
     Ok(0)
+}
+
+/// The networks a command without --net is for: all of them (the first one alone if that's all).
+fn chosen_networks(base: &Path, dir: &Path, net_given: bool) -> Vec<PathBuf> {
+    if net_given {
+        return vec![dir.to_path_buf()];
+    }
+    let all: Vec<PathBuf> = networks::all(base).into_iter().map(|(_, d)| d).collect();
+    if all.is_empty() { vec![dir.to_path_buf()] } else { all }
+}
+
+/// `meshvpn networks`
+fn print_networks(base: &Path, json: bool) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut rows = vec![];
+    for (name, d) in networks::all(base) {
+        let Ok(cfg) = Config::load(&d) else { continue };
+        let st = match rt.block_on(control::request(&d, &control::Request::Status)) {
+            Ok(control::Response::Status(st)) => Some(st),
+            _ => None,
+        };
+        let ident = Identity::from_config(&cfg)?;
+        rows.push(serde_json::json!({
+            "name": networks::display_name(&d),
+            "first": name.is_empty(),
+            "network": cfg.network,
+            "node": cfg.name,
+            "ip": overlay_ip(&ident.id).to_string(),
+            "interface": st.as_ref().map(|s| s.interface.clone()).unwrap_or(cfg.interface.clone()),
+            "port": cfg.listen_port(),
+            "names": format!("<node>.{}", networks::suffix(&d)),
+            "running": st.is_some(),
+            "online": st.as_ref().map(|s| s.peers.iter().filter(|p| p.online).count()),
+            "nodes": st.as_ref().map(|s| s.peers.len()),
+            "dir": d.display().to_string(),
+        }));
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("This machine isn't in a network yet: meshvpn init, or meshvpn join <invite>.");
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<16} {:<16} {:<10} {:<6} {:<18} STATUS",
+        "NETWORK", "THIS NODE", "ADDRESS", "INTERFACE", "PORT", "NAMES"
+    );
+    for r in &rows {
+        let status = if r["running"] == true {
+            format!("running, {} of {} nodes online", r["online"], r["nodes"])
+        } else {
+            "not running".to_string()
+        };
+        println!(
+            "{:<14} {:<16} {:<16} {:<10} {:<6} {:<18} {status}",
+            r["name"].as_str().unwrap_or(""),
+            r["node"].as_str().unwrap_or(""),
+            r["ip"].as_str().unwrap_or(""),
+            r["interface"].as_str().unwrap_or(""),
+            r["port"].as_u64().map(|p| p.to_string()).unwrap_or("-".into()),
+            r["names"].as_str().unwrap_or(""),
+        );
+    }
+    if rows.len() > 1 {
+        println!();
+        println!("Commands find a node's network by its name. For anything else: meshvpn --net <network> ...");
+        println!("Leave a further network: meshvpn networks leave <network>");
+    } else {
+        println!();
+        println!("To be in another network too, join it: meshvpn join <invite>");
+    }
+    Ok(())
+}
+
+/// `meshvpn networks leave NAME`: a further network goes, the others stay as they are.
+fn leave_network(base: &Path, name: &str, json: bool) -> Result<()> {
+    let dir = networks::dir_of(base, name);
+    if !Config::path(&dir).exists() {
+        if Config::load(base).is_ok_and(|c| c.network == name) {
+            bail!(
+                "{name} is this machine's first network, which stays (the others are set up next to it) - \
+                 to stop it: meshvpn uninstall"
+            );
+        }
+        bail!("this machine isn't in a network called {name} (not found): see meshvpn networks");
+    }
+    require_owner()?;
+    config::set_rootless(&dir);
+    if config::rootless() {
+        uninstall_user(&dir)?
+    } else {
+        uninstall(&dir)?
+    };
+    // Its daemon removes its names from /etc/hosts as it stops; this is for one that didn't run.
+    if !config::rootless() {
+        let _ = hosts::write(Some(name), None);
+        let _ = std::fs::remove_dir_all(format!("/var/lib/meshvpn/networks/{name}"));
+    } else {
+        node::user_ssh_config(&dir, false);
+    }
+    std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    say(
+        json,
+        &format!("left network {name}: its configuration is gone from this machine"),
+    );
+    Ok(())
 }
 
 /// systemd and sudo start meshvpn without the user's proxy variables, so install.sh saves the
@@ -1797,6 +2090,24 @@ fn create(dir: &Path, o: NodeOpts, network: String, key: [u8; 32], bootstrap: Ve
         .map(config::sanitize_name)
         .unwrap_or_else(config::default_node_name);
     let mut cfg = Config::new(name, network, key);
+    let mut o = o;
+    if networks::is_extra(dir) {
+        if !cfg!(target_os = "linux") {
+            bail!("this machine is in a network already, and being in a further one works on Linux only for now");
+        }
+        // What the others of this machine don't use, unless chosen.
+        let (iface, port, socks) = networks::free_slot(&networks::base(dir));
+        if o.interface == "mesh0" {
+            o.interface = iface;
+        }
+        if o.listen == format!("0.0.0.0:{DEFAULT_PORT}") {
+            o.listen = format!("0.0.0.0:{port}");
+        }
+        if o.ssh_remote_port == DEFAULT_PORT {
+            o.ssh_remote_port = port;
+        }
+        cfg.socks_listen = socks;
+    }
     cfg.listen = (!o.no_listen).then_some(o.listen);
     cfg.endpoints = o.endpoints;
     cfg.bootstrap = bootstrap;
@@ -1858,7 +2169,7 @@ fn print_node_summary(cfg: &Config) -> Result<()> {
     let id = Identity::from_config(cfg)?;
     println!("  this node:   {}", cfg.name);
     println!("  mesh IP:     {}", overlay_ip(&id.id));
-    println!("  host name:   {}.mesh", cfg.name);
+    println!("  host name:   {}.{}", cfg.name, networks::current_suffix());
     if let Some(t) = &cfg.ssh_tunnel {
         if t.remote_port == 0 {
             println!("  ssh tunnel:  {} (outgoing only)", t.server);
@@ -1877,23 +2188,29 @@ fn print_node_summary(cfg: &Config) -> Result<()> {
 }
 
 fn print_next_steps(dir: &Path, cfg: &Config) {
+    let net = networks::flag(dir);
     println!();
     if control::is_running(dir) {
         println!("meshvpn is still running with the previous configuration. Restart it:");
         println!(
             "{}",
-            config::hint("  sudo meshvpn install   # restarts the service (or the background daemon)")
+            config::hint(&format!(
+                "  sudo meshvpn{net} install   # restarts the service (or the background daemon)"
+            ))
         );
         println!("  (or stop `meshvpn up` with Ctrl+C and start it again)");
         println!();
     }
     println!("Next steps:");
-    println!("  {:<22} # run now, in the foreground", config::hint("sudo meshvpn up"));
+    println!(
+        "  {:<22} # run now, in the foreground",
+        config::hint(&format!("sudo meshvpn{net} up"))
+    );
     println!(
         "  {:<22} # or: run in the background, also after reboot",
-        config::hint("sudo meshvpn install")
+        config::hint(&format!("sudo meshvpn{net} install"))
     );
-    println!("  {:<22} # see who is connected", "meshvpn status");
+    println!("  {:<22} # see who is connected", format!("meshvpn{net} status"));
     if config::rootless() {
         println!();
         println!("Rootless install (config in {}):", dir.display());
@@ -2461,8 +2778,9 @@ fn print_status(st: &node::Status) {
     }
     if st.ssh_server.as_deref() == Some("built-in") {
         println!(
-            "  ssh server:   built-in (ssh <user>@{}.mesh, logins: meshvpn ssh list)",
-            st.name
+            "  ssh server:   built-in (ssh <user>@{}.{}, logins: meshvpn ssh list)",
+            st.name,
+            networks::current_suffix()
         );
     }
     if let Some(t) = &st.turned_away {
@@ -2572,7 +2890,10 @@ fn update_cmd(dir: &Path, check: bool, force: bool, json: bool) -> Result<()> {
     })
 }
 
-const UNIT_PATH: &str = "/etc/systemd/system/meshvpn.service";
+/// The systemd unit of a network: `meshvpn.service`, `meshvpn-<name>.service`.
+fn unit_path(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("/etc/systemd/system/{}.service", networks::service(dir)))
+}
 const BIN_PATH: &str = "/usr/local/bin/meshvpn";
 
 fn require_root() -> Result<()> {
@@ -2630,38 +2951,50 @@ fn install(dir: &Path) -> Result<()> {
         return install_launchd(&dir, &bin);
     }
     if !systemd_running() {
-        for (pid, cmd) in stop_other_daemons() {
+        for (pid, cmd) in stop_other_daemons(&dir) {
             println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
         }
-        return install_background(&dir, &bin, Path::new("/var/log/meshvpn.log"));
+        return install_background(
+            &dir,
+            &bin,
+            &PathBuf::from(format!("/var/log/{}.log", networks::service(&dir))),
+        );
     }
+    let svc = networks::service(&dir);
     let unit = format!(
-        "[Unit]\nDescription=meshvpn decentralized mesh VPN\nWants=network-online.target\nAfter=network-online.target\n\n\
+        "[Unit]\nDescription=meshvpn decentralized mesh VPN{}\nWants=network-online.target\nAfter=network-online.target\n\n\
          [Service]\nExecStart={} --dir {} up\nRestart=always\nRestartSec=3\n\n\
          [Install]\nWantedBy=multi-user.target\n",
+        networks::name(&dir)
+            .map(|n| format!(", network {n}"))
+            .unwrap_or_default(),
         bin.display(),
         dir.display()
     );
-    std::fs::write(UNIT_PATH, unit)?;
+    std::fs::write(unit_path(&dir), unit)?;
     systemctl(&["daemon-reload"])?;
     // The service takes over: a meshvpn started by hand (or an old version) would hold the
     // network interface and make the service fail with "Resource busy".
-    let _ = systemctl(&["stop", "meshvpn"]);
-    for (pid, cmd) in stop_other_daemons() {
+    let _ = systemctl(&["stop", &svc]);
+    for (pid, cmd) in stop_other_daemons(&dir) {
         println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
     }
-    systemctl(&["enable", "meshvpn"])?;
-    systemctl(&["restart", "meshvpn"])?;
+    systemctl(&["enable", &svc])?;
+    systemctl(&["restart", &svc])?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     let active = std::process::Command::new("systemctl")
-        .args(["is-active", "--quiet", "meshvpn"])
+        .args(["is-active", "--quiet", &svc])
         .status()
         .is_ok_and(|s| s.success());
     if !active {
-        bail!("the meshvpn service did not start - see: journalctl -u meshvpn -n 20");
+        bail!("the {svc} service did not start - see: journalctl -u {svc} -n 20");
     }
-    println!("meshvpn is running and will start at boot.");
-    println!("  status: meshvpn status   logs: journalctl -u meshvpn -f");
+    let net = networks::flag(&dir);
+    match networks::name(&dir) {
+        Some(n) => println!("meshvpn is running for network {n} and will start at boot."),
+        None => println!("meshvpn is running and will start at boot."),
+    }
+    println!("  status: meshvpn{net} status   logs: journalctl -u {svc} -f");
     Ok(())
 }
 
@@ -2802,7 +3135,7 @@ fn install_launchd(dir: &Path, bin: &Path) -> Result<()> {
     );
     let target = format!("system/{LAUNCHD_LABEL}");
     let _ = launchctl(&["bootout", &target]);
-    for (pid, cmd) in stop_other_daemons() {
+    for (pid, cmd) in stop_other_daemons(dir) {
         println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
     }
     std::fs::write(LAUNCHD_PLIST, plist)?;
@@ -2827,12 +3160,29 @@ fn is_daemon_cmdline(args: &[String]) -> bool {
     is_meshvpn && args.iter().skip(1).any(|a| a == "up")
 }
 
-/// Stops meshvpn daemons (`meshvpn ... up`) other than this process. Returns what it stopped.
-fn stop_other_daemons() -> Vec<(i32, String)> {
+/// The network directory a daemon's command line runs (None: the default one).
+fn daemon_dir(args: &[String]) -> Option<PathBuf> {
+    let i = args.iter().position(|a| a == "--dir")?;
+    let d = PathBuf::from(args.get(i + 1)?);
+    Some(std::path::absolute(&d).unwrap_or(d))
+}
+
+/// Is that daemon the one of network `dir`? One without --dir runs a machine's first network.
+fn runs_network(args: &[String], dir: &Path) -> bool {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    match daemon_dir(args) {
+        Some(d) => d == dir,
+        None => !networks::is_extra(&dir),
+    }
+}
+
+/// Stops meshvpn daemons (`meshvpn ... up`) of network `dir` other than this process (those of
+/// the machine's other networks keep running). Returns what it stopped.
+fn stop_other_daemons(dir: &Path) -> Vec<(i32, String)> {
     let me = std::process::id() as i32;
     let mut stopped = vec![];
     for (pid, args) in sys::processes() {
-        if pid == me || !is_daemon_cmdline(&args) {
+        if pid == me || !is_daemon_cmdline(&args) || !runs_network(&args, dir) {
             continue;
         }
         if !sys::terminate(pid) {
@@ -2867,22 +3217,43 @@ fn uninstall(dir: &Path) -> Result<()> {
         let _ = launchctl(&["bootout", &format!("system/{LAUNCHD_LABEL}")]);
         std::fs::remove_file(LAUNCHD_PLIST).ok();
     } else if systemd_running() {
-        let _ = systemctl(&["disable", "--now", "meshvpn"]);
+        let _ = systemctl(&["disable", "--now", &networks::service(dir)]);
     } else {
-        remove_cron_entry();
-        for (pid, cmd) in stop_other_daemons() {
+        remove_cron_entry(dir);
+        for (pid, cmd) in stop_other_daemons(dir) {
             println!("Stopped meshvpn (pid {pid}: {cmd}).");
         }
     }
-    sshd::disable();
-    node::remove_ssh_client_config();
-    std::fs::remove_file(UNIT_PATH).ok();
+    match networks::name(dir) {
+        Some(n) => {
+            std::fs::remove_file(node::ssh_client_dropin_extra(&n)).ok();
+        }
+        None => {
+            // sshd asks every network of this machine: it stays while one of them runs.
+            if networks::all(dir).len() <= 1 {
+                sshd::disable();
+            }
+            node::remove_ssh_client_config();
+        }
+    }
+    std::fs::remove_file(unit_path(dir)).ok();
     let _ = systemctl(&["daemon-reload"]);
-    println!("meshvpn service removed (configuration kept).");
+    match networks::name(dir) {
+        Some(n) => println!("meshvpn service of network {n} removed (configuration kept)."),
+        None => println!("meshvpn service removed (configuration kept)."),
+    }
     Ok(())
 }
 
 const CRON_MARK: &str = "# meshvpn rootless";
+
+/// The crontab mark of a network's entry.
+fn cron_mark(dir: &Path) -> String {
+    match networks::name(dir) {
+        Some(n) => format!("{CRON_MARK} network {n}"),
+        None => CRON_MARK.to_string(),
+    }
+}
 
 fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
@@ -2891,12 +3262,12 @@ fn home() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))
 }
 
-fn user_unit_path() -> Result<PathBuf> {
+fn user_unit_path(dir: &Path) -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         Some(x) => PathBuf::from(x),
         None => home()?.join(".config"),
     };
-    Ok(base.join("systemd/user/meshvpn.service"))
+    Ok(base.join(format!("systemd/user/{}.service", networks::service(dir))))
 }
 
 /// A systemd user manager this process can talk to (not in most containers).
@@ -2910,12 +3281,16 @@ fn user_systemd() -> bool {
             .is_ok_and(|s| s.success())
 }
 
-fn remove_cron_entry() {
-    if let Some(lines) = crontab_lines() {
+fn remove_cron_entry(dir: &Path) {
+    if let Some(lines) = crontab_lines(dir) {
         let before = std::process::Command::new("crontab")
             .arg("-l")
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(CRON_MARK))
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.ends_with(&cron_mark(dir)))
+            })
             .unwrap_or(false);
         if before {
             let _ = set_crontab(&lines);
@@ -2923,13 +3298,13 @@ fn remove_cron_entry() {
     }
 }
 
-fn crontab_lines() -> Option<Vec<String>> {
+fn crontab_lines(dir: &Path) -> Option<Vec<String>> {
     let out = std::process::Command::new("crontab").arg("-l").output().ok()?;
     // "no crontab for user" is an empty one; a missing crontab binary is None.
     Some(
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|l| !l.contains(CRON_MARK))
+            .filter(|l| !l.ends_with(&cron_mark(dir)))
             .map(String::from)
             .collect(),
     )
@@ -2972,11 +3347,12 @@ fn install_user(dir: &Path) -> Result<()> {
         bin
     };
     let dir = std::path::absolute(dir)?;
-    for (pid, cmd) in stop_other_daemons() {
+    for (pid, cmd) in stop_other_daemons(&dir) {
         println!("Stopped a meshvpn that was already running (pid {pid}: {cmd}).");
     }
     if user_systemd() {
-        let unit_path = user_unit_path()?;
+        let svc = networks::service(&dir);
+        let unit_path = user_unit_path(&dir)?;
         std::fs::create_dir_all(unit_path.parent().unwrap())?;
         let unit = format!(
             "[Unit]\nDescription=meshvpn decentralized mesh VPN (rootless)\n\n\
@@ -2987,15 +3363,15 @@ fn install_user(dir: &Path) -> Result<()> {
         );
         std::fs::write(&unit_path, unit)?;
         systemctl(&["--user", "daemon-reload"])?;
-        systemctl(&["--user", "enable", "meshvpn"])?;
-        systemctl(&["--user", "restart", "meshvpn"])?;
+        systemctl(&["--user", "enable", &svc])?;
+        systemctl(&["--user", "restart", &svc])?;
         std::thread::sleep(std::time::Duration::from_secs(2));
         let active = std::process::Command::new("systemctl")
-            .args(["--user", "is-active", "--quiet", "meshvpn"])
+            .args(["--user", "is-active", "--quiet", &svc])
             .status()
             .is_ok_and(|s| s.success());
         if !active {
-            bail!("the meshvpn user service did not start - see: journalctl --user -u meshvpn -n 20");
+            bail!("the {svc} user service did not start - see: journalctl --user -u {svc} -n 20");
         }
         // Without lingering, user services only run while the user is logged in.
         let user = agent::Remote::default_user();
@@ -3015,7 +3391,10 @@ fn install_user(dir: &Path) -> Result<()> {
             println!("  It runs while you are logged in. To start it at boot, an admin can run:");
             println!("    sudo loginctl enable-linger {user}");
         }
-        println!("  status: meshvpn status   logs: journalctl --user -u meshvpn -f");
+        println!(
+            "  status: meshvpn{} status   logs: journalctl --user -u {svc} -f",
+            networks::flag(&dir)
+        );
         return Ok(());
     }
     // No systemd for this user: start it in the background and again after reboot via cron.
@@ -3057,8 +3436,8 @@ fn install_background(dir: &Path, bin: &Path, log: &Path) -> Result<()> {
         log.display()
     );
     let in_container = userspace::in_container();
-    let cron = crontab_lines().filter(|_| !in_container).map(|mut lines| {
-        lines.push(format!("@reboot {cmd} >> {} 2>&1 {CRON_MARK}", log.display()));
+    let cron = crontab_lines(dir).filter(|_| !in_container).map(|mut lines| {
+        lines.push(format!("@reboot {cmd} >> {} 2>&1 {}", log.display(), cron_mark(dir)));
         set_crontab(&lines)
     });
     match cron {
@@ -3071,20 +3450,21 @@ fn install_background(dir: &Path, bin: &Path, log: &Path) -> Result<()> {
             "  It does not start by itself after a reboot (no systemd or cron here): run `meshvpn install` again."
         ),
     }
-    println!("  status: meshvpn status   stop: meshvpn uninstall");
+    let net = networks::flag(dir);
+    println!("  status: meshvpn{net} status   stop: meshvpn{net} uninstall");
     Ok(())
 }
 
 fn uninstall_user(dir: &Path) -> Result<()> {
-    if let Ok(unit) = user_unit_path()
+    if let Ok(unit) = user_unit_path(dir)
         && unit.exists()
     {
-        let _ = systemctl(&["--user", "disable", "--now", "meshvpn"]);
+        let _ = systemctl(&["--user", "disable", "--now", &networks::service(dir)]);
         std::fs::remove_file(&unit).ok();
         let _ = systemctl(&["--user", "daemon-reload"]);
     }
-    remove_cron_entry();
-    for (pid, cmd) in stop_other_daemons() {
+    remove_cron_entry(dir);
+    for (pid, cmd) in stop_other_daemons(dir) {
         println!("Stopped meshvpn (pid {pid}: {cmd}).");
     }
     node::user_ssh_config(dir, false);

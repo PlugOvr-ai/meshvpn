@@ -142,7 +142,8 @@ pub fn select(all: &[NodeView], selectors: &[String]) -> Result<Vec<NodeView>> {
                 "all" | "*" => true,
                 s if s.starts_with("tag:") => n.tags.iter().any(|t| *t == s[4..]),
                 s => {
-                    let s = s.strip_suffix(".mesh").unwrap_or(s);
+                    let suffix = format!(".{}", crate::networks::current_suffix());
+                    let s = s.strip_suffix(&suffix).or_else(|| s.strip_suffix(".mesh")).unwrap_or(s);
                     n.name == s || n.ip.to_string() == s || (s.len() >= 4 && n.id.starts_with(s))
                 }
             })
@@ -258,7 +259,14 @@ impl Remote {
             .args(["-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]);
         if self.socks {
             let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
-            c.args(["-o", &format!("ProxyCommand={} nc %h %p", exe.display())]);
+            c.args([
+                "-o",
+                &format!(
+                    "ProxyCommand={}{} nc %h %p",
+                    exe.display(),
+                    crate::networks::current_dir_args()
+                ),
+            ]);
         }
         c.arg(self.destination(node)).arg(script);
         c
@@ -282,7 +290,14 @@ impl Remote {
         ]);
         if self.socks {
             let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
-            c.args(["-o", &format!("ProxyCommand={} nc %h %p", exe.display())]);
+            c.args([
+                "-o",
+                &format!(
+                    "ProxyCommand={}{} nc %h %p",
+                    exe.display(),
+                    crate::networks::current_dir_args()
+                ),
+            ]);
         }
         c.arg(self.destination(node));
         c
@@ -292,9 +307,9 @@ impl Remote {
     fn destination(&self, node: &NodeView) -> String {
         // Never let a user name turn into an ssh option (it may come from the network).
         if self.user.is_empty() || !crate::proto::valid_user(&self.user) {
-            format!("{}.mesh", node.name)
+            format!("{}.{}", node.name, crate::networks::current_suffix())
         } else {
-            format!("{}@{}.mesh", self.user, node.name)
+            format!("{}@{}.{}", self.user, node.name, crate::networks::current_suffix())
         }
     }
 
@@ -314,7 +329,7 @@ impl Remote {
     /// of ~/.ssh/config, else the local account).
     pub fn ssh_config_user(node: &str) -> String {
         std::process::Command::new("ssh")
-            .args(["-G", &format!("{node}.mesh")])
+            .args(["-G", &format!("{node}.{}", crate::networks::current_suffix())])
             .output()
             .ok()
             .and_then(|o| {
