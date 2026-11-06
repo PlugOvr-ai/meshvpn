@@ -3315,6 +3315,34 @@ impl Node {
         None
     }
 
+    /// A peer's own private address that a direct path to it already uses, outside the subnets
+    /// of this machine (pods on different machines of a cluster are routed to each other, not in
+    /// one subnet). The path is authenticated, so the address is really that node's, and it is
+    /// one of its own interfaces: no NAT between, NCCL can use it as it is.
+    fn direct_lan(&self, info: &NodeInfo) -> Option<Ipv4Addr> {
+        let st = self.state.lock().unwrap();
+        let mut seen: Vec<IpAddr> = vec![];
+        if let Some(p) = st.udp_paths.get(&info.id).filter(|p| p.usable()) {
+            seen.push(p.addr.ip());
+        }
+        if let Some(l) = st.links.get(&info.id)
+            && let Ok(a) = l.addr.parse::<SocketAddr>()
+        {
+            seen.push(a.ip());
+        }
+        let own: Vec<Ipv4Addr> = info
+            .lan
+            .iter()
+            .filter_map(|l| crate::net::parse_cidr(l))
+            .map(|(ip, _)| ip)
+            .collect();
+        let mine: Vec<Ipv4Addr> = crate::net::local_lans().into_iter().map(|(_, ip, _)| ip).collect();
+        seen.into_iter().find_map(|ip| match ip {
+            IpAddr::V4(v4) if v4.is_private() && own.contains(&v4) && !mine.contains(&v4) => Some(v4),
+            _ => None,
+        })
+    }
+
     /// Fills our row of the network matrix: RTT and LAN path for every online peer, and the
     /// throughput of direct links when `bytes` > 0. Then tells everyone.
     pub async fn measure(self: Arc<Self>, only: Option<Vec<NodeId>>, bytes: u64) {
@@ -3352,7 +3380,10 @@ impl Node {
             } else {
                 None
             };
-            let lan_ip = Self::lan_check(&info).await;
+            let lan_ip = match Self::lan_check(&info).await {
+                Some(ip) => Some(ip),
+                None => self.direct_lan(&info),
+            };
             let mut st = self.state.lock().unwrap();
             let rtt_us = rtt
                 .or_else(|| st.links.get(&info.id).and_then(|l| l.rtt))

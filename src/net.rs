@@ -75,12 +75,21 @@ pub fn local_lans() -> Vec<(String, Ipv4Addr, u8)> {
     out
 }
 
-/// Interface on which this machine reaches `peer` directly, if they share a LAN.
+/// Interface on which this machine reaches `peer` directly: the one of a LAN both share, else
+/// the one the kernel routes it through (pods on different machines of a cluster: different
+/// subnets, but a direct route).
 pub fn lan_interface_for(peer: Ipv4Addr) -> Option<String> {
-    local_lans()
-        .into_iter()
-        .find(|(_, ip, p)| same_subnet(*ip, *p, peer))
-        .map(|(n, _, _)| n)
+    let lans = local_lans();
+    if let Some((n, _, _)) = lans.iter().find(|(_, ip, p)| same_subnet(*ip, *p, peer)) {
+        return Some(n.clone());
+    }
+    // Which local address the kernel would send from (no packet is sent).
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((peer, 9)).ok()?;
+    let std::net::IpAddr::V4(local) = sock.local_addr().ok()?.ip() else {
+        return None;
+    };
+    lans.into_iter().find(|(_, ip, _)| *ip == local).map(|(n, _, _)| n)
 }
 
 #[cfg(test)]

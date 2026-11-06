@@ -1120,6 +1120,32 @@ def test_net_env(lab):
 
 
 @test
+def test_routed_lan(lab):
+    """Pods of a cluster: different subnets, routed to each other without NAT. Their direct path
+    counts as a LAN path (verified by the mesh's authenticated path), for NCCL and heavy traffic."""
+    net_a = lab.network("a", subnet="10.199.1.0/24")
+    net_b = lab.network("b", subnet="10.199.2.0/24")
+    rtr = lab.node("rtr", [net_a, net_b], install=False, sysctls=["net.ipv4.ip_forward=1"])
+    hub, p1 = lab.node("hub", [net_a]), lab.node("p1", [net_a])
+    p2 = lab.node("p2", [net_b])
+    for c, other, via in ((hub, net_b, net_a), (p1, net_b, net_a), (p2, net_a, net_b)):
+        c.sh(f"ip route add {'10.199.2.0/24' if other == net_b else '10.199.1.0/24'} via {rtr.net_ip(via)}")
+    hub.mv(f"init --name hub --endpoint {hub.net_ip(net_a)}:7870")
+    hub.up()
+    for n in (p1, p2):
+        n.mv(f"join {invite(hub)} --name {n.name}")
+        n.up()
+        wait(lambda n=n: hub.online(n.name), f"{n.name} online", 60)
+    p2_ip = p2.net_ip(net_b)
+    wait(lambda: (p1.peer("p2") or {}).get("path", "").startswith(f"direct UDP {p2_ip}"), "p1-p2 direct over the route", 60)
+    edges = p1.mvj("net matrix --measure --mb 2", timeout=120)
+    e = next((e for e in edges if e["from"] == "p1" and e["to"] == "p2"), None)
+    check(e and e["lan_ip"] == p2_ip, f"routed path counts as LAN path: {e}")
+    env = p1.mvj("net env --master p1 p1 p2")
+    check(env["NCCL_SOCKET_IFNAME"] == "eth0", f"NCCL over the routed path: {env}")
+
+
+@test
 def test_doctor(lab):
     """doctor finds a Tailscale conflict and a blocking firewall; healthy nodes are healthy."""
     _, (hub, a) = mesh(lab, ["hub", "a"])
