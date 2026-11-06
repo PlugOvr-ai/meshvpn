@@ -387,15 +387,30 @@ pub fn detach(cmd: &mut std::process::Command) {
 #[cfg(target_os = "linux")]
 pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-    passwd
+    let mut out: Vec<(String, std::path::PathBuf)> = passwd
         .lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split(':').collect();
             let uid: u32 = f.get(2)?.parse().ok()?;
             let home = f.get(5)?;
-            ((uid == 0 || uid >= 1000) && uid < 65534).then(|| (f[0].to_string(), home.into()))
+            (uid == 0 || person_uid(uid)).then(|| (f[0].to_string(), home.into()))
         })
-        .collect()
+        .collect();
+    // This process's own account, also where it isn't in /etc/passwd (LDAP, SSSD).
+    if let (Some(me), Some(home)) = (user_name(), std::env::var_os("HOME"))
+        && !out.iter().any(|(n, _)| *n == me)
+        && person_uid(unsafe { libc::geteuid() })
+    {
+        out.push((me, home.into()));
+    }
+    out
+}
+
+/// An account of a person: from 1000, without nobody (65534) and the "no account" numbers at
+/// the top. Large numbers are people too (LDAP, SSSD and clusters hand out uids in the millions).
+#[cfg(unix)]
+pub fn person_uid(uid: u32) -> bool {
+    uid >= 1000 && !matches!(uid, 65534 | 65535 | 4294967294 | 4294967295)
 }
 
 /// macOS keeps accounts in Directory Services, not /etc/passwd; people's homes are in /Users

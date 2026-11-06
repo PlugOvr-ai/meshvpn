@@ -62,6 +62,25 @@ fn local_accounts() -> Vec<String> {
         .collect();
     users.sort();
     users.push("root".into());
+    me_first(users)
+}
+
+/// Whoever opened this: the account behind sudo, else this process's own.
+fn me() -> Option<String> {
+    std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "root")
+        .or_else(crate::sys::user_name)
+        .filter(|n| crate::proto::valid_user(n))
+}
+
+/// The person who opened this comes first (and is there even without an /etc/passwd line,
+/// e.g. an LDAP account).
+fn me_first(mut users: Vec<String>) -> Vec<String> {
+    if let Some(me) = me() {
+        users.retain(|u| *u != me);
+        users.insert(0, me);
+    }
     users
 }
 
@@ -82,15 +101,21 @@ fn local_accounts() -> Vec<String> {
         }
         if uid == 0 {
             root = true;
-        } else if (1000..65534).contains(&uid) {
+        } else if crate::sys::person_uid(uid) {
             users.push(name.to_string());
         }
+    }
+    // A rootless install logs people in only as its own user: just that one.
+    if crate::config::rootless()
+        && let Some(me) = me()
+    {
+        return vec![me];
     }
     users.sort();
     if root {
         users.push("root".into());
     }
-    users
+    me_first(users)
 }
 
 impl App {
@@ -388,4 +413,16 @@ pub fn run(dir: &Path) -> Result<()> {
         println!("{msg}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod account_tests {
+    #[test]
+    fn the_current_user_comes_first() {
+        let me = super::me().unwrap();
+        let users = super::me_first(vec!["alice".into(), me.clone(), "root".into()]);
+        assert_eq!(users[0], me);
+        assert_eq!(users.iter().filter(|u| **u == me).count(), 1);
+        assert_eq!(super::me_first(vec!["root".into()])[0], me);
+    }
 }

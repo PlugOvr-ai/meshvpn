@@ -591,6 +591,11 @@ def test_ssh_logins(lab):
     check(login("alice", "bob@server.mesh") != "bob", "deny didn't take effect")
     server.mv("ssh allow everyone --as bob")
     check(login("eve", "bob@server.mesh") == "bob", "allow everyone didn't take effect")
+    # A cluster account with a uid in the millions (LDAP, SSSD) is a person too: its key is published.
+    laptop.sh("useradd -m -u 1065219 -s /bin/sh carol && su carol -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    server.mv("ssh allow carol@laptop --as bob")
+    wait(lambda: "carol@laptop" in server.mv("ssh-authorized-keys bob"), "server learns carol's key (uid 1065219)", 90)
+    check(login("carol", "bob@server.mesh") == "bob", "carol -> bob should work")
 
 
 @test
