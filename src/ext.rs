@@ -148,6 +148,11 @@ pub trait Extension: Send + Sync {
         String::new()
     }
 
+    /// The extension's commands, for tab completion (their arguments and options too).
+    fn cli(&self) -> Option<clap::Command> {
+        None
+    }
+
     /// The daemon started (or the documents changed): set up, recompute.
     fn start(&self, _ctx: &Ctx) {}
     fn docs_changed(&self, _ctx: &Ctx) {}

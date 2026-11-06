@@ -18,6 +18,7 @@ import ipaddress
 import json
 import os
 import random
+import shlex
 import string
 import subprocess
 import sys
@@ -190,6 +191,15 @@ def mesh(lab, names, net=None, tags=None, join_args="", admin_args=""):
     return net, nodes
 
 
+def tab(node, line, user=None, mv="meshvpn"):
+    """What Tab offers at the end of `line` in a new interactive bash (completion as installed)."""
+    script = ("COMP_LINE=\"$1\"; COMP_POINT=${#1}; read -ra COMP_WORDS <<< \"$1\"; "
+              "[[ \"$1\" == *' ' ]] && COMP_WORDS+=(''); COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); "
+              f"_meshvpn {mv} \"${{COMP_WORDS[COMP_CWORD]}}\" ''; printf '%s\\n' \"${{COMPREPLY[@]}}\"")
+    p = node.sh(f"bash -ic {shlex.quote(script)} tab {shlex.quote(line)} 2>/dev/null", user=user, ok=False)
+    return p.stdout.split()
+
+
 def ping(a, ip, count=2):
     return a.sh(f"ping -c{count} -W3 -i0.3 {ip}", ok=False).returncode == 0
 
@@ -245,6 +255,9 @@ def test_two_networks(lab):
     check(out.count("running in the background") == 2, f"install: {out}")
     nets = laptop.mvj("networks")
     check([n["name"] for n in nets] == ["mesh", "lab"], f"networks: {nets}")
+    # Tab completion came with install: commands, and the nodes of both networks.
+    check(sorted(tab(laptop, "meshvpn net")) == ["net", "networks"], f"completing commands: {tab(laptop, 'meshvpn net')}")
+    wait(lambda: {"huba", "hubb"} <= set(tab(laptop, "meshvpn exec hub")), "completing nodes of both networks", 60)
     check([n["interface"] for n in nets] == ["mesh0", "mesh1"] and [n["port"] for n in nets] == [7870, 7872], f"networks: {nets}")
     wait(lambda: hub_a.online("laptop") and hub_b.online("laptop"), "laptop online in both", 60)
     ip_a, ip_b = hub_a.ip(), hub_b.ip()
@@ -1790,6 +1803,9 @@ def test_rootless(lab):
     mv = "/home/agent/.local/bin/meshvpn"
     check(box.sh(f"{mv} status", user="agent", ok=False).returncode == 0, "status as the user")
     wait(lambda: hub.online("box"), "box online at hub")
+    # Tab completion for the user, also without the bash-completion package.
+    wait(lambda: "hub" in tab(box, f"{mv} exec h", user="agent", mv=mv), "completing node names (rootless)", 60)
+    check(tab(box, f"{mv} ssh allow alice@h", user="agent", mv=mv) == ["alice@hub"], "completing user@node")
     st = json.loads(box.sh(f"{mv} --json status", user="agent"))
     check(st.get("socks"), "rootless node should run in userspace mode")
     # mesh -> services of the user, user -> mesh via SOCKS and ssh

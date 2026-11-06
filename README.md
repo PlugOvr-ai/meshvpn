@@ -476,6 +476,11 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | `meshvpn networks` / `sudo meshvpn networks leave <name>` | The networks this machine is in ([several networks](#several-networks-on-one-machine)); `--net <name>` picks one for any command |
 | `sudo meshvpn connect host[:port]` | Connect the network to a node it can reach but that can't reach it (alias: `add-peer`) |
 
+**Tab completion** (bash) comes with `meshvpn install`: commands and options, and the names and tags of the nodes as they
+are right now (`meshvpn exec gp<Tab>`, `ssh allow alice@<Tab>`, `cp ./data gpu1:<Tab>`). Where the bash-completion
+package isn't installed (many container images), install adds one marked line to `~/.bashrc`; `uninstall` removes it.
+Elsewhere: `source <(meshvpn completion bash)`, in zsh after `autoload bashcompinit; bashcompinit`.
+
 ### Admins and invites
 
 New networks are **managed**: the node that ran `init` is the admin. Only admins can invite new nodes, ban nodes and

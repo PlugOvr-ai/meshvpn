@@ -4,6 +4,7 @@
 #![cfg_attr(windows, allow(dead_code))]
 
 mod agent;
+mod completion;
 mod config;
 #[cfg(unix)]
 mod console;

@@ -316,6 +316,15 @@ enum Cmd {
     Install,
     /// Stop and remove the systemd service (of all networks, or the one of --net).
     Uninstall,
+    /// Tab completion for bash (`meshvpn install` sets it up; zsh: `autoload bashcompinit;
+    /// bashcompinit; source <(meshvpn completion bash)`).
+    Completion {
+        #[arg(value_parser = ["bash"])]
+        shell: String,
+    },
+    /// What the completion script asks: candidates for the word at POINT of LINE.
+    #[command(name = "__complete", hide = true)]
+    Complete { line: String, point: usize },
     /// Commands of an installed extension.
     #[command(external_subcommand)]
     External(Vec<String>),
@@ -1903,11 +1912,25 @@ fn real_main(cli: Cli) -> Result<i32> {
             for d in chosen_networks(&base, &dir, net_given) {
                 install(&d)?;
             }
+            if let Some(path) = crate::completion::install()
+                && !json
+            {
+                println!("Tab completion for bash: {} (in new shells)", path.display());
+            }
         }
         Cmd::Uninstall => {
             // The further ones first: the first network's goes last, with sshd's setup.
             for d in chosen_networks(&base, &dir, net_given).iter().rev() {
                 uninstall(d)?;
+            }
+            if !net_given {
+                crate::completion::uninstall();
+            }
+        }
+        Cmd::Completion { .. } => print!("{}", crate::completion::BASH),
+        Cmd::Complete { line, point } => {
+            for c in crate::completion::complete(full_command(), &base, &line, point) {
+                println!("{c}");
             }
         }
         Cmd::Networks { cmd: None } => print_networks(&base, json)?,
@@ -1916,6 +1939,20 @@ fn real_main(cli: Cli) -> Result<i32> {
         } => leave_network(&base, &name, json)?,
     }
     Ok(0)
+}
+
+/// All commands: meshvpn's and an extension's.
+fn full_command() -> clap::Command {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    if let Some(ext) = crate::ext::get().and_then(|e| e.cli()) {
+        for sub in ext.get_subcommands() {
+            if cmd.find_subcommand(sub.get_name()).is_none() {
+                cmd = cmd.subcommand(sub.clone());
+            }
+        }
+    }
+    cmd
 }
 
 /// The networks a command without --net is for: all of them (the first one alone if that's all).
