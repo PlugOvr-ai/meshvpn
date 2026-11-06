@@ -288,6 +288,10 @@ pub struct Config {
     /// Maintain `<name>.mesh` entries in /etc/hosts.
     #[serde(default = "default_true")]
     pub manage_hosts: bool,
+    /// An IPv6 address in the mesh besides the IPv4 one (kernel mode on Linux). Off: IPv4 only,
+    /// e.g. where firewall rules for the mesh interface exist only for IPv4.
+    #[serde(default = "default_true")]
+    pub ipv6: bool,
     /// Publish the SSH public keys of this machine's users, so other nodes can allow them to
     /// log in without a password.
     #[serde(default = "default_true")]
@@ -369,6 +373,7 @@ impl Config {
             interface: default_iface(),
             mtu: default_mtu(),
             manage_hosts: !rootless(),
+            ipv6: true,
             publish_ssh_keys: true,
             ssh_authorized_keys: true,
             userspace: if rootless() { Userspace::Always } else { Userspace::Auto },

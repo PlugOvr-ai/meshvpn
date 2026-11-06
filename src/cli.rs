@@ -2746,6 +2746,9 @@ fn print_status(st: &node::Status) {
             config::hint("sudo meshvpn update")
         );
     }
+    if let Some(ip6) = st.mesh_ip6 {
+        println!("  IPv6:         {ip6}");
+    }
     if !st.banned.is_empty() {
         println!("  banned:       {}", st.banned.join(", "));
     }

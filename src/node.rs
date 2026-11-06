@@ -6,7 +6,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, SavedState, Userspace};
-use crate::keys::{Identity, NodeId, OVERLAY_NETMASK, overlay_ip};
+use crate::keys::{Identity, NodeId, OVERLAY_NETMASK, overlay_ip, overlay_ip6};
 use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
 
@@ -140,6 +140,7 @@ struct State {
     records: HashMap<NodeId, Record>,
     links: HashMap<NodeId, LinkEntry>,
     ip_map: HashMap<Ipv4Addr, NodeId>,
+    ip6_map: HashMap<Ipv6Addr, NodeId>,
     /// destination -> first hop
     routes: HashMap<NodeId, NodeId>,
     ciphers: HashMap<NodeId, XChaCha20Poly1305>,
@@ -157,6 +158,10 @@ struct State {
     kernel_routes: HashSet<Ipv4Addr>,
     /// Addresses of this network that are another node's in the machine's first network.
     address_clashes: Vec<String>,
+    /// Of those, the ones left to the first network: this network reaches the node over IPv6.
+    v4_withheld: HashSet<Ipv4Addr>,
+    /// The addresses routes were last worked out for.
+    route_ips: Vec<Ipv4Addr>,
     /// Host key of whatever answers SSH here (published in our record).
     my_ssh_host_key: Option<String>,
     update_available: Option<String>,
@@ -233,6 +238,8 @@ pub struct Node {
     ident: Identity,
     net: String,
     my_ip: Ipv4Addr,
+    /// The IPv6 address on the interface: None in userspace mode, or where IPv6 is off.
+    my_ip6: Option<Ipv6Addr>,
     io: PacketIo,
     state: Mutex<State>,
     next_link_id: AtomicU64,
@@ -289,6 +296,9 @@ pub struct Status {
     pub network: String,
     pub id: String,
     pub ip: Ipv4Addr,
+    /// The node's IPv6 address in the mesh (None: userspace mode, or IPv6 is off here).
+    #[serde(default)]
+    pub mesh_ip6: Option<Ipv6Addr>,
     pub interface: String,
     pub endpoints: Vec<String>,
     pub ssh_tunnel: Option<String>,
@@ -387,6 +397,8 @@ pub struct PeerStatus {
     pub exit: bool,
     pub id: String,
     pub ip: Ipv4Addr,
+    #[serde(default)]
+    pub ip6: Option<Ipv6Addr>,
     pub online: bool,
     pub path: String,
     pub rtt_ms: Option<u64>,
@@ -418,12 +430,16 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     // Kernel TUN device if possible; otherwise (containers without /dev/net/tun or NET_ADMIN)
     // a TCP/IP stack in this process.
     let mut tun_dev = None;
+    let mut my_ip6 = None;
     let mut userspace_reason = None;
     if cfg.userspace == Userspace::Always {
         userspace_reason = Some("userspace = \"always\" in the config".to_string());
     } else {
         match create_tun(&mut cfg, my_ip, crate::networks::is_extra(&dir)) {
-            Ok(t) => tun_dev = Some(t),
+            Ok(t) => {
+                tun_dev = Some(t);
+                my_ip6 = add_ipv6(&cfg, overlay_ip6(&cfg.network_id(), &ident.id));
+            }
             Err(msg) if cfg.userspace == Userspace::Auto && tun_unavailable(&msg) => userspace_reason = Some(msg),
             Err(msg) => return Err(tun_error(&cfg, &msg)),
         }
@@ -446,6 +462,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         ident,
         net: cfg.network_id(),
         my_ip,
+        my_ip6,
         io,
         state: Mutex::new(State::default()),
         next_link_id: AtomicU64::new(1),
@@ -666,6 +683,24 @@ fn assign_ips<'a>(
     (ip_map, conflicts)
 }
 
+/// IPv6 addresses of `ids`. 64 bits of hash: no two nodes share one unless someone grinds
+/// identities for it (2^64 work), and then, as with IPv4, the address belongs to nobody.
+fn assign_ips6<'a>(
+    ids: impl Iterator<Item = &'a NodeId>,
+    net: &str,
+    mine: Option<Ipv6Addr>,
+) -> HashMap<Ipv6Addr, NodeId> {
+    let mut by_ip: HashMap<Ipv6Addr, Vec<NodeId>> = HashMap::new();
+    for id in ids {
+        by_ip.entry(overlay_ip6(net, id)).or_default().push(*id);
+    }
+    by_ip
+        .into_iter()
+        .filter(|(ip, owners)| owners.len() == 1 && Some(*ip) != mine)
+        .map(|(ip, owners)| (ip, owners[0]))
+        .collect()
+}
+
 impl Node {
     // ----------------------------------------------------------------------------- own record
 
@@ -736,6 +771,7 @@ impl Node {
                 .or_else(|| (st.ssh_allow_all.len() == 1).then(|| st.ssh_allow_all[0].clone())),
             measured: st.measured,
             exit: st.exit_offer,
+            ipv6: self.my_ip6.is_some(),
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
             } else {
@@ -928,6 +964,14 @@ impl Node {
             if wanted {
                 match tokio::net::TcpListener::bind((self.my_ip, 22)).await {
                     Ok(l) => {
+                        if let Some(ip6) = self.my_ip6 {
+                            match tokio::net::TcpListener::bind((ip6, 22)).await {
+                                Ok(l6) => {
+                                    tokio::spawn(crate::sshserver::listen(self.clone(), l6));
+                                }
+                                Err(e) => info!("built-in SSH server: cannot listen on [{ip6}]:22: {e}"),
+                            }
+                        }
                         self.ssh_listening.store(true, Ordering::Relaxed);
                         self.ssh_check();
                         crate::sshserver::listen(self.clone(), l).await;
@@ -1068,7 +1112,8 @@ impl Node {
                 .iter()
                 .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
                 .collect();
-            let ip = overlay_ip(&rec.info.id);
+            // Both addresses: ssh may come over either.
+            let ip = format!("{},{}", overlay_ip(&rec.info.id), overlay_ip6(&self.net, &rec.info.id));
             if in_scope && !st.banned.contains_key(&rec.info.id) {
                 for k in st.ssh_allow_keys.iter().filter(|k| k.users.iter().any(|u| u == user)) {
                     lines.push(format!("from=\"{ip}\" {} meshvpn:key:{}\n", k.key, k.comment));
@@ -1083,7 +1128,8 @@ impl Node {
                 }
             }
         }
-        for line in Self::ext_key_lines(&access, user) {
+        let v6_of = |ip: Ipv4Addr| st.ip_map.get(&ip).map(|id| overlay_ip6(&self.net, id));
+        for line in Self::ext_key_lines(&access, user, v6_of) {
             if !lines.contains(&line) {
                 lines.push(line);
             }
@@ -1755,6 +1801,8 @@ impl Node {
         }
         st.ip_conflicts = conflicts;
         st.ip_map = ip_map;
+        let with_ipv6: Vec<NodeId> = st.records.values().filter(|r| r.info.ipv6).map(|r| r.info.id).collect();
+        st.ip6_map = assign_ips6(with_ipv6.iter(), &self.net, self.my_ip6);
         self.sync_routes(st);
         st.id_prefix = st
             .records
@@ -1801,6 +1849,15 @@ impl Node {
 
     /// Encrypts an IP packet end-to-end for `dst` and hands it to the first hop.
     pub(crate) fn send_packet(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
+        self.send_to(IpAddr::V4(dst_ip), pkt)
+    }
+
+    /// An IPv6 packet: only to nodes (no exit for IPv6).
+    fn send_packet6(&self, dst_ip: Ipv6Addr, pkt: &[u8]) {
+        self.send_to(IpAddr::V6(dst_ip), pkt)
+    }
+
+    fn send_to(&self, dst_ip: IpAddr, pkt: &[u8]) {
         match self.outgoing(dst_ip, pkt) {
             // Drop on congestion, like a real network.
             Some(Outgoing::Udp(addr, datagrams)) => {
@@ -1819,7 +1876,7 @@ impl Node {
 
     /// Like `send_packet`, but waits for room instead of dropping (throughput tests).
     async fn send_packet_waiting(&self, dst_ip: Ipv4Addr, pkt: &[u8]) {
-        match self.outgoing(dst_ip, pkt) {
+        match self.outgoing(IpAddr::V4(dst_ip), pkt) {
             Some(Outgoing::Udp(addr, datagrams)) => {
                 if let Some(sock) = self.udp_socket(&addr) {
                     for d in datagrams {
@@ -1836,10 +1893,10 @@ impl Node {
 
     /// What carries `pkt` to `dst_ip`: straight over UDP if there is a direct path, else the
     /// first hop of the route (a direct link or a relay).
-    fn outgoing(&self, dst_ip: Ipv4Addr, pkt: &[u8]) -> Option<Outgoing> {
+    fn outgoing(&self, dst_ip: IpAddr, pkt: &[u8]) -> Option<Outgoing> {
         let direct = {
             let mut st = self.state.lock().unwrap();
-            let dst = st.ip_map.get(&dst_ip).copied().or_else(|| self.exit_for(&st, dst_ip))?;
+            let dst = self.node_for(&st, dst_ip)?;
             st.udp_paths
                 .get(&dst)
                 .is_some_and(|p| p.usable())
@@ -1853,7 +1910,7 @@ impl Node {
         }
         let (dst, tx, cipher) = {
             let mut st = self.state.lock().unwrap();
-            let dst = st.ip_map.get(&dst_ip).copied().or_else(|| self.exit_for(&st, dst_ip))?;
+            let dst = self.node_for(&st, dst_ip)?;
             let hop = st.routes.get(&dst).copied()?;
             let tx = st.links.get(&hop).map(|l| l.tx.clone())?;
             let cipher = self.cipher_for(&mut st, &dst)?;
@@ -1910,7 +1967,7 @@ impl Node {
     /// Hands an IP packet for this node to the kernel or the userspace stack.
     async fn deliver(&self, pkt: Vec<u8>) {
         // Throughput tests end here instead of in the kernel.
-        if pkt.len() >= 20 + 21 && pkt[9] == BENCH_PROTO && pkt[20..24] == *BENCH_MAGIC {
+        if pkt.len() >= 20 + 21 && pkt[0] >> 4 == 4 && pkt[9] == BENCH_PROTO && pkt[20..24] == *BENCH_MAGIC {
             self.handle_ip_bench(&pkt);
             return;
         }
@@ -1927,6 +1984,29 @@ impl Node {
                 let _ = tx.send(crate::userspace::Cmd::Packet(pkt));
             }
         }
+    }
+
+    /// The node that gets packets for `ip`: the node with that address, or our exit.
+    fn node_for(&self, st: &State, ip: IpAddr) -> Option<NodeId> {
+        match ip {
+            IpAddr::V4(v4) => st.ip_map.get(&v4).copied().or_else(|| self.exit_for(st, v4)),
+            IpAddr::V6(v6) => st.ip6_map.get(&v6).copied(),
+        }
+    }
+
+    /// The IPv4 mesh address of the node that has IPv6 mesh address `ip`: who a connection is
+    /// from, whichever address it came over.
+    pub fn mesh_ip_of6(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
+        let st = self.state.lock().unwrap();
+        let id = st.ip6_map.get(&ip)?;
+        let v4 = overlay_ip(id);
+        (st.ip_map.get(&v4) == Some(id)).then_some(v4)
+    }
+
+    /// `id` is the only node with its IPv6 mesh address.
+    pub(crate) fn owns_ip6(&self, id: &NodeId) -> bool {
+        let st = self.state.lock().unwrap();
+        st.ip6_map.get(&overlay_ip6(&self.net, id)) == Some(id)
     }
 
     /// `id` is the only node with its mesh address (see rebuild).
@@ -1994,11 +2074,17 @@ impl Node {
                 }
             };
             let pkt = &buf[..n];
-            if n < 20 || pkt[0] >> 4 != 4 {
-                continue; // IPv4 only
+            match pkt.first().map(|b| b >> 4) {
+                Some(4) if n >= 20 => {
+                    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+                    self.send_packet(dst, pkt);
+                }
+                Some(6) if n >= 40 => {
+                    let dst: [u8; 16] = pkt[24..40].try_into().unwrap();
+                    self.send_packet6(Ipv6Addr::from(dst), pkt);
+                }
+                _ => {}
             }
-            let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-            self.send_packet(dst, pkt);
         }
     }
 
@@ -2563,7 +2649,15 @@ impl Node {
                 (true, Some(net)) => format!(",{name}.{net}"),
                 (true, None) => format!(",{name}"),
             };
-            text.push_str(&format!("{name}.{suffix},{ip}{plain} {key}\n"));
+            let id = if ip == self.my_ip {
+                Some(self.ident.id)
+            } else {
+                st.ip_map.get(&ip).copied()
+            };
+            let ip6 = id
+                .map(|id| format!(",{}", overlay_ip6(&self.net, &id)))
+                .unwrap_or_default();
+            text.push_str(&format!("{name}.{suffix},{ip}{ip6}{plain} {key}\n"));
         }
         if text == st.known_hosts_written {
             return;
@@ -2594,10 +2688,60 @@ impl Node {
         if !crate::networks::is_extra(&self.dir) {
             return;
         }
-        let want: HashSet<Ipv4Addr> = st.ip_map.keys().copied().filter(|ip| *ip != self.my_ip).collect();
-        if want == st.kernel_routes {
+        let mut ips: Vec<Ipv4Addr> = st.ip_map.keys().copied().filter(|ip| *ip != self.my_ip).collect();
+        ips.sort();
+        // Looked at again when this network's nodes change, as the first network's are on disk.
+        let routed =
+            |st: &State| ips.iter().filter(|ip| !st.v4_withheld.contains(ip)).count() == st.kernel_routes.len();
+        if ips == st.route_ips && routed(st) {
             return;
         }
+        st.route_ips = ips.clone();
+        // The same address in this machine's first network. With IPv6 the first network keeps
+        // it and this one reaches its node over IPv6; without, this route takes it over here.
+        let first = crate::networks::base(&self.dir);
+        let theirs: HashMap<Ipv4Addr, String> = Config::load(&first)
+            .map(|c| {
+                let net = c.network_id();
+                crate::config::SavedState::load(&first)
+                    .peers
+                    .iter()
+                    .filter_map(|p| p.verify(&net).ok())
+                    .map(|i| (overlay_ip(&i.id), i.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let suffix = crate::networks::suffix(&self.dir);
+        let mut clashes = vec![];
+        let mut withheld = HashSet::new();
+        for ip in &ips {
+            if let Some(other) = theirs.get(ip) {
+                let ours = st
+                    .ip_map
+                    .get(ip)
+                    .and_then(|id| st.records.get(id))
+                    .map_or("?", |r| r.info.name.as_str());
+                let text = if self.my_ip6.is_some() {
+                    withheld.insert(*ip);
+                    format!(
+                        "address clash: {ip} is {ours} in this network and {other} in this machine's first network - \
+                         {other} keeps it here, {ours}.{suffix} is reached over IPv6"
+                    )
+                } else {
+                    format!(
+                        "address clash: {ip} is {ours} in this network and {other} in this machine's first network - \
+                         here it reaches {ours}, so {other} can't be reached from this machine (with IPv6 on, both could)"
+                    )
+                };
+                if !st.address_clashes.contains(&text) {
+                    warn!("{text}");
+                }
+                clashes.push(text);
+            }
+        }
+        st.address_clashes = clashes;
+        st.v4_withheld = withheld;
+        let want: HashSet<Ipv4Addr> = ips.into_iter().filter(|ip| !st.v4_withheld.contains(ip)).collect();
         let iface = &self.cfg.interface;
         let src = self.my_ip.to_string();
         let ip = |args: &[&str]| {
@@ -2620,38 +2764,6 @@ impl Node {
         for gone in st.kernel_routes.difference(&want) {
             ip(&["route", "del", &format!("{gone}/32"), "dev", iface]);
         }
-        // The same address in this machine's first network: this route takes it over here.
-        let first = crate::networks::base(&self.dir);
-        let theirs: HashMap<Ipv4Addr, String> = Config::load(&first)
-            .map(|c| {
-                let net = c.network_id();
-                crate::config::SavedState::load(&first)
-                    .peers
-                    .iter()
-                    .filter_map(|p| p.verify(&net).ok())
-                    .map(|i| (overlay_ip(&i.id), i.name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut clashes = vec![];
-        for ip in &want {
-            if let Some(other) = theirs.get(ip) {
-                let ours = st
-                    .ip_map
-                    .get(ip)
-                    .and_then(|id| st.records.get(id))
-                    .map_or("?", |r| r.info.name.as_str());
-                let text = format!(
-                    "address clash: {ip} is {ours} in this network and {other} in this machine's first network - \
-                     here it reaches {ours}, so {other} can't be reached from this machine"
-                );
-                if !st.kernel_routes.contains(ip) {
-                    warn!("{text}");
-                }
-                clashes.push(text);
-            }
-        }
-        st.address_clashes = clashes;
         let mut done = HashSet::new();
         for new in want.iter().filter(|w| !st.kernel_routes.contains(*w)) {
             if ip(&["route", "replace", &format!("{new}/32"), "dev", iface, "src", &src]) {
@@ -2669,7 +2781,13 @@ impl Node {
         }
         let aliases = self.ext_host_names();
         let mut st = self.state.lock().unwrap();
-        let mut entries = vec![(st.my_name.clone(), self.my_ip, self.ident.id)];
+        let v6 = |id: &NodeId| self.my_ip6.map(|_| overlay_ip6(&self.net, id));
+        let mut entries = vec![crate::hosts::Entry {
+            name: st.my_name.clone(),
+            v4: Some(self.my_ip),
+            v6: self.my_ip6,
+            id: self.ident.id,
+        }];
         // If two nodes share a name, the plain name goes to the one that is online and newest
         // (e.g. a machine that was set up again gets its name back from its old identity).
         let mut others: Vec<_> = st.records.values().collect();
@@ -2682,10 +2800,18 @@ impl Node {
         });
         let others: Vec<_> = others
             .into_iter()
-            .map(|r| (r.info.name.clone(), overlay_ip(&r.info.id), r.info.id))
+            .map(|r| {
+                let ip = overlay_ip(&r.info.id);
+                crate::hosts::Entry {
+                    name: r.info.name.clone(),
+                    v4: (!st.v4_withheld.contains(&ip)).then_some(ip),
+                    v6: v6(&r.info.id).filter(|_| r.info.ipv6),
+                    id: r.info.id,
+                }
+            })
             .collect();
         entries.extend(others);
-        let taken: HashSet<String> = entries.iter().map(|e| e.0.clone()).collect();
+        let taken: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
         let suffix = crate::networks::suffix(&self.dir);
         let block = crate::hosts::render(&entries, &suffix) + &crate::hosts::render_aliases(&aliases, &taken, &suffix);
         if block == st.hosts_written {
@@ -2729,6 +2855,7 @@ impl Node {
                     exit: r.info.exit,
                     id: id.hex(),
                     ip: overlay_ip(&id),
+                    ip6: r.info.ipv6.then(|| overlay_ip6(&self.net, &id)),
                     online: self.is_online(&st, &id),
                     path,
                     rtt_ms: udp
@@ -2754,6 +2881,7 @@ impl Node {
             network: self.cfg.network.clone(),
             id: self.ident.id.hex(),
             ip: self.my_ip,
+            mesh_ip6: self.my_ip6,
             interface: self.cfg.interface.clone(),
             endpoints: st.my_endpoints.clone(),
             ssh_tunnel: self.cfg.ssh_tunnel.as_ref().map(|t| match t.remote_port {
@@ -2795,7 +2923,10 @@ impl Node {
                     ));
                 }
                 w.extend(self.exit_status(&st).1);
-                w.extend(st.address_clashes.iter().cloned());
+                // With IPv6 a clash is taken care of (see sync_routes): no warning then.
+                if self.my_ip6.is_none() {
+                    w.extend(st.address_clashes.iter().cloned());
+                }
                 w
             },
             exit_offer: st.exit_offer,
@@ -3478,6 +3609,49 @@ fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr, extra: bool) -> std::result::Re
         }
     }
     Ok(dev)
+}
+
+/// Puts this node's IPv6 address on the interface. None where IPv6 is off: the mesh works over
+/// IPv4 alone then, as before.
+fn add_ipv6(cfg: &Config, ip: Ipv6Addr) -> Option<Ipv6Addr> {
+    if !cfg.ipv6 || !cfg!(target_os = "linux") {
+        return None;
+    }
+    let read = |f: &str| std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{f}/disable_ipv6")).ok();
+    match read("all").as_deref().map(str::trim) {
+        Some("0") => {}
+        Some(_) => {
+            info!("IPv6 is off on this machine: the mesh uses IPv4 only");
+            return None;
+        }
+        None => {
+            info!("no IPv6 in this kernel: the mesh uses IPv4 only");
+            return None;
+        }
+    }
+    let iface = &cfg.interface;
+    // New interfaces may start without IPv6 (net.ipv6.conf.default): ours gets it.
+    if read(iface).as_deref().map(str::trim) == Some("1") {
+        let _ = std::fs::write(format!("/proc/sys/net/ipv6/conf/{iface}/disable_ipv6"), "0");
+    }
+    // nodad: the address is ours alone, no need to wait for duplicate address detection.
+    let out = std::process::Command::new("ip")
+        .args(["-6", "addr", "replace", &format!("{ip}/64"), "dev", iface, "nodad"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => Some(ip),
+        Ok(o) => {
+            warn!(
+                "no IPv6 in the mesh: ip -6 addr add {ip}/64 dev {iface}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            None
+        }
+        Err(e) => {
+            warn!("no IPv6 in the mesh: ip: {e} (it needs the ip command, iproute2)");
+            None
+        }
+    }
 }
 
 fn permission_problem(msg: &str) -> bool {

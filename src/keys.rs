@@ -156,6 +156,30 @@ pub fn network_tag(network_key: &[u8; 32]) -> String {
     Key32(blake3::derive_key("meshvpn network tag v1", network_key)).hex()[..16].to_string()
 }
 
+/// IPv6 address of a node: a private (ULA) /64 of its own for each network, from the network's
+/// id, and 64 bits of hash(node id). Networks never share a prefix, so the IPv6 addresses of
+/// several networks on one machine can't clash, and two nodes of one network practically never.
+pub fn overlay_ip6(network: &str, id: &NodeId) -> std::net::Ipv6Addr {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&overlay_prefix6(network));
+    let h = blake3::derive_key("meshvpn ipv6 interface id v1", &id.0);
+    b[8..].copy_from_slice(&h[..8]);
+    if b[8..] == [0; 8] {
+        b[15] = 1;
+    }
+    std::net::Ipv6Addr::from(b)
+}
+
+/// The network's /64: fd00::/8 (locally assigned ULA, RFC 4193), 40 bits of hash(network id),
+/// subnet 0.
+pub fn overlay_prefix6(network: &str) -> [u8; 8] {
+    let h = blake3::derive_key("meshvpn ipv6 prefix v1", network.as_bytes());
+    let mut p = [0u8; 8];
+    p[0] = 0xfd;
+    p[1..6].copy_from_slice(&h[..5]);
+    p
+}
+
 pub const OVERLAY_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 192, 0, 0);
 
 /// An address of the mesh (100.64.0.0/10).
@@ -177,6 +201,19 @@ mod tests {
             assert_ne!(ip, Ipv4Addr::new(100, 64, 0, 0));
             assert_ne!(ip, Ipv4Addr::new(100, 127, 255, 255));
         }
+    }
+
+    #[test]
+    fn ipv6_addresses_per_network() {
+        let a = Key32(random32());
+        let lab = overlay_ip6("0123456789abcdef", &a);
+        let home = overlay_ip6("fedcba9876543210", &a);
+        assert_eq!(lab.octets()[0], 0xfd);
+        assert_ne!(lab.octets()[..8], home.octets()[..8], "each network has its own prefix");
+        assert_eq!(lab.octets()[8..], home.octets()[8..], "the node part follows the node");
+        assert_eq!(lab, overlay_ip6("0123456789abcdef", &a));
+        let p = overlay_prefix6("0123456789abcdef");
+        assert_eq!(lab.octets()[..8], p);
     }
 
     #[test]

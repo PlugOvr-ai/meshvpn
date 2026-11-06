@@ -211,6 +211,9 @@ pub struct NodeInfo {
     /// Offers its internet connection to the mesh (an exit node).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exit: bool,
+    /// Has its IPv6 address in the mesh: others send it IPv6 (older nodes have none).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ipv6: bool,
 }
 
 /// GPUs of a node reserved for someone until `expires` (ms since epoch).
@@ -586,6 +589,7 @@ mod tests {
             ssh_host_key: None,
             login_user: None,
             exit: false,
+            ipv6: false,
             version: String::new(),
         }
     }

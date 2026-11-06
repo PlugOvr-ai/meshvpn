@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::keys::NodeId;
 
@@ -21,17 +21,28 @@ fn names(name: &str, suffix: &str) -> String {
     }
 }
 
-pub fn render(entries: &[(String, Ipv4Addr, NodeId)], suffix: &str) -> String {
+/// A node's names: to its IPv4 address (None: that one is another node's here) and its IPv6
+/// address (None: no IPv6 here). Programs try the IPv4 address first where there are both.
+pub struct Entry {
+    pub name: String,
+    pub v4: Option<Ipv4Addr>,
+    pub v6: Option<Ipv6Addr>,
+    pub id: NodeId,
+}
+
+pub fn render(entries: &[Entry], suffix: &str) -> String {
     let mut used = HashSet::new();
     let mut out = String::new();
-    for (name, ip, id) in entries {
+    for Entry { name, v4, v6, id } in entries {
         // Two nodes with the same name: the later one gets its id appended.
         let name = if used.insert(name.clone()) {
             name.clone()
         } else {
             format!("{name}-{}", id.short())
         };
-        out.push_str(&format!("{ip}\t{}\n", names(&name, suffix)));
+        for ip in v4.map(|i| i.to_string()).into_iter().chain(v6.map(|i| i.to_string())) {
+            out.push_str(&format!("{ip}\t{}\n", names(&name, suffix)));
+        }
     }
     out
 }
@@ -117,9 +128,22 @@ mod tests {
     #[test]
     fn further_networks_have_their_own_names() {
         let id = crate::keys::Key32([7; 32]);
-        let out = render(&[("gpu1".into(), Ipv4Addr::new(100, 64, 0, 9), id)], "lab.mesh");
+        let e = |v4, v6| Entry {
+            name: "gpu1".into(),
+            v4,
+            v6,
+            id,
+        };
+        let v4 = Some(Ipv4Addr::new(100, 64, 0, 9));
+        let v6: Option<Ipv6Addr> = Some("fd12:3456:789a::1".parse().unwrap());
+        let out = render(&[e(v4, None)], "lab.mesh");
         assert_eq!(out, "100.64.0.9\tgpu1.lab.mesh gpu1.lab\n");
-        let out = render(&[("gpu1".into(), Ipv4Addr::new(100, 64, 0, 9), id)], "mesh");
+        let out = render(&[e(v4, None)], "mesh");
         assert_eq!(out, "100.64.0.9\tgpu1.mesh gpu1\n");
+        let out = render(&[e(v4, v6)], "mesh");
+        assert_eq!(out, "100.64.0.9\tgpu1.mesh gpu1\nfd12:3456:789a::1\tgpu1.mesh gpu1\n");
+        // Its IPv4 address is another node's here: by name over IPv6 only.
+        let out = render(&[e(None, v6)], "lab.mesh");
+        assert_eq!(out, "fd12:3456:789a::1\tgpu1.lab.mesh gpu1.lab\n");
     }
 }

@@ -742,6 +742,7 @@ mod tests {
             ssh_host_key: None,
             login_user: None,
             exit: false,
+            ipv6: false,
         };
         let c: Vec<String> = Node::peer_candidates(&info).iter().map(|a| a.to_string()).collect();
         assert!(c.contains(&"192.168.10.3:7870".to_string()));

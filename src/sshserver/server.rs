@@ -82,14 +82,26 @@ pub async fn listen(node: Arc<Node>, listener: tokio::net::TcpListener) {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         };
-        // Only the mesh may connect (the address is routable from the LAN in principle).
-        let IpAddr::V4(ip) = peer.ip() else { continue };
+        // Only the mesh may connect (the address is routable from the LAN in principle). Over
+        // IPv6 the node is known by its IPv4 mesh address all the same.
+        let (ip, peer) = match peer.ip() {
+            IpAddr::V4(ip) => (ip, peer),
+            IpAddr::V6(ip6) => match node.mesh_ip_of6(ip6) {
+                Some(ip) => (ip, SocketAddr::from((ip, peer.port()))),
+                None => {
+                    debug!("ssh: refusing a connection from {peer} (not a mesh address)");
+                    continue;
+                }
+            },
+        };
         if !crate::keys::in_overlay(ip) {
             debug!("ssh: refusing a connection from {peer} (not a mesh address)");
             continue;
         }
         let _ = stream.set_nodelay(true);
-        let local = local.unwrap_or(SocketAddr::from((node.my_ip(), 22)));
+        let local = local
+            .filter(|l| l.is_ipv4())
+            .unwrap_or(SocketAddr::from((node.my_ip(), 22)));
         tokio::spawn(serve(node.clone(), stream, peer, local));
     }
 }

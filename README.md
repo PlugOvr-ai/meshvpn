@@ -88,7 +88,8 @@ sudo meshvpn join mesh1-eyJuZXR3b3Jr...
 sudo meshvpn install
 ```
 
-That's it. Every node gets a stable IP in `100.64.0.0/10` and a `<name>.mesh` host name:
+That's it. Every node gets a stable IP in `100.64.0.0/10`, an IPv6 address in its network's own
+private prefix (`fdxx:xxxx:xxxx::/64`), and a `<name>.mesh` host name for both:
 
 ```sh
 $ meshvpn status
@@ -166,7 +167,8 @@ sudo meshvpn exit off            # back to direct
 * In userspace mode, connections through the SOCKS proxy go through the exit.
 * The exit forwards only to public internet addresses - never into its own LAN or to cloud metadata
   addresses. It needs `iptables`; in a container, start it with `--sysctl net.ipv4.ip_forward=1`.
-* DNS keeps using the machine's resolver, and IPv6 isn't carried (the mesh is IPv4).
+* DNS keeps using the machine's resolver, and internet IPv6 isn't carried (only the mesh's own
+  IPv6 addresses are).
 * While the exit node is offline there is no internet (status shows a warning), so nothing leaks
   out directly. The setting survives restarts.
 
@@ -191,11 +193,13 @@ sudo meshvpn networks leave lab   # leave it again; the first network doesn't no
 * `meshvpn install` and `uninstall` take care of all networks of the machine, or the one of `--net`.
   `ssh user@<node>.lab.mesh` works as usual, and so do `meshvpn ssh allow` and the built-in SSH
   server: each network's logins come only from its own nodes.
-* Addresses are from the same range in every network. The first network routes the range as a whole;
-  a further network adds a route per node of its own, so the other nodes of both need nothing new.
-  Addresses are 22 bits of a hash, so the same address can turn up in both networks: about once in
-  400 for two networks of 100 nodes each, and likely for two of a thousand. Then the further
-  network's node wins on this machine, and its log and `meshvpn doctor` name both nodes.
+* IPv6 addresses can't clash: each network has its own prefix. IPv4 addresses are from the same
+  range in every network. The first network routes the range as a whole; a further network adds a
+  route per node of its own, so the other nodes of both need nothing new. IPv4 addresses are 22
+  bits of a hash, so the same one can turn up in both networks: about once in 400 for two networks
+  of 100 nodes each, and likely for two of a thousand. Then the first network's node keeps the
+  address here, and the further network's node is reached over IPv6: its name points there only.
+  (Without IPv6 on the machine, the further network's node wins, and status and the log name both.)
 * Linux only for now, and exit nodes only in the first network. Without root, the networks are
   the user's own, in userspace mode, each with its own SOCKS port (1055, 1056, ...).
 
@@ -503,7 +507,7 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 |---|---|
 | Identity | Each node has an ed25519 key (its node id) and an X25519 key. |
 | Membership | A shared 32-byte network key from the invite. Links use Noise `XXpsk3` with it as the PSK: without the key, the handshake fails. Banning a node changes the key (the key is versioned). |
-| Addresses | `100.64.0.0/10` + 22 bits of `blake3(node id)`. Deterministic, so no allocation server is needed. |
+| Addresses | `100.64.0.0/10` + 22 bits of `blake3(node id)`. Deterministic, so no allocation server is needed. IPv6: `fd00::/8` + 40 bits of a hash of the network id (a /64 for each network) + 64 bits of a hash of the node id. Nodes say in their record whether they have IPv6 (it's off with `ipv6 = false` in the config, where the machine has IPv6 off, and in userspace mode); names point to the IPv6 address only of those that do. Inbound filtering by the extension and anti-spoofing apply to both. |
 | Transport | TCP links (the only thing an SSH tunnel or proxy can carry) for control traffic, and **direct UDP paths** for data wherever possible. Nodes publish their address candidates (LAN, public address as other nodes see it) and keep sending authenticated probes to each other, which opens a path through both NATs (hole punching). Data then goes directly over UDP; if a path stops answering it falls back to TCP or a relay within seconds. IPv6 addresses are candidates too: without NAT on the way, probes from both sides get through stateful firewalls, also where IPv4 hole punching can't (NATs that change the port per destination, typical for mobile networks - `meshvpn status` and `doctor` say which kind of NAT a node is behind). |
 | Discovery | Nodes sign a record (name, endpoints, neighbors, sequence number) and gossip all records they know. A new link gets the full table; changes are flooded. The state is saved to disk, so the mesh survives losing the bootstrap node. |
 | Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers) or the SSH tunnel's public port. |

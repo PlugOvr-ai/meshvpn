@@ -14,6 +14,7 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import ipaddress
 import json
 import os
 import random
@@ -254,6 +255,10 @@ def test_two_networks(lab):
     routes = laptop.sh("ip route show dev mesh1")
     check(ip_b in routes and "100.64.0.0/10" not in routes, f"the further network routes its nodes only: {routes}")
     check("also in: lab" in laptop.mv("status"), "status names the other network")
+    # IPv6: each network its own prefix, so nothing to clash.
+    v6_a, v6_b = laptop.status()["mesh_ip6"], laptop.mvj("--net lab status")["mesh_ip6"]
+    check(v6_a and v6_b and v6_a.split(":")[:3] != v6_b.split(":")[:3], f"IPv6 prefixes of the networks: {v6_a} {v6_b}")
+    check(ping(laptop, "-6 huba.mesh") and ping(laptop, "-6 hubb.lab.mesh"), "both networks over IPv6")
     # Datasets: the laptop serves one in each network, and each hub gets its own.
     for net_flag, hub, tag in (("", hub_a, "first"), ("--net lab ", hub_b, "second")):
         laptop.sh(f"mkdir -p /data/{tag} && head -c 3000000 /dev/urandom > /data/{tag}/blob")
@@ -319,6 +324,48 @@ def test_two_networks_rootless(lab):
     check("network lab" not in cfg and "Host *.mesh" in cfg, f"~/.ssh/config: {cfg}")
     p = box.sh(f"ssh {o} nobody@huba.mesh true", user="agent", ok=False)
     check("Permission denied" in p.stderr, f"the first network after leaving the other: {p.stderr}")
+
+
+@test
+def test_ipv6(lab):
+    """Each node has an IPv6 address in its network's own prefix too: ping and ssh over it, by
+    name; where IPv6 is off the mesh works over IPv4 as before."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    a = lab.node("a", [net])
+    b = lab.node("b", [net])
+    off = lab.node("off", [net], sysctls=["net.ipv6.conf.all.disable_ipv6=1"])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    a.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    for n, extra in ((a, ""), (b, " --ssh-allow-all agent"), (off, "")):
+        n.mv(f"join {invite(hub)} --name {n.name}{extra}")
+        n.up()
+        wait(lambda n=n: hub.online(n.name), f"{n.name} online")
+    ip6 = {n.name: n.status().get("mesh_ip6") for n in (hub, a, b)}
+    check(all(v and v.startswith("fd") for v in ip6.values()), f"IPv6 addresses: {ip6}")
+    prefixes = {str(ipaddress.ip_network(v + "/64", strict=False)) for v in ip6.values()}
+    check(len(prefixes) == 1, f"one prefix for the network: {ip6}")
+    check(f"IPv6:         {ip6['a']}" in a.mv("status"), "status shows the IPv6 address")
+    check(ip6["a"] in a.sh("ip -6 addr show dev mesh0"), "a's address on its interface")
+    wait(lambda: a.online("b"), "a sees b")
+    check(ping(a, f"-6 {ip6['b']}"), "ping over IPv6")
+    check(ping(a, "-6 b.mesh"), "ping over IPv6 by name")
+    hosts = a.sh("cat /etc/hosts")
+    check(f"{ip6['b']}\tb.mesh b" in hosts and f"{b.ip()}\tb.mesh b" in hosts, f"/etc/hosts has both: {hosts}")
+    # ssh over IPv6: sshd's key rules and known_hosts know the address too.
+    wait(lambda: "b.mesh" in a.sh("cat /var/lib/meshvpn/known_hosts 2>/dev/null; true"), "a has b's host key", 60)
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8"
+    p = wait(lambda: (lambda p: p if p.returncode == 0 else None)(
+        a.sh(f"ssh -6 {o} agent@b.mesh 'echo $SSH_CONNECTION'", user="agent", ok=False)), "ssh over IPv6", 60)
+    check(ip6["a"] in p.stdout, f"the connection came over IPv6: {p.stdout}")
+    # No IPv6 on this machine: IPv4 only, and the others still reach it.
+    st = off.status()
+    check(not st.get("mesh_ip6"), f"no IPv6 where it is off: {st.get('mesh_ip6')}")
+    hosts = a.sh("cat /etc/hosts")
+    check(len([l for l in hosts.splitlines() if l.endswith("off.mesh off")]) == 1, f"off by its IPv4 address only: {hosts}")
+    check(not a.peer("off").get("ip6") and a.peer("b").get("ip6") == ip6["b"], "who has IPv6, in status")
+    check(ping(a, "off.mesh") and ping(off, "b.mesh"), "IPv4 with a node without IPv6")
 
 
 @test

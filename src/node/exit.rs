@@ -247,6 +247,13 @@ impl Node {
     /// Is this packet from `src` (already decrypted) allowed in? Its source address must be the
     /// sender's own, except for internet replies relayed by our exit.
     pub(super) fn source_ok(&self, src: &NodeId, pkt: &[u8]) -> bool {
+        if pkt.len() >= 40 && pkt[0] >> 4 == 6 {
+            // IPv6: only between nodes, from the sender's own address.
+            let from: [u8; 16] = pkt[8..24].try_into().unwrap();
+            return self.my_ip6.is_some()
+                && std::net::Ipv6Addr::from(from) == crate::keys::overlay_ip6(&self.net, src)
+                && self.owns_ip6(src);
+        }
         if pkt.len() < 20 || pkt[0] >> 4 != 4 {
             return false;
         }
@@ -261,6 +268,11 @@ impl Node {
     /// May a packet from the mesh go on to its destination here? Ours, or the internet if we
     /// are an exit.
     pub(super) fn may_deliver(&self, pkt: &[u8]) -> bool {
+        if pkt.first().is_some_and(|b| b >> 4 == 6) {
+            let Some(dst) = pkt.get(24..40) else { return false };
+            let dst: [u8; 16] = dst.try_into().unwrap();
+            return self.my_ip6 == Some(std::net::Ipv6Addr::from(dst)) && self.ext_allows(pkt);
+        }
         let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
         if dst == self.my_ip {
             return self.ext_allows(pkt);

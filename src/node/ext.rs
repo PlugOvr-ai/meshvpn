@@ -264,7 +264,12 @@ impl Node {
 
     /// The extension's keys for local `user`, as authorized_keys lines (sshd). A key without
     /// source addresses must come with `restrict` (no shell: e.g. a gateway's jump account).
-    pub(super) fn ext_key_lines(access: &SshAccess, user: &str) -> Vec<String> {
+    /// `v6_of`: the IPv6 address of the node with a mesh IPv4 address.
+    pub(super) fn ext_key_lines(
+        access: &SshAccess,
+        user: &str,
+        v6_of: impl Fn(Ipv4Addr) -> Option<std::net::Ipv6Addr>,
+    ) -> Vec<String> {
         access
             .keys
             .iter()
@@ -274,7 +279,11 @@ impl Node {
             .map(|k| {
                 let mut opts = vec![];
                 if !k.from.is_empty() {
-                    let from: Vec<String> = k.from.iter().map(|ip| ip.to_string()).collect();
+                    let from: Vec<String> = k
+                        .from
+                        .iter()
+                        .flat_map(|ip| std::iter::once(ip.to_string()).chain(v6_of(*ip).map(|v6| v6.to_string())))
+                        .collect();
                     opts.push(format!("from=\"{}\"", from.join(",")));
                 }
                 opts.extend(k.options.iter().cloned());
@@ -302,6 +311,26 @@ impl Node {
     /// Lets the extension filter a packet from the mesh to this node.
     pub(super) fn ext_allows(&self, pkt: &[u8]) -> bool {
         let Some(ext) = Self::ext() else { return true };
+        if pkt.len() >= 40 && pkt[0] >> 4 == 6 {
+            let src: [u8; 16] = pkt[8..24].try_into().unwrap();
+            // IPv6 comes only from nodes (source_ok): one without an address of its own is refused.
+            let Some(from) = self
+                .state
+                .lock()
+                .unwrap()
+                .ip6_map
+                .get(&std::net::Ipv6Addr::from(src))
+                .copied()
+            else {
+                return false;
+            };
+            let (protocol, port) = ipv6_transport(pkt);
+            return ext.allow_inbound(&Inbound {
+                from: &from,
+                protocol,
+                port,
+            });
+        }
         if pkt.len() < 20 {
             return false;
         }
@@ -355,10 +384,59 @@ impl Node {
     }
 }
 
+/// The transport protocol of an IPv6 packet, past its extension headers, and the destination port
+/// for TCP and UDP (None in a later fragment, which has no port).
+pub(crate) fn ipv6_transport(pkt: &[u8]) -> (u8, Option<u16>) {
+    let mut next = pkt[6];
+    let mut at = 40;
+    let mut first = true;
+    // Hop-by-hop, routing, fragment, destination options; at most a few.
+    for _ in 0..8 {
+        match next {
+            0 | 43 | 60 => {
+                let Some(h) = pkt.get(at..at + 2) else { break };
+                next = h[0];
+                at += (h[1] as usize + 1) * 8;
+            }
+            44 => {
+                let Some(h) = pkt.get(at..at + 4) else { break };
+                next = h[0];
+                first = u16::from_be_bytes([h[2], h[3]]) >> 3 == 0;
+                at += 8;
+            }
+            _ => break,
+        }
+    }
+    let port = (first && matches!(next, 6 | 17))
+        .then(|| pkt.get(at + 2..at + 4).map(|p| u16::from_be_bytes([p[0], p[1]])))
+        .flatten();
+    (next, port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ext::AuthorizedKey;
+
+    #[test]
+    fn ipv6_ports_past_extension_headers() {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        p[6] = 6; // TCP
+        p.extend_from_slice(&[0x9c, 0x40, 0, 22]);
+        assert_eq!(ipv6_transport(&p), (6, Some(22)));
+        // Hop-by-hop options (8 bytes), then UDP.
+        let mut q = p[..40].to_vec();
+        q[6] = 0;
+        q.extend_from_slice(&[17, 0, 0, 0, 0, 0, 0, 0, 0x9c, 0x40, 0x1e, 0xbf]);
+        assert_eq!(ipv6_transport(&q), (17, Some(7871)));
+        // A later fragment has no port.
+        let mut f = p[..40].to_vec();
+        f[6] = 44;
+        f.extend_from_slice(&[6, 0, 0x01, 0x00, 0, 0, 0, 1, 0x9c, 0x40, 0, 22]);
+        assert_eq!(ipv6_transport(&f), (6, None));
+        assert_eq!(ipv6_transport(&p[..40]), (6, None));
+    }
 
     #[test]
     fn extension_keys_become_safe_authorized_keys_lines() {
@@ -386,18 +464,18 @@ mod tests {
             only: None,
         };
         assert_eq!(
-            Node::ext_key_lines(&access, "jump"),
+            Node::ext_key_lines(&access, "jump", |_| None),
             vec![format!(
                 "from=\"100.64.0.9\",restrict,port-forwarding,permitopen=\"dev1.mesh:22\" {key} booking_r1\n"
             )]
         );
         assert_eq!(
-            Node::ext_key_lines(&access, "alice"),
+            Node::ext_key_lines(&access, "alice", |_| None),
             vec![format!("from=\"100.64.0.9\" {key} booking_r1\n")]
         );
-        assert!(Node::ext_key_lines(&access, "bob").is_empty());
+        assert!(Node::ext_key_lines(&access, "bob", |_| None).is_empty());
         assert_eq!(
-            Node::ext_key_lines(&access, "guest"),
+            Node::ext_key_lines(&access, "guest", |_| None),
             vec![format!("restrict,port-forwarding {key} booking_r1\n")]
         );
     }
