@@ -286,6 +286,11 @@ canvas.addEventListener("keydown", async e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && navigator.clipboard && navigator.clipboard.readText) {
     try { const t = await navigator.clipboard.readText(); if (t) send(C_CLIPBOARD, enc.encode(t)); } catch (_) {}
   }
+  // AltGr (Windows reports it as Ctrl+Alt): the character alone, without the Ctrl and Alt held
+  // for it - the desktop would see Ctrl+@ instead of @.
+  if (k[1] && e.getModifierState && e.getModifierState("AltGraph")) {
+    for (const [code, pk] of pressed) if (/^(Control|Alt)/.test(code)) { key(false, pk[0], pk[1]); pressed.delete(code); }
+  }
   pressed.set(e.code, k); key(true, k[0], k[1]);
 });
 canvas.addEventListener("keyup", e => {
