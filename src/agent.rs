@@ -632,6 +632,8 @@ pub struct Edge {
     pub mesh_mbps: Option<f32>,
     /// `to`'s address on a LAN both share, verified from `from`.
     pub lan_ip: Option<String>,
+    /// Throughput over that LAN path (straight, as NCCL uses it), Mbit/s.
+    pub lan_mbps: Option<f32>,
     pub age_s: u64,
 }
 
@@ -654,6 +656,7 @@ pub fn matrix(nodes: &[NodeView]) -> Vec<Edge> {
                     rtt_ms: p.rtt_us.map(|u| u as f64 / 1000.0),
                     mesh_mbps: p.mesh_mbps,
                     lan_ip: p.lan_ip.clone(),
+                    lan_mbps: p.lan_mbps,
                     age_s: now_ms().saturating_sub(p.at) / 1000,
                 });
             }
@@ -675,7 +678,8 @@ pub fn measure(dir: &Path, nodes: &[NodeView], mb: u64) -> Result<Vec<NodeView>>
         },
     ))?;
     // Each node measures towards the others one after another.
-    let deadline = Instant::now() + Duration::from_secs(30 + nodes.len() as u64 * (mb / 2 + 10));
+    // Per peer: the mesh test, and a few seconds over a LAN path.
+    let deadline = Instant::now() + Duration::from_secs(30 + nodes.len() as u64 * (mb / 2 + 14));
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let fresh: Vec<NodeView> = select(&self::nodes(&status(dir)?), &ids)?;
@@ -709,17 +713,32 @@ pub fn print_matrix(edges: &[Edge]) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<w$}  {:<w$}  {:>9}  {:>12}  {:<17}  AGE",
-        "FROM", "TO", "RTT", "MESH", "LAN PATH"
+        "{:<w$}  {:<w$}  {:>9}  {:>12}  {:<15}  {:>12}  AGE",
+        "FROM", "TO", "RTT", "MESH", "LAN PATH", "LAN"
     );
     for e in edges {
         let rtt = e.rtt_ms.map(|r| format!("{r:.1} ms")).unwrap_or("-".into());
-        let mbps = e.mesh_mbps.map(|m| format!("{m:.0} Mbit/s")).unwrap_or("-".into());
+        let mbps = e.mesh_mbps.map(rate).unwrap_or("-".into());
         let lan = e.lan_ip.clone().unwrap_or("-".into());
+        let lan_rate = match (&e.lan_ip, e.lan_mbps) {
+            (Some(_), Some(m)) => rate(m),
+            _ => "-".into(),
+        };
         println!(
-            "{:<w$}  {:<w$}  {rtt:>9}  {mbps:>12}  {lan:<17}  {}s",
+            "{:<w$}  {:<w$}  {rtt:>9}  {mbps:>12}  {lan:<15}  {lan_rate:>12}  {}s",
             e.from, e.to, e.age_s
         );
+    }
+}
+
+/// `612 Mbit/s`, `18.3 Gbit/s`.
+fn rate(mbps: f32) -> String {
+    if mbps >= 10_000.0 {
+        format!("{:.0} Gbit/s", mbps / 1000.0)
+    } else if mbps >= 1000.0 {
+        format!("{:.1} Gbit/s", mbps / 1000.0)
+    } else {
+        format!("{mbps:.0} Mbit/s")
     }
 }
 

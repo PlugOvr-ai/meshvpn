@@ -3384,12 +3384,21 @@ impl Node {
                 Some(ip) => Some(ip),
                 None => self.direct_lan(&info),
             };
+            // Several streams, as NCCL uses it: one TCP stream doesn't fill a fast link.
+            let lan_mbps = match lan_ip {
+                Some(ip) if bytes > 0 => crate::share::lan_throughput(&self, ip, 4, 1.5).await,
+                _ => None,
+            };
             let mut st = self.state.lock().unwrap();
             let rtt_us = rtt
                 .or_else(|| st.links.get(&info.id).and_then(|l| l.rtt))
                 .or_else(|| st.udp_paths.get(&info.id).and_then(|p| p.rtt))
                 .map(|d| d.as_micros() as u32);
-            let old_mbps = st.perf.get(&info.id).and_then(|p| p.mesh_mbps);
+            let old = st.perf.get(&info.id);
+            let old_mbps = old.and_then(|p| p.mesh_mbps);
+            let old_lan = old
+                .filter(|p| p.lan_ip == lan_ip.map(|i| i.to_string()))
+                .and_then(|p| p.lan_mbps);
             st.perf.insert(
                 info.id,
                 Perf {
@@ -3397,6 +3406,7 @@ impl Node {
                     rtt_us,
                     mesh_mbps: mbps.or(old_mbps),
                     lan_ip: lan_ip.map(|i| i.to_string()),
+                    lan_mbps: lan_mbps.or(old_lan),
                     at: now_ms(),
                 },
             );

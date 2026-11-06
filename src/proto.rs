@@ -270,6 +270,9 @@ pub struct Perf {
     /// `peer`'s address on a LAN both share, verified reachable from here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_ip: Option<String>,
+    /// Measured throughput over that LAN path (straight, not through the mesh), Mbit/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_mbps: Option<f32>,
     /// When it was measured (ms since epoch).
     pub at: u64,
 }

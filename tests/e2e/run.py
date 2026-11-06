@@ -1127,6 +1127,12 @@ def test_net_env(lab):
     pair = lambda a, b: next((e for e in edges if e["from"] == a and e["to"] == b), None)  # noqa: E731
     check(pair("g1", "g2") and pair("g1", "g2")["lan_ip"], f"g1-g2 share a LAN: {pair('g1', 'g2')}")
     check(not (pair("g1", "g3") or {}).get("lan_ip"), "g1-g3 share no LAN")
+    # The LAN path's own speed (straight, as NCCL uses it): far above the mesh's in a container network.
+    e = pair("g1", "g2")
+    check((e.get("lan_mbps") or 0) > 1000 and e["lan_mbps"] > (e["mesh_mbps"] or 0), f"LAN path throughput: {e}")
+    check(not (pair("g1", "g3") or {}).get("lan_mbps"), "no LAN throughput without a LAN path")
+    table = ctl.mv("net matrix")
+    check("LAN PATH" in table and "Gbit/s" in table, f"matrix shows LAN throughput: {table}")
     # Throughput for every pair, also those talking only over UDP or through a relay (g1-g3).
     for x, y in (("g1", "g2"), ("g2", "g1"), ("g1", "g3"), ("g3", "g1")):
         e = pair(x, y)
@@ -1159,6 +1165,7 @@ def test_routed_lan(lab):
     edges = p1.mvj("net matrix --measure --mb 2", timeout=120)
     e = next((e for e in edges if e["from"] == "p1" and e["to"] == "p2"), None)
     check(e and e["lan_ip"] == p2_ip, f"routed path counts as LAN path: {e}")
+    check((e.get("lan_mbps") or 0) > 100, f"routed LAN path throughput: {e}")
     env = p1.mvj("net env --master p1 p1 p2")
     check(env["NCCL_SOCKET_IFNAME"] == "eth0", f"NCCL over the routed path: {env}")
 

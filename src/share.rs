@@ -288,8 +288,16 @@ fn auth_tag(key: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Req {
-    Manifest { id: String },
-    Chunk { id: String, file: usize, index: usize },
+    Manifest {
+        id: String,
+    },
+    Chunk {
+        id: String,
+        file: usize,
+        index: usize,
+    },
+    /// Throughput test: data follows until the sender closes; the answer is how much arrived.
+    Sink,
 }
 
 fn listen(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -335,6 +343,19 @@ async fn serve_conn(node: &Node, mut s: TcpStream) -> Result<()> {
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
         let data: Option<Vec<u8>> = match serde_json::from_str::<Req>(&line)? {
+            Req::Sink => {
+                let mut r = lines.into_inner();
+                let mut buf = vec![0u8; 1 << 20];
+                let mut got = 0u64;
+                loop {
+                    match r.read(&mut buf).await? {
+                        0 => break,
+                        n => got += n as u64,
+                    }
+                }
+                w.write_all(&got.to_be_bytes()).await?;
+                return Ok(());
+            }
             Req::Manifest { id } => node.shares.get(&id).map(|s| serde_json::to_vec(&s.manifest).unwrap()),
             Req::Chunk { id, file, index } => match node.shares.get(&id) {
                 Some(s) if file < s.manifest.files.len() && index < s.manifest.files[file].chunks.len() => {
@@ -416,6 +437,57 @@ async fn request(c: &mut Conn, req: &Req) -> Result<Option<Vec<u8>>> {
     let mut buf = vec![0u8; len as usize];
     c.lines.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+/// Throughput over a LAN path, Mbit/s: `streams` connections straight to `ip` (not through the
+/// mesh, as NCCL and fetch use it), sending for `secs` seconds.
+pub async fn lan_throughput(node: &Node, ip: Ipv4Addr, streams: usize, secs: f64) -> Option<f32> {
+    let key = node.network_keys().into_iter().next()?;
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..streams {
+        set.spawn(sink_stream(ip, key, secs));
+    }
+    let mut ok: Vec<(u64, f64)> = vec![];
+    while let Some(r) = set.join_next().await {
+        ok.extend(r.ok().flatten());
+    }
+    if ok.is_empty() {
+        return None;
+    }
+    let bytes: u64 = ok.iter().map(|r| r.0).sum();
+    let secs = ok.iter().map(|r| r.1).fold(0.0, f64::max);
+    Some((bytes as f64 * 8.0 / secs / 1e6) as f32)
+}
+
+/// One connection of `lan_throughput`: (bytes the other side got, seconds).
+async fn sink_stream(ip: Ipv4Addr, key: [u8; 32], secs: f64) -> Option<(u64, f64)> {
+    {
+        let s = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(SocketAddr::from((ip, PORT))))
+            .await
+            .ok()?
+            .ok()?;
+        let (r, mut w) = s.into_split();
+        let mut r = BufReader::new(r);
+        let mut nonce = [0u8; 32];
+        tokio::time::timeout(Duration::from_secs(2), r.read_exact(&mut nonce))
+            .await
+            .ok()?
+            .ok()?;
+        w.write_all(&auth_tag(&key, &nonce)).await.ok()?;
+        w.write_all(b"\"sink\"\n").await.ok()?;
+        let buf = vec![0u8; 1 << 20];
+        let start = Instant::now();
+        while start.elapsed().as_secs_f64() < secs {
+            w.write_all(&buf).await.ok()?;
+        }
+        w.shutdown().await.ok()?;
+        // Older nodes don't know the test: they just close.
+        let got = tokio::time::timeout(Duration::from_secs(10), r.read_u64())
+            .await
+            .ok()?
+            .ok()?;
+        Some((got, start.elapsed().as_secs_f64()))
+    }
 }
 
 #[derive(Serialize, Default, Clone)]
