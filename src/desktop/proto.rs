@@ -3,7 +3,8 @@
 
 // session -> browser
 pub const S_INIT: u8 = 1; // w u16, h u16
-pub const S_TILE: u8 = 2; // x u16, y u16, w u16, h u16, format u8 (1 png, 2 jpeg), image
+pub const S_TILE: u8 = 2; // x u16, y u16, w u16, h u16, format u8 (1 png, 2 jpeg, 3 raw BGRX rows), image
+pub const TILE_RAW: u8 = 3; // only to the viewer at the desk (C_LOCAL)
 pub const S_FRAME_END: u8 = 3; // the browser answers C_ACK once it has drawn the frame
 pub const S_WINDOWS: u8 = 4; // JSON [{id, title, active}]
 pub const S_CLIPBOARD: u8 = 5; // UTF-8 text copied in the session
@@ -13,6 +14,7 @@ pub const S_NOTICE: u8 = 8; // UTF-8 text to show
 pub const S_FILES: u8 = 9; // JSON {path, parent, entries: [{name, dir, size, mtime, link}], error}
 pub const S_FILE_DATA: u8 = 10; // id u32, offset u64, total u64, bytes (a file being read)
 pub const S_FILE_DONE: u8 = 11; // JSON {id, ok, error}: end of a read error, upload or file operation
+pub const S_VIDEO: u8 = 13; // kind u8 (0 avcC setup, 1 key frame, 2 frame), w u16, h u16, H.264 (AVCC); C_ACK per decoded frame
 pub const S_MONITORS: u8 = 12; // JSON {monitors: [{name, primary, x, y, w, h}], view: index or null (all)}
 
 // browser -> session
@@ -31,6 +33,9 @@ pub const C_FILE_READ: u8 = 112; // id u32, UTF-8 path
 pub const C_FILE_WRITE: u8 = 113; // id u32, offset u64, total u64, path length u16, path, bytes
 pub const C_FILE_OP: u8 = 114; // JSON {id, op: mkdir|delete|rename, path, to}
 pub const C_MONITOR: u8 = 115; // index u8 (255: all monitors), --screen only
+pub const C_CAPS: u8 = 118; // JSON {video: ["h264"]}: what this browser can decode
+pub const C_LOCAL: u8 = 116; // this viewer is on the machine's own screen: raw tiles, its size wins
+pub const C_RAWKEY: u8 = 117; // down u8, X key code u8 (the desk's keyboard layout is copied over)
 pub const C_STOP: u8 = 120; // end the session (closes all apps)
 
 pub const MAX_MESSAGE: usize = 32 << 20;

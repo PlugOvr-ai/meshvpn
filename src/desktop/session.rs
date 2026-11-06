@@ -61,13 +61,16 @@ x11rb::atom_manager! {
 // ---------------------------------------------------------------------------------------------
 // Files of a user's session
 
-/// `$XDG_RUNTIME_DIR/meshvpn-desktop`, else `/tmp/meshvpn-desktop-<uid>` (0700, ours).
+/// `/tmp/meshvpn-desktop-<uid>` (0700, ours). Not `$XDG_RUNTIME_DIR`: logind removes that when
+/// the user's last login ends (leaving the desk, an SSH connection closing), and the session
+/// outlives them. A session started there before still is found there.
 pub fn runtime_dir() -> Result<PathBuf> {
     let uid = unsafe { libc::geteuid() };
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-        Some(r) if Path::new(&r).is_dir() => PathBuf::from(r).join("meshvpn-desktop"),
-        _ => PathBuf::from(format!("/tmp/meshvpn-desktop-{uid}")),
-    };
+    let legacy = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(|r| PathBuf::from(r).join("meshvpn-desktop"))
+        .filter(|d| std::os::unix::net::UnixStream::connect(socket_path(d)).is_ok());
+    let dir = legacy.unwrap_or_else(|| PathBuf::from(format!("/tmp/meshvpn-desktop-{uid}")));
     match std::fs::create_dir(&dir) {
         Ok(()) => std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -153,6 +156,8 @@ fn write_fonts_conf(path: &Path, bundle: &Bundle, cache: &Path) -> Result<()> {
 pub enum Mode {
     Plain,
     Xfce,
+    Mate,
+    Cinnamon,
     /// The screen of the machine itself: the desktop someone is logged in to there (X11).
     Screen,
 }
@@ -162,9 +167,83 @@ impl Mode {
         match self {
             Mode::Plain => "plain",
             Mode::Xfce => "xfce",
+            Mode::Mate => "mate",
+            Mode::Cinnamon => "cinnamon",
             Mode::Screen => "screen",
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Plain => "the built-in desktop",
+            Mode::Xfce => "Xfce",
+            Mode::Mate => "MATE",
+            Mode::Cinnamon => "Cinnamon",
+            Mode::Screen => "the machine's screen",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Mode> {
+        [Mode::Plain, Mode::Xfce, Mode::Mate, Mode::Cinnamon, Mode::Screen]
+            .into_iter()
+            .find(|m| m.name() == name)
+    }
+
+    /// Its programs are there (Cinnamon also needs an X server with OpenGL: the system's Xvfb).
+    fn installed(self) -> bool {
+        match self {
+            Mode::Xfce => has_xfce(),
+            Mode::Mate => which("mate-session"),
+            Mode::Cinnamon => which("cinnamon-session") && system_xvfb().is_some(),
+            Mode::Plain | Mode::Screen => true,
+        }
+    }
+
+    /// The variables a session of this desktop has (a display manager would set them): its
+    /// window manager wants to know it's X11, its programs which desktop they are in.
+    fn environment(self) -> Vec<(&'static str, &'static str)> {
+        let (current, session) = match self {
+            Mode::Xfce => ("XFCE", "xfce"),
+            Mode::Mate => ("MATE", "mate"),
+            Mode::Cinnamon => ("X-Cinnamon", "cinnamon"),
+            Mode::Plain | Mode::Screen => return vec![("XDG_SESSION_TYPE", "x11")],
+        };
+        vec![
+            ("XDG_SESSION_TYPE", "x11"),
+            ("XDG_CURRENT_DESKTOP", current),
+            ("XDG_SESSION_DESKTOP", session),
+            ("DESKTOP_SESSION", session),
+        ]
+    }
+
+    /// The command line starting it, with its own D-Bus if available (settings and panels want one).
+    fn start_line(self) -> Option<String> {
+        let cmd = match self {
+            Mode::Xfce => "xfce4-session",
+            Mode::Mate => "mate-session",
+            // Software rendering: the X server's OpenGL is Mesa's, on the CPU.
+            Mode::Cinnamon if which("cinnamon-session-cinnamon2d") => "cinnamon-session-cinnamon2d",
+            Mode::Cinnamon => "cinnamon-session --session cinnamon2d",
+            Mode::Plain | Mode::Screen => return None,
+        };
+        Some(if which("dbus-launch") {
+            format!("exec dbus-launch --exit-with-session {cmd}")
+        } else {
+            format!("exec {cmd}")
+        })
+    }
+}
+
+/// The desktops meshvpn can run, in the order "auto" tries them (after the one chosen with
+/// `meshvpn desktop setup --desktop`).
+pub const DESKTOPS: [&str; 3] = ["xfce", "mate", "cinnamon"];
+
+/// The system's Xvfb (with OpenGL through Mesa), unlike the bundled one.
+pub fn system_xvfb() -> Option<PathBuf> {
+    ["/usr/bin/Xvfb", "/usr/local/bin/Xvfb"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
 }
 
 /// Xfce is installed (its session manager is in PATH).
@@ -174,49 +253,62 @@ pub fn has_xfce() -> bool {
         .unwrap_or(false)
 }
 
-/// "auto" (Xfce if installed), "xfce" or "plain".
+/// "auto" (the machine's chosen desktop, else the first installed of `DESKTOPS`, else the
+/// built-in one), or a desktop by name.
 pub fn resolve_mode(want: &str) -> Result<Mode> {
-    match want {
-        "plain" => Ok(Mode::Plain),
-        "screen" => Ok(Mode::Screen),
-        "xfce" if has_xfce() => Ok(Mode::Xfce),
-        "xfce" => bail!(
-            "Xfce is not installed on this machine - install it with `sudo meshvpn desktop setup --xfce` there, \
-             or use the built-in desktop (--plain)"
-        ),
-        _ if has_xfce() => Ok(Mode::Xfce),
-        _ => Ok(Mode::Plain),
+    if let Some(m) = Mode::from_name(want) {
+        if m.installed() {
+            return Ok(m);
+        }
+        bail!(
+            "{} is not installed on this machine - install it with `sudo meshvpn desktop setup --desktop {}` \
+             there, or use the built-in desktop (--plain)",
+            m.label(),
+            m.name()
+        );
     }
-}
-
-/// A desktop installed without root is in ~/.local/bin, which a login or a daemon often doesn't
-/// have in its PATH. Called first thing in `attach`: nothing else runs yet, and the session and
-/// its programs inherit this.
-fn find_user_desktop() {
-    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
-        return;
-    };
-    let bin = PathBuf::from(home).join(".local/bin");
-    if has_xfce() || !bin.join("xfce4-session").is_file() {
-        return;
-    }
-    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    paths.push(bin);
-    if let Ok(path) = std::env::join_paths(paths) {
-        // Safety: see above, there are no other threads yet.
-        unsafe { std::env::set_var("PATH", path) };
-    }
+    let chosen = std::fs::read_to_string(bundle::DEFAULT_FILE).unwrap_or_default();
+    Ok(std::iter::once(chosen.trim())
+        .chain(DESKTOPS)
+        .filter_map(Mode::from_name)
+        .find(|m| *m != Mode::Plain && *m != Mode::Screen && m.installed())
+        .unwrap_or(Mode::Plain))
 }
 
 pub fn attach(want: &str) -> Result<()> {
-    find_user_desktop();
     let notice = |text: &str| {
         let mut out = std::io::stdout();
         let _ = out.write_all(&frame(S_NOTICE, text.as_bytes()));
         let _ = out.flush();
     };
+    let stream = connect(want, &notice)?;
+    // Plain copies both ways; the session speaks the protocol.
+    let mut to_session = stream.try_clone()?;
+    let mut from_session = stream;
+    let up = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let _ = std::io::copy(&mut stdin, &mut to_session);
+        let _ = to_session.shutdown(std::net::Shutdown::Write);
+    });
+    let mut stdout = std::io::stdout().lock();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        match from_session.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    drop(up);
+    Ok(())
+}
+
+/// The user's session of kind `want`, started if it isn't running. `notice` tells the user
+/// what happens (and why not).
+pub fn connect(want: &str, notice: &dyn Fn(&str)) -> Result<std::os::unix::net::UnixStream> {
     let dir = match session_dir(want) {
         Ok(d) => d,
         Err(e) => {
@@ -231,21 +323,16 @@ pub fn attach(want: &str) -> Result<()> {
             // was installed after the session started). Sessions before 0.13 were all plain.
             let running = std::fs::read_to_string(dir.join("mode")).unwrap_or_else(|_| "plain".into());
             let running = running.trim();
-            let explicit = (want == "xfce" || want == "plain") && running != want;
-            if want != "screen" && (explicit || (want == "auto" && running != "xfce" && has_xfce())) {
-                let other = if running == "xfce" {
-                    "the built-in desktop"
-                } else {
-                    "Xfce"
-                };
+            let running = Mode::from_name(running).unwrap_or(Mode::Plain);
+            let wanted = resolve_mode(want).ok();
+            if want != "screen"
+                && let Some(other) = wanted.filter(|w| *w != running)
+            {
                 notice(&format!(
-                    "This desktop session was started with {} and keeps it. To get {other}: End session (⏻, closes \
+                    "This desktop session was started with {} and keeps it. To get {}: End session (⏻, closes \
                      its applications), then reconnect.",
-                    if running == "xfce" {
-                        "Xfce"
-                    } else {
-                        "the built-in desktop"
-                    }
+                    running.label(),
+                    other.label()
                 ));
             }
             s
@@ -296,28 +383,7 @@ pub fn attach(want: &str) -> Result<()> {
             }
         }
     };
-    // Plain copies both ways; the session speaks the protocol.
-    let mut to_session = stream.try_clone()?;
-    let mut from_session = stream;
-    let up = std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let _ = std::io::copy(&mut stdin, &mut to_session);
-        let _ = to_session.shutdown(std::net::Shutdown::Write);
-    });
-    let mut stdout = std::io::stdout().lock();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match from_session.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if stdout.write_all(&buf[..n]).and_then(|_| stdout.flush()).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    drop(up);
-    Ok(())
+    Ok(stream)
 }
 
 fn start_detached(dir: &Path, mode: Mode) -> Result<()> {
@@ -328,8 +394,34 @@ fn start_detached(dir: &Path, mode: Mode) -> Result<()> {
         .append(true)
         .open(dir.join("session.log"))?;
     let mut c = std::process::Command::new(exe);
-    c.args(["desktop", "session", "--session", mode.name()])
-        .stdin(std::process::Stdio::null())
+    c.args(["desktop", "session", "--session", mode.name()]);
+    if mode != Mode::Screen {
+        // A desktop of its own outlives the login that started it (the desk, an SSH
+        // connection): not that login's session, bus or runtime directory (logind removes it).
+        for v in [
+            "XDG_SESSION_ID",
+            "XDG_SESSION_TYPE",
+            "XDG_SESSION_CLASS",
+            "XDG_SESSION_DESKTOP",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SEAT",
+            "XDG_VTNR",
+            "XDG_SEAT_PATH",
+            "XDG_SESSION_PATH",
+            "DESKTOP_SESSION",
+            "GDMSESSION",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SESSION_MANAGER",
+        ] {
+            c.env_remove(v);
+        }
+        let run = dir.join("run");
+        if std::fs::create_dir(&run).is_ok() {
+            std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
+        }
+        c.env("XDG_RUNTIME_DIR", &run);
+    }
+    c.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     unsafe {
@@ -380,8 +472,19 @@ pub fn run(want: &str) -> Result<()> {
     let font_cache = dir.join("fontcache");
     write_fonts_conf(&fonts_conf, &bundle, &font_cache)?;
 
-    let (mut xvfb, dpy) = start_xvfb(&bundle, &xauth)?;
+    // VirtualGL needs an X server with GLX, as Cinnamon does: then the system's Xvfb.
+    let mut gpu = gl_on_gpu();
+    let system = (mode == Mode::Cinnamon || !gpu.is_empty()).then(system_xvfb).flatten();
+    if !gpu.is_empty() && system.is_none() {
+        warn!(
+            "3D: VirtualGL needs the system's Xvfb (install it, or `meshvpn desktop setup --gpu`) - OpenGL on the CPU"
+        );
+        gpu.clear();
+    }
+    let (mut xvfb, dpy) = start_xvfb(&bundle, &xauth, system.as_deref())?;
     info!("Xvfb running as display :{dpy}");
+    // For the viewer at the desk (it copies the keyboard layout there to here).
+    std::fs::write(dir.join("display"), format!(":{dpy}"))?;
     let path = format!("/tmp/.X11-unix/X{dpy}");
     let unix = std::os::unix::net::UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
     let (stream, _) = DefaultStream::from_unix_stream(unix)?;
@@ -396,6 +499,8 @@ pub fn run(want: &str) -> Result<()> {
         dir: dir.clone(),
         proxy: login_proxy(),
         chrome_home: browser_home(),
+        desktop: mode.environment(),
+        gpu,
     };
     if let Some(h) = &env.chrome_home {
         info!("Chrome runs with its own profile here: {}", h.display());
@@ -407,16 +512,16 @@ pub fn run(want: &str) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let mut desk = Desk::new(conn, env, mode)?;
     std::fs::write(dir.join("mode"), mode.name())?;
-    if mode == Mode::Xfce {
-        prepare_xfce();
-        // With D-Bus if available (Xfce's settings and panel want a session bus).
-        let line = if which("dbus-launch") {
-            "exec dbus-launch --exit-with-session xfce4-session"
-        } else {
-            "exec xfce4-session"
-        };
-        desk.session = Some(desk.spawn(line).context("starting Xfce")?);
-        info!("Xfce started");
+    if let Some(line) = mode.start_line() {
+        if mode == Mode::Xfce {
+            prepare_xfce();
+        }
+        no_screen_lock(&dir);
+        desk.session = Some(
+            desk.spawn(&line)
+                .with_context(|| format!("starting {}", mode.label()))?,
+        );
+        info!("{} started", mode.label());
     }
 
     let result = serve(&mut desk, &sock, cmd_tx, cmd_rx);
@@ -476,6 +581,8 @@ fn run_screen(dir: &Path, sock: &Path) -> Result<()> {
         dir: dir.to_path_buf(),
         proxy: vec![],
         chrome_home: None,
+        desktop: vec![],
+        gpu: vec![],
     };
     std::fs::write(dir.join("mode"), Mode::Screen.name())?;
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -694,6 +801,92 @@ fn which(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// VirtualGL for the whole session, as TurboVNC does it: every program's OpenGL renders on a GPU
+/// (EGL, no X server on it needed) and the finished picture goes into the session's X server.
+/// The GPU: MESHVPN_DESKTOP_GPU (a /dev/dri/card* device, "egl" for EGL's own choice, or "off"),
+/// else the first GPU this user may use (its device is accessible: with bookings, the booked
+/// one). Nothing without VirtualGL (`meshvpn desktop setup --gpu`).
+fn gl_on_gpu() -> Vec<(String, String)> {
+    let want = std::env::var("MESHVPN_DESKTOP_GPU").unwrap_or_default();
+    if want == "off" {
+        return vec![];
+    }
+    let Some(lib) = ["/usr/lib", "/usr/lib64", "/opt/VirtualGL/lib", "/opt/VirtualGL/lib64"]
+        .into_iter()
+        .map(Path::new)
+        .find(|d| d.join("libvglfaker.so").is_file() && d.join("libdlfaker.so").is_file())
+    else {
+        return vec![];
+    };
+    let device = if !want.is_empty() {
+        Some(want)
+    } else {
+        let mut cards: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        cards.sort();
+        cards
+            .into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("card")))
+            .find(|p| {
+                let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                // A real GPU (not a firmware framebuffer), and ours to use.
+                let driver = std::fs::read_link(format!("/sys/class/drm/{name}/device/driver"))
+                    .ok()
+                    .and_then(|d| d.file_name().map(|f| f.to_string_lossy().into_owned()))
+                    .unwrap_or_default();
+                let ok = ["nvidia", "amdgpu", "radeon", "i915", "xe", "nouveau"].contains(&driver.as_str());
+                let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap_or_default();
+                ok && unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) } == 0
+            })
+            .map(|p| p.display().to_string())
+    };
+    let Some(device) = device else {
+        info!("3D: VirtualGL is installed, but no GPU here is this user's to use - OpenGL on the CPU");
+        return vec![];
+    };
+    info!("3D: VirtualGL on {device}");
+    let mut preload = format!(
+        "{}:{}",
+        lib.join("libdlfaker.so").display(),
+        lib.join("libvglfaker.so").display()
+    );
+    if let Ok(p) = std::env::var("LD_PRELOAD")
+        && !p.is_empty()
+    {
+        preload = format!("{p}:{preload}");
+    }
+    vec![
+        ("LD_PRELOAD".into(), preload),
+        ("VGL_DISPLAY".into(), device),
+        // A whole desktop runs under it (window manager, compositor).
+        ("VGL_WM".into(), "1".into()),
+    ]
+}
+
+/// No screen locker in this session: it would lock a desktop that only a browser shows, and
+/// accounts that log in with keys often have no password to unlock it with. (Cinnamon starts
+/// its own over D-Bus: that one stays.) Per session: the
+/// autostart entries are hidden through a directory of its own first in XDG_CONFIG_DIRS (the
+/// user's desktop at the machine keeps its locker).
+fn no_screen_lock(dir: &Path) {
+    let auto = dir.join("xdg/autostart");
+    let _ = std::fs::create_dir_all(&auto);
+    for name in [
+        "mate-screensaver",
+        "xfce4-screensaver",
+        "xscreensaver",
+        "light-locker",
+        "gnome-screensaver",
+        "cinnamon-screensaver",
+    ] {
+        let _ = std::fs::write(
+            auto.join(format!("{name}.desktop")),
+            format!("[Desktop Entry]\nType=Application\nName={name}\nExec={name}\nHidden=true\n"),
+        );
+    }
+}
+
 /// First start of Xfce for this user: the default panel without asking, no compositing
 /// (it only costs CPU on a virtual screen). Existing settings are left alone.
 fn prepare_xfce() {
@@ -719,22 +912,28 @@ fn prepare_xfce() {
     }
 }
 
-fn start_xvfb(bundle: &Bundle, xauth: &Path) -> Result<(std::process::Child, u32)> {
+/// The bundled Xvfb, or `system`'s (the system's own, with OpenGL through Mesa).
+fn start_xvfb(bundle: &Bundle, xauth: &Path, system: Option<&Path>) -> Result<(std::process::Child, u32)> {
     use std::os::unix::process::CommandExt;
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         bail!("pipe: {}", std::io::Error::last_os_error());
     }
     let (rfd, wfd) = (fds[0], fds[1]);
-    let mut c = std::process::Command::new(bundle.xvfb());
+    let mut c = std::process::Command::new(system.map(Path::to_path_buf).unwrap_or_else(|| bundle.xvfb()));
     c.args(["-displayfd", "3", "-auth"])
         .arg(xauth)
         .args(["-nolisten", "tcp", "-screen", "0"])
         .arg(format!("{MAX_W}x{MAX_H}x24"))
-        .args(["-fp", "built-ins", "-dpi", "96", "+extension", "RANDR", "-xkbdir"])
-        .arg(bundle.xkb_dir())
-        .env("MESHVPN_XKB_BIN", bundle.bin_dir())
-        .stdin(std::process::Stdio::null());
+        .args(["-dpi", "96", "+extension", "RANDR"]);
+    if system.is_some() {
+        c.args(["+extension", "GLX"]);
+    } else {
+        c.args(["-fp", "built-ins", "-xkbdir"])
+            .arg(bundle.xkb_dir())
+            .env("MESHVPN_XKB_BIN", bundle.bin_dir());
+    }
+    c.stdin(std::process::Stdio::null());
     unsafe {
         c.pre_exec(move || {
             if libc::dup2(wfd, 3) < 0 {
@@ -783,6 +982,10 @@ struct AppEnv {
     proxy: Vec<(String, String)>,
     /// Chrome's own profile for this desktop (see `browser_home`).
     chrome_home: Option<PathBuf>,
+    /// What the desktop's programs check to know where they are (XDG_SESSION_TYPE and co.).
+    desktop: Vec<(&'static str, &'static str)>,
+    /// VirtualGL: OpenGL of every program on the GPU (see `gl_on_gpu`).
+    gpu: Vec<(String, String)>,
 }
 
 /// Chrome and Chromium hand a start over to a browser of the same profile that already runs on
@@ -880,6 +1083,11 @@ struct Client {
     id: u64,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     inflight: u32,
+    /// The viewer on this machine's own screen (`meshvpn desktop local`): raw pixels, its
+    /// keyboard's key codes, and its screen size wins.
+    local: bool,
+    /// Gets the H.264 stream instead of tiles (it said it can decode it, and there's an encoder).
+    video: bool,
 }
 
 struct Managed {
@@ -939,6 +1147,11 @@ struct Desk {
     /// --screen: the monitors of that screen, and the one shown (`None`: all of them).
     monitors: Vec<Monitor>,
     view: Option<usize>,
+    /// H.264: the encoder this machine has (None: not looked yet), and the running one.
+    video_kind: Option<Option<super::video::Kind>>,
+    encoder: Option<super::video::Encoder>,
+    /// Monitors set up like the desk's while someone sits there.
+    desk_monitors: Vec<Atom>,
     /// Where the part shown starts on the X screen.
     ox: u16,
     oy: u16,
@@ -1086,6 +1299,9 @@ impl Desk {
             session: None,
             screen: shared,
             monitors: vec![],
+            desk_monitors: vec![],
+            video_kind: None,
+            encoder: None,
             view: None,
             ox: 0,
             oy: 0,
@@ -1101,6 +1317,7 @@ impl Desk {
 
     fn run(&mut self, rx: mpsc::Receiver<Cmd>) -> Result<()> {
         let mut last_reap = Instant::now();
+        let mut last_touch = Instant::now();
         while !self.stop {
             let mut busy = false;
             loop {
@@ -1117,6 +1334,9 @@ impl Desk {
                 busy = true;
                 self.event(ev);
             }
+            if self.video_out() {
+                busy = true;
+            }
             if self.dirty
                 && !self.clients.is_empty()
                 && self.last_frame.elapsed() >= FRAME_INTERVAL
@@ -1126,6 +1346,15 @@ impl Desk {
                 self.send_frame();
             }
             self.conn.flush()?;
+            if last_touch.elapsed() > Duration::from_secs(3600) {
+                // Cleaners of /tmp (systemd-tmpfiles) remove what hasn't changed in days.
+                for f in [self.env.dir.clone(), socket_path(&self.env.dir)] {
+                    if let Ok(c) = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()) {
+                        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), std::ptr::null(), 0) };
+                    }
+                }
+                last_touch = Instant::now();
+            }
             if last_reap.elapsed() > Duration::from_secs(2) {
                 self.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
                 if let Some(s) = &mut self.session
@@ -1195,7 +1424,13 @@ impl Desk {
                     // Monitors plugged in or arranged since.
                     self.load_monitors();
                 }
-                let c = Client { id, tx, inflight: 0 };
+                let c = Client {
+                    id,
+                    tx,
+                    inflight: 0,
+                    local: false,
+                    video: false,
+                };
                 let mut hello = frame(S_INIT, &[self.w.to_le_bytes(), self.h.to_le_bytes()].concat());
                 hello.extend(self.windows_msg());
                 // Apps installed since the session started show up too.
@@ -1214,7 +1449,17 @@ impl Desk {
                 self.dirty = true;
             }
             Cmd::Leave(id) => {
+                let was_local = self.is_local(id);
                 self.clients.retain(|c| c.id != id);
+                if !self.clients.iter().any(|c| c.video) {
+                    self.encoder = None;
+                }
+                if was_local && !self.clients.iter().any(|c| c.local) {
+                    let _ = self.set_desk_monitors(&[]);
+                    let _ = self.conn.change_keyboard_control(
+                        &ChangeKeyboardControlAux::new().auto_repeat_mode(AutoRepeatMode::DEFAULT),
+                    );
+                }
                 if self.screen && self.clients.is_empty() {
                     self.tell_screen("Your screen is no longer shared.");
                     self.stop = true;
@@ -1240,7 +1485,77 @@ impl Desk {
                 self.full = true;
                 self.dirty = true;
             }
+            // At the desk, the desk's screen size wins.
+            C_RESIZE if !self.is_local(from) && self.clients.iter().any(|c| c.local) => {
+                let init = frame(S_INIT, &[self.w.to_le_bytes(), self.h.to_le_bytes()].concat());
+                self.send_to(from, init);
+            }
             C_RESIZE => self.resize(u16_at(p, 0), u16_at(p, 2)),
+            C_CAPS => {
+                let caps: serde_json::Value = serde_json::from_slice(p).unwrap_or_default();
+                let wants = caps["video"].as_array().is_some_and(|a| a.iter().any(|v| v == "h264"));
+                if wants && self.video_kind.is_none() {
+                    // Once per session: which encoder this machine has.
+                    let k = super::video::pick();
+                    info!(
+                        "video: {}",
+                        k.as_ref()
+                            .map(|k| k.name())
+                            .unwrap_or("no hardware encoder - picture tiles".into())
+                    );
+                    self.video_kind = Some(k);
+                }
+                let on = wants && matches!(self.video_kind, Some(Some(_)));
+                if let Some(c) = self.clients.iter_mut().find(|c| c.id == from) {
+                    c.video = on;
+                    c.inflight = 0;
+                }
+                if on {
+                    // A new decoder starts with a key frame: a new stream for all.
+                    self.encoder = None;
+                }
+                self.full = true;
+                self.dirty = true;
+            }
+            C_LOCAL => {
+                if let Some(c) = self.clients.iter_mut().find(|c| c.id == from) {
+                    c.local = true;
+                }
+                // The desk's keyboard repeats keys itself.
+                self.conn
+                    .change_keyboard_control(&ChangeKeyboardControlAux::new().auto_repeat_mode(AutoRepeatMode::OFF))?;
+                // And its monitors are this screen's.
+                let list: Vec<(i16, i16, u16, u16, bool)> = serde_json::from_slice::<serde_json::Value>(p)
+                    .ok()
+                    .and_then(|v| {
+                        v["monitors"].as_array().map(|a| {
+                            a.iter()
+                                .filter_map(|m| {
+                                    Some((
+                                        m["x"].as_i64()? as i16,
+                                        m["y"].as_i64()? as i16,
+                                        m["w"].as_u64()? as u16,
+                                        m["h"].as_u64()? as u16,
+                                        m["primary"].as_bool().unwrap_or(false),
+                                    ))
+                                })
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default();
+                if let Err(e) = self.set_desk_monitors(&list) {
+                    warn!("the desk's monitors: {e:#}");
+                }
+                self.full = true;
+                self.dirty = true;
+            }
+            C_RAWKEY => {
+                let (down, kc) = (p.first().copied().unwrap_or(0) == 1, p.get(1).copied().unwrap_or(0));
+                if kc >= 8 {
+                    let kind = if down { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT };
+                    self.conn.xtest_fake_input(kind, kc, 0, self.root, 0, 0, 0)?;
+                }
+            }
             C_POINTER => self.pointer(u16_at(p, 0), u16_at(p, 2), p.get(4).copied().unwrap_or(0))?,
             C_WHEEL => {
                 let dx = p.first().copied().unwrap_or(0) as i8;
@@ -1336,6 +1651,18 @@ impl Desk {
             .env_remove("WAYLAND_DISPLAY")
             .envs(self.env.proxy.iter().map(|(k, v)| (k, v)))
             .envs(self.env.chrome_home.iter().map(|h| ("CHROME_CONFIG_HOME", h)))
+            .envs(self.env.desktop.iter().copied())
+            .envs(self.env.gpu.iter().map(|(k, v)| (k, v)))
+            .envs((!self.screen).then(|| {
+                let dirs = std::env::var("XDG_CONFIG_DIRS")
+                    .ok()
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or_else(|| "/etc/xdg".into());
+                (
+                    "XDG_CONFIG_DIRS",
+                    format!("{}:{dirs}", self.env.dir.join("xdg").display()),
+                )
+            }))
             .stdin(std::process::Stdio::null());
         // Containers often set no locale: apps would fall back to ASCII/Latin-1.
         if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
@@ -1539,6 +1866,55 @@ impl Desk {
         Ok(r.data)
     }
 
+    /// Monitors like the desk's (two or more), or none of its own again (`list` empty).
+    fn set_desk_monitors(&mut self, list: &[(i16, i16, u16, u16, bool)]) -> Result<()> {
+        for name in std::mem::take(&mut self.desk_monitors) {
+            self.conn.randr_delete_monitor(self.root, name)?;
+        }
+        if list.len() < 2 {
+            self.conn.flush()?;
+            return Ok(());
+        }
+        let res = self.conn.randr_get_screen_resources_current(self.root)?.reply()?;
+        let mm = |px: u16| (px as u32 * 254 / 960).max(1);
+        for (i, &(x, y, w, h, primary)) in list.iter().enumerate() {
+            let name = self
+                .conn
+                .intern_atom(false, format!("DESK-{}", i + 1).as_bytes())?
+                .reply()?
+                .atom;
+            // The first takes the screen's output: its automatic monitor (all of it) goes.
+            let outputs = if i == 0 {
+                res.outputs.first().copied().into_iter().collect()
+            } else {
+                vec![]
+            };
+            self.conn
+                .randr_set_monitor(
+                    self.root,
+                    randr::MonitorInfo {
+                        name,
+                        primary,
+                        automatic: false,
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                        width_in_millimeters: mm(w),
+                        height_in_millimeters: mm(h),
+                        outputs,
+                    },
+                )?
+                .check()?;
+            self.desk_monitors.push(name);
+        }
+        Ok(())
+    }
+
+    fn is_local(&self, id: u64) -> bool {
+        self.clients.iter().any(|c| c.id == id && c.local)
+    }
+
     fn send_frame(&mut self) {
         self.conn.damage_subtract(self.damage, x11rb::NONE, x11rb::NONE).ok();
         self.dirty = false;
@@ -1556,7 +1932,13 @@ impl Desk {
             self.full = true;
         }
         let stride = w * 4;
+        let (want_enc, want_raw) = (
+            self.clients.iter().any(|c| !c.local && !c.video),
+            self.clients.iter().any(|c| c.local),
+        );
+        let mut any_change = false;
         let mut out = vec![];
+        let mut raw_out = vec![];
         for ty in (0..h).step_by(TILE) {
             for tx in (0..w).step_by(TILE) {
                 let (tw, th) = (TILE.min(w - tx), TILE.min(h - ty));
@@ -1568,29 +1950,131 @@ impl Desk {
                 if !changed {
                     continue;
                 }
+                any_change = true;
                 for y in ty..ty + th {
                     let a = y * stride + tx * 4;
                     self.prev[a..a + tw * 4].copy_from_slice(&cur[a..a + tw * 4]);
                 }
-                let (fmt, img) = encode_tile(&cur, stride, tx, ty, tw, th);
-                let mut p = Vec::with_capacity(9 + img.len());
+                let mut head = Vec::with_capacity(9);
                 for v in [tx as u16, ty as u16, tw as u16, th as u16] {
-                    p.extend_from_slice(&v.to_le_bytes());
+                    head.extend_from_slice(&v.to_le_bytes());
                 }
-                p.push(fmt);
-                p.extend_from_slice(&img);
-                out.extend(frame(S_TILE, &p));
+                if want_enc {
+                    let (fmt, img) = encode_tile(&cur, stride, tx, ty, tw, th);
+                    let mut p = head.clone();
+                    p.push(fmt);
+                    p.extend_from_slice(&img);
+                    out.extend(frame(S_TILE, &p));
+                }
+                if want_raw {
+                    // On the same machine: the pixels as they are (BGRX rows).
+                    let mut p = Vec::with_capacity(9 + tw * th * 4);
+                    p.extend_from_slice(&head);
+                    p.push(TILE_RAW);
+                    for y in ty..ty + th {
+                        let a = y * stride + tx * 4;
+                        p.extend_from_slice(&cur[a..a + tw * 4]);
+                    }
+                    raw_out.extend(frame(S_TILE, &p));
+                }
             }
         }
         self.full = false;
-        if out.is_empty() {
+        if any_change && self.clients.iter().any(|c| c.video) {
+            self.encode(&cur);
+        }
+        if out.is_empty() && raw_out.is_empty() {
             return;
         }
         out.extend(frame(S_FRAME_END, b""));
-        for c in &mut self.clients {
+        raw_out.extend(frame(S_FRAME_END, b""));
+        self.clients.retain_mut(|c| {
+            if c.video {
+                return true;
+            }
             c.inflight += 1;
+            c.tx.try_send(if c.local { raw_out.clone() } else { out.clone() })
+                .is_ok()
+        });
+    }
+
+    /// The frame to the H.264 encoder (started, or started again at a new size). H.264 wants an
+    /// even size: an odd last row or column is left out.
+    fn encode(&mut self, cur: &[u8]) {
+        let Some(kind) = self.video_kind.clone().flatten() else {
+            return;
+        };
+        let (w, h) = (self.w & !1, self.h & !1);
+        if self.encoder.as_ref().is_none_or(|e| (e.w, e.h) != (w, h)) {
+            self.encoder = None;
+            match super::video::Encoder::start(&kind, w, h) {
+                Ok(e) => self.encoder = Some(e),
+                Err(e) => {
+                    warn!("video: {e:#} - picture tiles instead");
+                    self.no_video();
+                    return;
+                }
+            }
         }
-        self.broadcast(&out);
+        let Some(enc) = &self.encoder else { return };
+        if (w, h) == (self.w, self.h) {
+            enc.frame(cur);
+        } else {
+            let (sw, dw) = (self.w as usize * 4, w as usize * 4);
+            let mut c = Vec::with_capacity(dw * h as usize);
+            for y in 0..h as usize {
+                c.extend_from_slice(&cur[y * sw..y * sw + dw]);
+            }
+            enc.frame(&c);
+        }
+    }
+
+    /// The encoder's frames to the browsers that take them.
+    fn video_out(&mut self) -> bool {
+        let Some(enc) = &self.encoder else { return false };
+        let mut msgs = vec![];
+        let mut ended = false;
+        loop {
+            match enc.out.try_recv() {
+                Ok(p) => msgs.push(p),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        let busy = !msgs.is_empty();
+        for p in msgs {
+            let counts = p[0] != super::video::CONFIG;
+            let m = frame(S_VIDEO, &p);
+            self.clients.retain_mut(|c| {
+                if !c.video {
+                    return true;
+                }
+                if counts {
+                    c.inflight += 1;
+                }
+                c.tx.try_send(m.clone()).is_ok()
+            });
+        }
+        if ended {
+            warn!("video: the encoder stopped - picture tiles instead");
+            self.no_video();
+        }
+        busy
+    }
+
+    /// Back to tiles for everyone (the encoder failed).
+    fn no_video(&mut self) {
+        self.encoder = None;
+        self.video_kind = Some(None);
+        for c in &mut self.clients {
+            c.video = false;
+            c.inflight = 0;
+        }
+        self.full = true;
+        self.dirty = true;
     }
 
     fn update_cursor(&mut self) {

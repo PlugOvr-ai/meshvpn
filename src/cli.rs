@@ -282,10 +282,14 @@ enum Cmd {
         /// Only print the link, don't open a browser.
         #[arg(long)]
         no_browser: bool,
-        /// Use Xfce (it must be installed on the node). Default: Xfce if installed.
+        /// Which desktop: xfce, mate or cinnamon (installed on the node with `meshvpn desktop setup
+        /// --desktop`), or plain (meshvpn's built-in minimal one). Default: the node's choice.
+        #[arg(long, value_parser = ["xfce", "mate", "cinnamon", "plain"], conflicts_with_all = ["xfce", "plain", "screen"])]
+        session: Option<String>,
+        /// Same as --session xfce.
         #[arg(long, conflicts_with = "plain")]
         xfce: bool,
-        /// Use meshvpn's built-in minimal desktop even if Xfce is installed.
+        /// Same as --session plain.
         #[arg(long, conflicts_with = "screen")]
         plain: bool,
         /// Share the node's own screen instead: the desktop you are logged in to at that machine,
@@ -483,22 +487,28 @@ enum DesktopCmd {
         /// Install from a downloaded meshvpn-desktop-<arch>.tar.gz (machines without internet).
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Also install the Xfce desktop with the system's package manager (needs root).
-        #[arg(long)]
+        /// Also install a desktop with the system's package manager (needs root): xfce, mate or
+        /// cinnamon. It becomes this machine's choice for `meshvpn desktop`.
+        #[arg(long, value_parser = ["xfce", "mate", "cinnamon"])]
+        desktop: Option<String>,
+        /// Same as --desktop xfce.
+        #[arg(long, conflicts_with = "desktop")]
         xfce: bool,
+        /// Also install the GPU support (needs root): 3D programs render on the GPU (VirtualGL),
+        /// and the GPU encodes the picture for the browser (H.264 with NVENC or VA-API).
+        #[arg(long)]
+        gpu: bool,
+        /// Add "meshvpn desktop" to the login screen (needs root): your desktop on the monitor,
+        /// still running after you leave, and in the browser from elsewhere.
+        #[arg(long)]
+        login: bool,
     },
+    /// Show your desktop session fullscreen on this machine's screen (started by the login
+    /// entry; Ctrl+Alt+End leaves it running).
+    #[command(hide = true)]
+    Local,
     /// End your desktop session on this machine (closes its applications).
     Stop,
-    /// Point an unpacked packed desktop at another place, of the same length as the one it was
-    /// built for (used by the installer without root).
-    #[command(hide = true)]
-    Relocate {
-        dir: PathBuf,
-        #[arg(long)]
-        from: String,
-        #[arg(long)]
-        to: String,
-    },
     /// Connect stdin/stdout to your desktop session (used through SSH by `meshvpn desktop <node>`).
     #[command(hide = true)]
     Attach {
@@ -1757,20 +1767,50 @@ fn real_main(cli: Cli) -> Result<i32> {
             user,
             port,
             no_browser,
+            session,
             xfce,
             plain,
             screen,
         } => match cmd {
-            Some(DesktopCmd::Setup { from, xfce }) => {
+            Some(DesktopCmd::Setup {
+                from,
+                desktop: which,
+                xfce,
+                gpu,
+                login,
+            }) => {
                 let b = desktop::bundle::setup(from.as_deref())?;
                 say(json, &format!("desktop components installed in {}", b.dir.display()));
-                if xfce {
-                    desktop::bundle::install_xfce()?;
+                if login {
+                    let p = desktop::bundle::install_login_entry()?;
                     say(
                         json,
-                        "Xfce installed: `meshvpn desktop <this node>` now opens an Xfce desktop",
+                        &format!(
+                            "\"meshvpn desktop\" added to the login screen ({}): log in with it to get your desktop on the monitor",
+                            p.display()
+                        ),
                     );
                 }
+                if gpu {
+                    desktop::bundle::install_gpu()?;
+                    say(
+                        json,
+                        "GPU support installed: 3D programs in `meshvpn desktop` sessions render on the GPU, and the GPU encodes the picture",
+                    );
+                }
+                if let Some(name) = which.or(xfce.then(|| "xfce".to_string())) {
+                    desktop::bundle::install_desktop(&name)?;
+                    say(
+                        json,
+                        &format!("{name} installed: `meshvpn desktop <this node>` now opens it"),
+                    );
+                }
+            }
+            Some(DesktopCmd::Local) => {
+                #[cfg(unix)]
+                desktop::local::run()?;
+                #[cfg(windows)]
+                desktop::session::local()?;
             }
             Some(DesktopCmd::Stop) => {
                 if desktop::session::stop()? {
@@ -1779,7 +1819,6 @@ fn real_main(cli: Cli) -> Result<i32> {
                     say(json, "no desktop session is running");
                 }
             }
-            Some(DesktopCmd::Relocate { dir, from, to }) => desktop::bundle::relocate(&dir, &from, &to)?,
             Some(DesktopCmd::Attach { session }) => desktop::session::attach(&session)?,
             Some(DesktopCmd::Session { session }) => {
                 init_logging(None)?;
@@ -1791,15 +1830,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 };
                 if std::env::var_os("MESHVPN_DESKTOP_BRIDGE").is_some() {
                     let mut target = desktop::client::Target::test(&node, user.as_deref());
-                    target.session = if screen {
-                        "screen"
-                    } else if xfce {
-                        "xfce"
-                    } else if plain {
-                        "plain"
-                    } else {
-                        "auto"
-                    };
+                    target.session = desktop_session(session.as_deref(), xfce, plain, screen);
                     desktop::client::run(target, port, !no_browser)?;
                     return Ok(0);
                 }
@@ -1813,15 +1844,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     socks: st.socks.is_some(),
                     timeout: std::time::Duration::from_secs(30),
                 };
-                let session = if screen {
-                    "screen"
-                } else if xfce {
-                    "xfce"
-                } else if plain {
-                    "plain"
-                } else {
-                    "auto"
-                };
+                let session = desktop_session(session.as_deref(), xfce, plain, screen);
                 desktop::client::run(desktop::client::Target { node, remote, session }, port, !no_browser)?;
             }
         },
@@ -1951,6 +1974,20 @@ fn real_main(cli: Cli) -> Result<i32> {
 }
 
 /// All commands: meshvpn's and an extension's.
+/// The session `meshvpn desktop <node>` asks the node for.
+fn desktop_session(session: Option<&str>, xfce: bool, plain: bool, screen: bool) -> &'static str {
+    match session {
+        Some("xfce") => "xfce",
+        Some("mate") => "mate",
+        Some("cinnamon") => "cinnamon",
+        Some(_) => "plain",
+        None if screen => "screen",
+        None if xfce => "xfce",
+        None if plain => "plain",
+        None => "auto",
+    }
+}
+
 fn full_command() -> clap::Command {
     use clap::CommandFactory;
     let mut cmd = Cli::command();

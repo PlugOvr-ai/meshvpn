@@ -9,7 +9,8 @@ import base64, json, os, select, socket, struct, sys, time
 S_INIT, S_TILE, S_FRAME_END, S_WINDOWS, S_CLIPBOARD, S_CURSOR, S_APPS, S_NOTICE, S_FILES, S_FILE_DATA, S_FILE_DONE = range(1, 12)
 C_POINTER, C_WHEEL, C_KEY, C_CLIPBOARD, C_ACTIVATE, C_CLOSE, C_LAUNCH, C_ACK, C_REFRESH, C_RESIZE = range(101, 111)
 C_FILES, C_FILE_READ, C_FILE_WRITE, C_FILE_OP, C_MONITOR = range(111, 116)
-S_MONITORS = 12
+C_CAPS = 118
+S_MONITORS, S_VIDEO = 12, 13
 
 
 class Viewer:
@@ -26,7 +27,7 @@ class Viewer:
         self.buf = b""
         self.size = None; self.windows = []; self.apps = None; self.clip = None; self.notices = []
         self.tiles = {1: 0, 2: 0}; self.frames = 0; self.cursor = False
-        self.listing = None; self.reads = {}; self.done = {}; self.monitors = None
+        self.listing = None; self.reads = {}; self.done = {}; self.monitors = None; self.video = []
 
     def send(self, kind, payload=b""):
         data = bytes([kind]) + struct.pack("<I", len(payload)) + payload
@@ -73,6 +74,10 @@ class Viewer:
             r = self.reads.setdefault(fid, {"data": bytearray(), "total": total})
             r["data"] += p[20:]
         elif kind == S_MONITORS: self.monitors = json.loads(p)
+        elif kind == S_VIDEO:
+            self.video.append((p[0], struct.unpack("<HH", p[1:5]), bytes(p[5:12])))
+            if p[0] != 0:
+                self.send(C_ACK)  # as the browser does once a frame is decoded
         elif kind == S_FILE_DONE:
             v = json.loads(p); self.done[v["id"]] = v
 
@@ -225,8 +230,65 @@ def own(port, token, word):
     print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
 
 
+def keys(port, token, what):
+    """Typing on a shared screen: a word and Enter, or Ctrl+Alt+End ("leave")."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
+    v.until(lambda: v.size is not None and v.frames >= 1, "first frame", 60)
+    v.settle(0.5)
+    if what == "leave":
+        for k in (0xFFE3, 0xFFE9, 0xFF57):
+            v.send(C_KEY, bytes([1, 0]) + struct.pack("<I", k))
+        for k in (0xFF57, 0xFFE9, 0xFFE3):
+            v.send(C_KEY, bytes([0, 0]) + struct.pack("<I", k))
+    else:
+        for ch in what:
+            v.key(ord(ch), 1)
+        v.key(0xFF0D, 0)
+    v.settle(1.5)
+    print(json.dumps({"size": v.size}))
+
+
+def de(port, token, terminal):
+    """A desktop from the packages: up, a terminal of it opens as a new window and takes typing."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1280, 800))
+    v.until(lambda: v.size == [1280, 800] and v.frames >= 1, "first frame", 120)
+    v.settle(15)  # the desktop starting
+    before = len(v.windows)
+    v.send(C_LAUNCH, terminal.encode())
+    v.until(lambda: len(v.windows) > before and v.windows[-1]["active"], "the terminal window", 90)
+    v.settle(3)
+    for ch in "echo typed-in-the-desktop > /tmp/de_typed":
+        v.key(ord(ch), 1)
+    v.key(0xFF0D, 0)
+    v.settle(2)
+    print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
+
+
+def video(port, token):
+    """A browser that decodes H.264: the stream instead of tiles, setup first, then a key frame."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
+    v.send(C_CAPS, json.dumps({"video": ["h264"]}).encode())
+    v.until(lambda: len(v.video) >= 2, "the video stream", 60)
+    tiles_before = sum(v.tiles.values())
+    v.send(C_LAUNCH, b"glxinfo > /tmp/glx 2>&1; xlogo")
+    v.until(lambda: any(w["title"] == "xlogo" for w in v.windows), "xlogo", 30)
+    v.settle(2)
+    kinds = [k for k, _, _ in v.video]
+    print(json.dumps({"kinds": kinds, "size": list(v.video[1][1]), "avcc": list(v.video[0][2][:4]),
+                      "tiles_after": sum(v.tiles.values()) - tiles_before, "notices": v.notices}))
+
+
 def main():
     port, token = int(sys.argv[1]), sys.argv[2]
+    if len(sys.argv) > 3 and sys.argv[3] == "video":
+        return video(port, token)
+    if len(sys.argv) > 4 and sys.argv[3] == "de":
+        return de(port, token, sys.argv[4])
+    if len(sys.argv) > 4 and sys.argv[3] == "keys":
+        return keys(port, token, sys.argv[4])
     if len(sys.argv) > 4 and sys.argv[3] == "own":
         return own(port, token, sys.argv[4])
     if len(sys.argv) > 3 and sys.argv[3] == "screen":

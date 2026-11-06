@@ -74,24 +74,6 @@ fn status(dir: &Path) -> Option<Status> {
     }
 }
 
-/// The packed desktop has no way to update its browser by itself.
-fn packed_browser() -> Option<Check> {
-    let b = crate::desktop::bundle::packed_browser()?;
-    let detail = format!("Chromium {} of the packed desktop, {} days old", b.version, b.days_old);
-    Some(if b.is_old() {
-        check(
-            "browser",
-            Level::Warn,
-            format!("{detail}: it has missed security fixes"),
-            Some(
-                "install the desktop again to get the newest release's browser: curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sudo sh -s -- --full",
-            ),
-        )
-    } else {
-        check("browser", Level::Ok, detail, None)
-    })
-}
-
 pub fn diagnose(dir: &Path) -> Vec<Check> {
     let mut c = vec![];
     let exe = crate::update::current_exe()
@@ -123,7 +105,6 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
     }
 
     // Before anything that ends the checks early: it has nothing to do with the network.
-    c.extend(packed_browser());
     let all = crate::networks::all(&crate::networks::base(dir));
     if all.len() > 1 {
         let names: Vec<String> = all.iter().map(|(_, d)| crate::networks::display_name(d)).collect();

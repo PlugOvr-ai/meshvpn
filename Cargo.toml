@@ -45,7 +45,7 @@ vt100 = "0.16"
 jpeg-encoder = "0.7.1"
 png = "0.18.1"
 russh-sftp = "3"
-x11rb = { version = "0.14.0", features = ["shm", "xtest", "damage", "xfixes", "randr"] }
+x11rb = { version = "0.14.0", features = ["shm", "xtest", "damage", "xfixes", "randr", "render"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

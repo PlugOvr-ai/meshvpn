@@ -132,9 +132,9 @@
   <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button id="dlgCancel">Cancel</button><button id="dlgOk">OK</button></div></div>
 <script>
 "use strict";
-const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8,S_FILES=9,S_FILE_DATA=10,S_FILE_DONE=11,S_MONITORS=12;
+const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8,S_FILES=9,S_FILE_DATA=10,S_FILE_DONE=11,S_MONITORS=12,S_VIDEO=13;
 const C_POINTER=101,C_WHEEL=102,C_KEY=103,C_CLIPBOARD=104,C_ACTIVATE=105,C_CLOSE=106,C_LAUNCH=107,C_ACK=108,C_REFRESH=109,C_RESIZE=110;
-const C_FILES=111,C_FILE_READ=112,C_FILE_WRITE=113,C_FILE_OP=114,C_MONITOR=115,C_STOP=120;
+const C_FILES=111,C_FILE_READ=112,C_FILE_WRITE=113,C_FILE_OP=114,C_MONITOR=115,C_CAPS=118,C_STOP=120;
 const $ = id => document.getElementById(id);
 const canvas = $("screen"), ctx = canvas.getContext("2d"), area = $("area");
 const token = location.hash.slice(1);
@@ -159,7 +159,7 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws?token=${token}`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { $("dot").classList.add("on"); send(C_RESIZE, u16s(...wantedSize())); canvas.focus(); };
+  ws.onopen = () => { $("dot").classList.add("on"); send(C_RESIZE, u16s(...wantedSize())); videoOffer(); canvas.focus(); };
   ws.onclose = () => {
     $("dot").classList.remove("on");
     for (const r of reads.values()) r.reject(new Error("disconnected"));
@@ -206,6 +206,7 @@ function handle(m) {
     case S_FILE_DATA: onFileData(p); break;
     case S_FILE_DONE: onFileDone(JSON.parse(dec.decode(p))); break;
     case S_MONITORS: monitors(JSON.parse(dec.decode(p))); break;
+    case S_VIDEO: videoFrame(p); break;
   }
 }
 
@@ -223,6 +224,37 @@ function tabs(list) {
     t.append(b);
   }
 }
+// H.264 from the node's GPU encoder (NVENC, VA-API), decoded here (WebCodecs); without either
+// the picture comes as tiles. Off: localStorage meshvpn.video = "off".
+let vdec = null, vts = 0, vfails = 0;
+function videoOffer() {
+  let off = false;
+  try { off = localStorage.getItem("meshvpn.video") === "off"; } catch (_) {}
+  if (off || typeof VideoDecoder === "undefined") return;
+  send(C_CAPS, enc.encode(JSON.stringify({ video: ["h264"] })));
+}
+function videoFrame(p) {
+  const kind = p[0], data = p.subarray(5);
+  if (kind === 0) {
+    // avcC: profile, compatibility, level name the codec.
+    const hex = b => b.toString(16).padStart(2, "0");
+    const codec = `avc1.${hex(data[1])}${hex(data[2])}${hex(data[3])}`;
+    if (vdec && vdec.state !== "closed") vdec.close();
+    vdec = new VideoDecoder({
+      output: f => { drawQ = drawQ.then(() => { ctx.drawImage(f, 0, 0); f.close(); send(C_ACK); }); },
+      error: e => {
+        // Once more from a key frame; twice in a row: tiles instead.
+        console.warn("video:", e); window.videoError = String(e); vdec = null;
+        if (++vfails < 2) videoOffer(); else send(C_CAPS, enc.encode(JSON.stringify({ video: [] })));
+      },
+    });
+    vdec.configure({ codec, description: data.slice(), optimizeForLatency: true });
+    return;
+  }
+  if (!vdec || vdec.state !== "configured") { send(C_ACK); return; }
+  vdec.decode(new EncodedVideoChunk({ type: kind === 1 ? "key" : "delta", timestamp: (vts += 33333), data }));
+}
+
 // The machine's own screen with several monitors: one at a time, or all.
 function monitors(v) {
   const m = $("mons"); m.textContent = "";

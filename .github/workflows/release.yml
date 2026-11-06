@@ -161,66 +161,14 @@ jobs:
           name: dist-desktop-${{ matrix.arch }}
           path: desktop-out/*.tar.gz
 
-  desktop-full:
-    # The one-file installer with Xfce and Chromium (desktop/build-full.sh), tested on a bare image.
-    name: full installer ${{ matrix.arch }}
-    needs: [build, desktop]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    strategy:
-      matrix:
-        include:
-          - { arch: x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-musl }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-    steps:
-      - name: Make room
-        # The sources are about 7 GB per architecture, and take more than that on the way.
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: dist-*
-          path: in
-          merge-multiple: true
-      - name: Build Xfce and Chromium
-        run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/full-out:/out" nixos/nix:latest sh /build/build-full.sh
-      - name: Put the installer together
-        run: |
-          mkdir bin && tar -xzf in/meshvpn-${{ matrix.target }}.tar.gz -C bin
-          sudo chown -R "$USER" full-out
-          sh desktop/make-run.sh bin/meshvpn in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
-            full-out/meshvpn-desktop-full-${{ matrix.arch }}.tar.gz run-out bin/THIRD-PARTY-LICENSES.txt
-      - name: Test it on a bare image
-        run: |
-          sudo modprobe tun || true
-          python3 tests/e2e/run.py --binary bin/meshvpn --desktop-bundle in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
-            --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless desktop_full_container
-      - name: Gather what gets published
-        # In one directory: paths from several would arrive as subdirectories, which can't be published.
-        run: |
-          mkdir publish
-          mv run-out/*.run full-out/meshvpn-full-sources-* publish/
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dist-full-${{ matrix.arch }}
-          path: publish/*
-          compression-level: 0
-
   e2e:
     uses: ./.github/workflows/e2e.yml
 
   release:
     # Published only when every end-to-end test passed.
-    needs: [build, macos, windows, desktop, desktop-full, e2e]
+    needs: [build, macos, windows, desktop, e2e]
     runs-on: ubuntu-latest
     steps:
-      - name: Make room
-        # The sources are about 7 GB per architecture, and take more than that on the way.
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
@@ -265,10 +213,10 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- join mesh1-...
           \`\`\`
 
-          **With a full desktop** (Xfce and the Chromium browser in one download, any Linux distribution, x86_64 and ARM64. Source: \`meshvpn-full-sources-*\`):
+          **With a desktop for \`meshvpn desktop\`** (Xfce, MATE or Cinnamon from the system's package manager):
 
           \`\`\`sh
-          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- --full join mesh1-...
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- --desktop mate join mesh1-...
           \`\`\`
 
           **macOS** (Apple Silicon and Intel; the same installer):
@@ -309,7 +257,6 @@ jobs:
         run: |
           # A directory fails only at the very end, an hour in.
           if [ -n "$(find dist -mindepth 1 -type d)" ]; then find dist -mindepth 1 -type d; exit 1; fi
-          ls dist/meshvpn-full-x86_64.run dist/meshvpn-full-aarch64.run dist/meshvpn-full-sources-x86_64.tar.gz.part00 dist/meshvpn-full-sources-aarch64.tar.gz.part00
 
       - name: Publish release
         env:

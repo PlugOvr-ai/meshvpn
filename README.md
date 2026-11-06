@@ -359,12 +359,25 @@ applications you want to run.
   bar ends the session and its applications.
 * **First use** downloads the bundle by itself; on machines without internet copy `meshvpn-desktop-<arch>.tar.gz` from
   the release and run `meshvpn desktop setup --from <file>` (also handy in a Dockerfile).
-* Apps get a UTF-8 locale and the bundled DejaVu fonts if the image has none. Not yet: OpenGL/GPU acceleration, sound.
-* **A full desktop with Xfce:** `sudo meshvpn desktop setup --xfce` on the node (or `xfce4` in the Dockerfile) installs
-  Xfce with the system's package manager (apt, dnf, apk, zypper; about 300 MB). From then on `meshvpn desktop <node>`
-  opens an Xfce desktop: panel with the applications menu, file manager, terminal, windows you can move and resize.
-  The tabs in the browser bar follow Xfce's windows; logging out of Xfce ends the session. `--plain` keeps the
-  built-in minimal desktop, `--xfce` insists on Xfce. A running session keeps its desktop until `meshvpn desktop stop`.
+* Apps get a UTF-8 locale and the bundled DejaVu fonts if the image has none. Not yet: sound. GPU: see `setup --gpu` below.
+* **A full desktop: Xfce, MATE or Cinnamon.** `sudo meshvpn desktop setup --desktop mate` on the node (or `xfce`,
+  `cinnamon`; also at install time: `install.sh --desktop mate`) installs it with the system's package manager (apt,
+  dnf, zypper; Xfce and MATE also apk) and makes it the node's choice: from then on `meshvpn desktop <node>` opens it,
+  with its panel, applications menu, file manager and terminal. The tabs in the browser bar follow its windows; logging
+  out of it ends the session. `--session xfce|mate|cinnamon|plain` asks for another one (`--plain`: meshvpn's built-in
+  minimal desktop). A running session keeps its desktop until `meshvpn desktop stop`. Cinnamon draws with OpenGL, so it
+  runs on the system's Xvfb with Mesa's software rendering (installed with it): fine for office work, slower than the
+  others. Screen lockers don't start in Xfce and MATE sessions (they would lock a desktop only a browser shows);
+  Cinnamon starts its own, so an idle Cinnamon session can lock and then needs the account's password.
+* **The GPU for 3D and for the picture:** `sudo meshvpn desktop setup --gpu` on the node installs VirtualGL, ffmpeg and
+  the system's Xvfb. From then on OpenGL programs in desktop sessions render on a GPU the user may use (VirtualGL with
+  EGL, for every program of the session, the desktop's compositor included; with bookings the booked GPU, since only its
+  device is accessible) instead of on the CPU, and the GPU encodes the picture as H.264 (NVENC on NVIDIA, VA-API on
+  Intel/AMD), which browsers with WebCodecs decode (Chrome, Edge, Safari 17+): much less data and CPU than picture
+  tiles with moving content or at high resolutions. Without an encoder or in other browsers it stays tiles. To choose:
+  `MESHVPN_DESKTOP_GPU=/dev/dri/card1` (or `off`) and `MESHVPN_DESKTOP_ENCODER=nvenc|vaapi|off` in the node's
+  environment; in the browser `localStorage["meshvpn.video"] = "off"` keeps tiles. The session log says what it uses
+  (`3D: VirtualGL on …`, `video: NVENC`). Fedora's own ffmpeg has no H.264 encoder: there use RPM Fusion's.
 * **The machine's own screen:** `meshvpn desktop <node> --screen` shows the desktop you are logged in to at that
   machine, with its windows and programs as they are (your Chrome included), instead of a desktop of its own. It keeps the
   monitor's size (the browser scales it); with several monitors the bar shows *Screen 1*, *Screen 2*, … and *All*,
@@ -372,36 +385,11 @@ applications you want to run.
   when you close the tab; the programs keep running. X11 desktops only (Xorg: Cinnamon, MATE, Xfce, KDE or GNOME on X11);
   a Wayland session is refused with a note. Chrome in a desktop of its own uses a separate profile while your usual one
   is open on the machine's screen, because Chrome would otherwise open its windows there.
-* **Everything in one file:** `install.sh --full` (or `meshvpn-full-<arch>.run` from the release, for machines without
-  internet) brings meshvpn, Xfce and the Chromium browser with all their libraries, so the node needs no package manager
-  and it works the same on Debian, Ubuntu, Fedora and Alpine: `curl -fsSL .../install.sh | sudo sh -s -- --full join mesh1-...`.
-  x86_64 and ARM64, about 650 MB to download, 2.2 GB on disk (in `/nix/store`, but Nix isn't needed). Terminals keep using the machine's own programs.
-  **It doesn't update itself:** a new meshvpn release brings a new browser, so install the newest release regularly.
-  The browser is Chromium as nixpkgs builds it, with H.264 and AAC playback compiled in. Where the machine blocks user
-  namespaces (default Docker) or as root, it runs without its sandbox and shows a warning, so only open sites you trust
-  there. Licences are in
-  `/opt/meshvpn-desktop-full`, the complete source is on the release page as `meshvpn-full-sources-<arch>.tar.gz.part*`.
-  `sudo sh meshvpn-full-<arch>.run --uninstall` removes the desktop and keeps meshvpn.
-* **The same without root,** for example in a Docker image where you aren't root:
-  `curl -fsSL .../install.sh | sh -s -- --user --full join mesh1-...`, or just `sh meshvpn-full-<arch>.run join mesh1-...`.
-  It needs no privileges, user namespaces or changes to how the container is started, and installs for your user alone
-  in `~/.local` (1.9 GB per user; licences in `~/.local/share/meshvpn/desktop-full/opt/meshvpn-desktop-full`). The installer
-  changes the path built into the programs to one of the same length, a link like `/tmp/mvx7k` that points to your files.
-  So `/tmp` must be writable, and `HOME` must be set and writable. If `/tmp` is emptied the link comes back when a desktop
-  program starts; if another user has taken the name, nothing runs and installing again picks a new one.
-  Allow logins with `meshvpn ssh allow <user>@<node> --as <you>`, then `meshvpn desktop <node> --user <you>` from the
-  other node. Container users with no name (not in `/etc/passwd`, such as `docker run --user 54321`) log in by number:
-  `--as 54321`, with `HOME` set. Without `/dev/net/tun` this runs in userspace mode, see above.
-* **Built into a Docker image,** so that nobody has to install it and the 1.9 GB survives new containers (use your
-  image's user in `--chown`: without it, a non-root user can't delete the file from `/tmp`):
-  ```dockerfile
-  COPY --chown=1000:1000 meshvpn-full-x86_64.run /tmp/full.run
-  RUN sh /tmp/full.run && rm -f /tmp/full.run
-  ```
-  Containers usually have no systemd or cron, so **nothing starts meshvpn after a restart: run `~/.local/bin/meshvpn up`
-  in the background from your entrypoint.** Join when the container first starts, not in the Dockerfile, or all containers of
-  the image would be the same node, and keep `~/.config/meshvpn` on a volume so that a new container stays that node.
-  A read-only root works (`--read-only --tmpfs /tmp`) as long as the home is writable.
+* **Your desktop at the desk, too:** `sudo meshvpn desktop setup --login` adds *meshvpn desktop* to the login screen.
+  Logging in with it shows your meshvpn desktop on the monitor, the same one `meshvpn desktop <node>` opens in a browser.
+  It runs in its own X server, so it keeps running when you leave the desk (**Ctrl+Alt+End**, back to the login screen)
+  and while someone else logs in there with theirs: each person gets their own desktop, at the desk or in a browser,
+  at the same time. The keyboard layout of the desk is used. Not yet: sound, USB devices at the desk.
 * **Logged in over SSH** (e.g. on your main node from outside the mesh)? `meshvpn desktop` notices and prints the
   matching forward, e.g. `ssh -L 7880:127.0.0.1:7880 you@main-node` - run it on your computer (or add it to the open
   session with Enter `~C`), then open the link in your local browser.

@@ -16,7 +16,7 @@ const PAGE: &str = include_str!("viewer.html");
 pub struct Target {
     pub node: NodeView,
     pub remote: Remote,
-    /// "auto" (Xfce if the node has it), "xfce" or "plain".
+    /// "auto" (the node's choice), "xfce", "mate", "cinnamon", "plain" or "screen".
     pub session: &'static str,
 }
 

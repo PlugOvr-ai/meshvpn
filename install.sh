@@ -17,12 +17,10 @@
 #
 #   curl -fsSL .../install.sh | sudo sh -s -- --enterprise join mesh1-...
 #
-# With a full desktop: Xfce and the Chromium browser in one 650 MB download, for any Linux
-# distribution, with no package manager involved (2.2 GB on disk; x86_64 and ARM64): --full first, e.g.
+# With a desktop for `meshvpn desktop` (Xfce, MATE or Cinnamon from the system's package manager:
+# apt, dnf, zypper; Xfce and MATE also apk): --desktop NAME first, e.g.
 #
-#   curl -fsSL .../install.sh | sudo sh -s -- --full join mesh1-...
-# Without root as well (for this user alone, in ~/.local):
-#   curl -fsSL .../install.sh | sh -s -- --user --full join mesh1-...
+#   curl -fsSL .../install.sh | sudo sh -s -- --desktop mate join mesh1-...
 #
 # Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin,
 # MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub,
@@ -37,13 +35,15 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 ROOTLESS="${MESHVPN_ROOTLESS:-}"
 [ "$ROOTLESS" = 0 ] && ROOTLESS=""
-FULL=""
+DESKTOP=""
 [ "${MESHVPN_EDITION:-}" = enterprise ] && REPO="PlugOvr-ai/meshvpn-enterprise-releases"
 while [ $# -gt 0 ]; do
     case "$1" in
         --user | --rootless) ROOTLESS=1 ;;
         --enterprise) REPO="PlugOvr-ai/meshvpn-enterprise-releases" ;;
-        --full) FULL=1 ;;
+        --desktop) [ $# -ge 2 ] || die "--desktop needs a name: xfce, mate or cinnamon"; DESKTOP="$2"; shift ;;
+        --desktop=*) DESKTOP="${1#--desktop=}" ;;
+        --full) die "--full is gone: use --desktop xfce (or mate, cinnamon), installed with the system's package manager" ;;
         *) break ;;
     esac
     shift
@@ -64,6 +64,13 @@ if [ "$OS" = Darwin ] && [ -n "$ROOTLESS" ]; then
     die "on macOS meshvpn needs root (it creates a network interface) - run the installer with sudo"
 fi
 
+case "$DESKTOP" in
+    "" | xfce | mate | cinnamon) ;;
+    *) die "--desktop: xfce, mate or cinnamon (not $DESKTOP)" ;;
+esac
+if [ -n "$DESKTOP" ] && { [ "$OS" != Linux ] || [ -n "$ROOTLESS" ]; }; then
+    die "--desktop installs with the system's package manager: Linux, with root"
+fi
 if [ -n "$ROOTLESS" ] && [ "$(id -u)" -eq 0 ]; then
     die "--user is for installing without root - as root, run the installer without it"
 fi
@@ -162,34 +169,6 @@ fetch() {
     fi
 }
 
-if [ -n "$FULL" ]; then
-    [ "$REPO" = "PlugOvr-ai/meshvpn" ] || die "--full is for the open source edition"
-    case "$TARGET" in
-        x86_64-unknown-linux-musl) ARCH=x86_64 ;;
-        aarch64-unknown-linux-musl) ARCH=aarch64 ;;
-        *) die "--full exists for x86_64 and ARM64 Linux, not $TARGET" ;;
-    esac
-    # /var/tmp: /tmp is often kept in memory, too small for this.
-    TMP="$(mktemp -d "${TMPDIR:-/var/tmp}/meshvpn-full.XXXXXX")"
-    trap 'rm -rf "$TMP"' EXIT INT TERM
-    RUN="meshvpn-full-$ARCH.run"
-    say "Downloading meshvpn with Xfce and Chromium ($VERSION, $ARCH, 650 MB)..."
-    fetch "$BASE/$RUN" "$TMP/$RUN" || die "download failed: $BASE/$RUN"
-    fetch "$BASE/$RUN.sha256" "$TMP/$RUN.sha256" || die "download failed: $BASE/$RUN.sha256"
-    if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$TMP" && sha256sum -c "$RUN.sha256" >/dev/null) || die "checksum mismatch - download corrupted?"
-    else
-        say "(sha256sum not found, skipping checksum verification)"
-    fi
-    # Without root it installs for this user alone, by itself.
-    if [ -n "$ROOTLESS" ]; then
-        sh "$TMP/$RUN" "$@"
-    else
-        $SUDO sh "$TMP/$RUN" "$@"
-    fi
-    exit $?
-fi
-
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
@@ -218,6 +197,9 @@ if [ -n "$PROXY" ]; then
         | $SUDO sh -c "mkdir -p '$MESH_DIR' && chmod 700 '$MESH_DIR' && umask 077 && cat > '$MESH_DIR/proxy.env'"
 fi
 say "Installed $("$BIN_DIR/meshvpn" --version) to $BIN_DIR/meshvpn"
+if [ -n "$DESKTOP" ]; then
+    $SUDO "$BIN_DIR/meshvpn" desktop setup --desktop "$DESKTOP" || die "installing the $DESKTOP desktop failed (see above)"
+fi
 
 if [ -n "$ROOTLESS" ]; then
     say "Rootless install: config in $MESH_DIR, userspace networking - other nodes reach the services here, ssh to *.mesh works directly, other programs reach the mesh via socks5h://127.0.0.1:1055."

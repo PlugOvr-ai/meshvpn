@@ -31,7 +31,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE = "meshvpn-e2e"
 BINARY = None
 DESKTOP_BUNDLE = None
-FULL_RUN = None
 DEPLOY_SH = os.path.join(HERE, "..", "..", "deploy.sh")
 INSTALL_SH = os.path.join(HERE, "..", "..", "install.sh")
 TESTS = {}
@@ -1405,229 +1404,6 @@ def test_desktop(lab):
 
 
 @test
-def test_desktop_full(lab):
-    """The one-file installer on a bare image: Xfce and Chromium with no package manager, then removed again."""
-    check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
-    net = lab.network("net")
-    hub = lab.node("hub", [net])
-    box = lab.node("box", [net], caps=False, install=False, cmd=["sleep", "infinity"], image="debian:12-slim")
-    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
-    hub.up()
-    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
-    run(["docker", "cp", FULL_RUN, f"{box.c}:/tmp/full.run"])
-    # No apt-get update ran in this image: nothing could have come from a package manager.
-    out = box.sh(f"sh /tmp/full.run join {invite(hub)} --name box --ssh-allow-all agent", timeout=600)
-    check("with Xfce and Chromium" in out, out[-500:])
-    box.sh("useradd -m agent")
-    wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
-         "ssh from hub to box", 60)
-    hub.sh("cd /home/agent && (meshvpn desktop box --no-browser --port 18082 > /tmp/desktop.out 2>&1 &)", user="agent")
-    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
-    token = out.split("#", 1)[1].split()[0]
-    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py 18082 {token} full", user="agent", ok=False, timeout=300)
-    check(p.returncode == 0, f"packed desktop: {p.stdout[-2000:]}{p.stderr[-1000:]}"
-          + box.sh("tail -30 /tmp/meshvpn-desktop-*/session.log", ok=False).stdout)
-    check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout,
-          "a terminal of the packed desktop runs this machine's own programs")
-    log = box.sh("cat /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
-    check("using the built-in desktop" not in log, f"Xfce should have stayed up: {log[-1000:]}")
-    # What the licences of what's inside ask for, and none of the patented codecs.
-    box.sh("test -s /opt/meshvpn-desktop-full/README && test -s /opt/meshvpn-desktop-full/THIRD-PARTY-LICENSES.txt "
-           "&& ls /opt/meshvpn-desktop-full/licenses | grep -q ^glibc")
-    found = box.sh("ls /nix/store | grep -E -- '-(x264|x265|openh264|ffmpeg|gst-plugins-bad|gst-plugins-ugly|gst-libav|fdk-aac|faad2|libde265|ldacBT|libfreeaptx|gtk4)-' ; true")
-    check(not found.strip(), f"should not be shipped: {found}")
-    # An old browser gets a warning, and stops nothing.
-    check("Chromium" in box.mv("doctor", ok=False).stdout and "security fixes" not in box.mv("doctor", ok=False).stdout, "doctor names the browser")
-    box.sh("sed -i 's/^date=.*/date=1000/' /opt/meshvpn-desktop-full/browser")
-    check("missed security fixes" in box.mv("doctor", ok=False).stdout, "doctor warns about an old browser")
-    # Removing it leaves meshvpn, and nothing of the desktop.
-    box.sh("cd /home/agent; su agent -s /bin/sh -c 'meshvpn desktop stop'", ok=False)
-    box.sh("sh /tmp/full.run --uninstall")
-    left = box.sh("ls /usr/local/bin; ls /nix /opt/meshvpn-desktop-full 2>&1", ok=False).stdout
-    check("chromium" not in left and "xfce4" not in left and "store" not in left, f"left behind: {left}")
-    check("meshvpn" in left, "meshvpn stays")
-
-
-@test
-def test_desktop_full_user(lab):
-    """The one-file installer without root in a stock container: no namespaces, nothing outside the home but a link."""
-    check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
-    net = lab.network("net")
-    hub = lab.node("hub", [net])
-    box = lab.node("box", [net], caps=False, install=False, cmd=["sleep", "infinity"], image="debian:12-slim")
-    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
-    hub.up()
-    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
-    box.sh("useradd -m dev && useradd -m other")
-    run(["docker", "cp", FULL_RUN, f"{box.c}:/tmp/full.run"])
-    box.sh("chmod 644 /tmp/full.run")
-    # What this is for: this container doesn't allow user namespaces.
-    p = box.sh("unshare -Urm true", user="dev", ok=False)
-    check(p.returncode != 0, "this test should run where user namespaces are not allowed")
-    # A daemon whose PATH doesn't have ~/.local/bin, as is usual.
-    home = "export HOME=/home/dev; "
-    out = box.sh(home + f"sh /tmp/full.run join {invite(hub)} --name box", user="dev", timeout=600)
-    check("with Xfce and Chromium" in out and "for this user alone" in out, out[-800:])
-    check(box.sh("test -e /nix -o -e /usr/local/bin/meshvpn -o -e /opt/meshvpn-desktop-full && echo root || echo clean").strip() == "clean",
-          "without root nothing goes in the system's places")
-    mv = "/home/dev/.local/bin/meshvpn"
-    prefix = box.sh("cat /home/dev/.local/share/meshvpn/desktop-full/prefix").strip()
-    check(len(prefix) == len("/nix/store") and prefix.startswith("/tmp/mv"), prefix)
-    box.sh(home + f"{mv} ssh allow agent@hub --as dev", user="dev")
-    wait(lambda: hub.online("box"), "box online at hub")
-    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
-    wait(lambda: hub.sh(f"ssh {o} dev@box.mesh whoami", user="agent", ok=False).stdout.strip() == "dev",
-         "login to the rootless node", 60)
-    hub.sh("cd /home/agent && (meshvpn desktop box --user dev --no-browser --port 18083 > /tmp/desktop.out 2>&1 &)", user="agent")
-    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 30)
-    token = out.split("#", 1)[1].split()[0]
-    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py 18083 {token} full", user="agent", ok=False, timeout=300)
-    check(p.returncode == 0, f"packed desktop: {p.stdout[-2000:]}{p.stderr[-1000:]}"
-          + box.sh("tail -30 /tmp/meshvpn-desktop-*/session.log", ok=False).stdout)
-    check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, "a terminal of this desktop runs the machine's programs")
-    log = box.sh("cat /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
-    check("using the built-in desktop" not in log, f"Xfce should have stayed up: {log[-1000:]}")
-    box.sh(home + f"{mv} desktop stop", user="dev", ok=False)
-    # Licences and sources are as easy to find as with root.
-    box.sh("cd /home/dev/.local/share/meshvpn/desktop-full/opt/meshvpn-desktop-full && test -s README "
-           "&& test -s THIRD-PARTY-LICENSES.txt && ls licenses | grep -q ^glibc")
-    # /tmp emptied: the link comes back. Someone else's link: refused, nothing of theirs runs.
-    wrapper = "/home/dev/.local/bin/chromium --version"
-    box.sh(f"rm -f {prefix}")
-    box.sh(home + wrapper, user="dev")
-    check(box.sh(f"stat -c %U {prefix}").strip() == "dev", "the link should be back")
-    box.sh(f"rm -f {prefix}")
-    box.sh(f"ln -s /home/other {prefix} && chown -h other {prefix}")
-    p = box.sh(home + wrapper, user="dev", ok=False)
-    check(p.returncode != 0 and "not ours" in p.stderr, f"someone else's link: {p.stdout}{p.stderr}")
-    # Installing again gets out of the way of it.
-    out = box.sh(home + "sh /tmp/full.run", user="dev", timeout=600)
-    check("with Xfce and Chromium" in out, out[-500:])
-    new = box.sh("cat /home/dev/.local/share/meshvpn/desktop-full/prefix").strip()
-    check(new != prefix, "should have taken another name")
-    box.sh(home + wrapper, user="dev")
-    # A second user of the machine has their own.
-    box.sh("export HOME=/home/other; sh /tmp/full.run", user="other", timeout=600)
-    other = box.sh("cat /home/other/.local/share/meshvpn/desktop-full/prefix").strip()
-    check(other != new, "two users, two links")
-    # Removing it: the desktop goes, meshvpn stays, the other user's stays.
-    box.sh(home + "sh /tmp/full.run --uninstall", user="dev")
-    left = box.sh(f"ls /home/dev/.local/bin; ls /home/dev/.local/share/meshvpn; test -e {new} && echo LINK; true")
-    check("xfce4" not in left and "chromium" not in left and "desktop-full" not in left and "LINK" not in left, f"left behind: {left}")
-    check("meshvpn" in left, "meshvpn stays")
-    box.sh("export HOME=/home/other; /home/other/.local/bin/chromium --version", user="other")
-
-
-@test
-def test_desktop_full_nameless(lab):
-    """A container user that's only a number, not in /etc/passwd: installs, logs in, gets the desktop."""
-    check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
-    net = lab.network("net")
-    hub = lab.node("hub", [net])
-    box = lab.node("box", [net], caps=False, install=False, cmd=["sleep", "infinity"], image="debian:12-slim")
-    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
-    hub.up()
-    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
-    box.sh("mkdir /tmp/h; chown 54321:54321 /tmp/h")
-    run(["docker", "cp", FULL_RUN, f"{box.c}:/tmp/full.run"])
-    box.sh("chmod 644 /tmp/full.run")
-    me = lambda c, **k: box.sh(f"setpriv --reuid=54321 --regid=54321 --clear-groups env HOME=/tmp/h sh -c '{c}'", **k)
-    me(f"sh /tmp/full.run join {invite(hub)} --name box", timeout=600)
-    wait(lambda: hub.online("box"), "box online at hub")
-    me("/tmp/h/.local/bin/meshvpn ssh allow agent@hub --as 54321")
-    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
-    wait(lambda: hub.sh(f"ssh {o} 54321@box.mesh id -u", user="agent", ok=False).stdout.strip() == "54321",
-         "login under the number", 60)
-    # Allowed names don't help: no other user, no other number, no root.
-    me("/tmp/h/.local/bin/meshvpn ssh allow agent@hub --as 54322")
-    me("/tmp/h/.local/bin/meshvpn ssh allow agent@hub --as root")
-    for name in ("54322", "root"):
-        p = hub.sh(f"ssh {o} {name}@box.mesh id -u", user="agent", ok=False)
-        check(p.returncode != 0, f"{name} should not log in: {p.stdout}")
-    hub.sh("cd /home/agent && (meshvpn desktop box --user 54321 --no-browser --port 18085 > /tmp/desktop.out 2>&1 &)", user="agent")
-    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 30)
-    token = out.split("#", 1)[1].split()[0]
-    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py 18085 {token} full", user="agent", ok=False, timeout=300)
-    check(p.returncode == 0, f"packed desktop: {p.stdout[-2000:]}{p.stderr[-1000:]}"
-          + box.sh("tail -30 /tmp/meshvpn-desktop-*/session.log", ok=False).stdout)
-    check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, "a terminal of this desktop runs the machine's programs")
-
-
-def full_user_session(hub, box, port, label):
-    """A desktop on `box` as its user dev, opened from the hub, used and closed again."""
-    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
-    wait(lambda: hub.sh(f"ssh {o} dev@box.mesh whoami", user="agent", ok=False).stdout.strip() == "dev", f"{label}: login", 90)
-    hub.sh(f"rm -f /tmp/desktop.out; cd /home/agent && (meshvpn desktop box --user dev --no-browser --port {port} > /tmp/desktop.out 2>&1 &)",
-           user="agent")
-    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), f"{label}: viewer link", 30)
-    token = out.split("#", 1)[1].split()[0]
-    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py {port} {token} full", user="agent", ok=False, timeout=300)
-    log = box.sh("tail -30 /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
-    check(p.returncode == 0, f"{label}: {p.stdout[-1500:]}{p.stderr[-800:]}{log}")
-    check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, f"{label}: a terminal runs the machine's programs")
-    check("using the built-in desktop" not in log, f"{label}: Xfce should have stayed up: {log[-600:]}")
-    box.sh("$HOME/.local/bin/meshvpn desktop stop", ok=False)
-
-
-@test
-def test_desktop_full_container(lab):
-    """A non-root image: read-only root with the home on a volume, a restart, and the desktop built into an image."""
-    check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
-    net = lab.network("net")
-    hub = lab.node("hub", [net])
-    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
-    hub.up()
-    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
-    base, baked, vol = f"{lab.prefix}-base", f"{lab.prefix}-baked", f"{lab.prefix}-home"
-
-    def start(image, *extra):
-        c = f"{lab.prefix}-box"
-        run(["docker", "rm", "-f", c], ok=False)
-        run(["docker", "run", "-d", "--name", c, "--hostname", "box", "--network", net, *extra, image, "sleep", "infinity"])
-        if c not in lab.containers:
-            lab.containers.append(c)
-        return Node(lab, "box", c)
-
-    def up(box):
-        run(["docker", "exec", "-d", box.c, "sh", "-c", "$HOME/.local/bin/meshvpn up >> /tmp/meshvpn.log 2>&1"])
-
-    with tempfile.TemporaryDirectory(dir=os.path.dirname(FULL_RUN)) as d:
-        os.link(FULL_RUN, f"{d}/full.run")
-        open(f"{d}/Dockerfile", "w").write(
-            "FROM debian:12-slim\nRUN useradd -m -u 1000 dev\nUSER dev\nENV HOME=/home/dev\n")
-        run(["docker", "build", "-q", "-t", base, d], timeout=300)
-        # What the README tells people to write.
-        open(f"{d}/Dockerfile", "w").write(
-            f"FROM {base}\nCOPY --chown=1000:1000 full.run /tmp/full.run\nRUN sh /tmp/full.run && rm -f /tmp/full.run\n")
-        run(["docker", "build", "-q", "-t", baked, d], timeout=600)
-    run(["docker", "volume", "create", vol])
-    try:
-        # Built into the image: /tmp is empty when it starts, and it joins only now.
-        home = f"{vol}:/home/dev"
-        box = start(baked, "--tmpfs", "/tmp", "-v", home)
-        check(box.sh("id -u").strip() == "1000", "should run as the image's user")
-        box.sh(f"$HOME/.local/bin/meshvpn join {invite(hub)} --name box")
-        up(box)
-        wait(lambda: hub.online("box"), "box online at hub")
-        box.sh("$HOME/.local/bin/meshvpn ssh allow agent@hub --as dev")
-        full_user_session(hub, box, 18086, "built into the image")
-        # docker restart: started again by the entrypoint, as there's nothing else to do it.
-        run(["docker", "restart", box.c])
-        up(box)
-        full_user_session(hub, box, 18087, "after a restart")
-        # A new container, nothing writable but the home and /tmp: the same node.
-        box = start(baked, "--read-only", "--tmpfs", "/tmp", "-v", home)
-        up(box)
-        full_user_session(hub, box, 18088, "read-only root, new container")
-        nodes = [n["name"] for n in hub.mvj("nodes")]
-        check(nodes.count("box") == 1, f"the same node, not a second one: {nodes}")
-    finally:
-        run(["docker", "rm", "-f", f"{lab.prefix}-box"], ok=False)
-        run(["docker", "volume", "rm", vol], ok=False)
-        run(["docker", "rmi", "-f", baked, base], ok=False)
-
-
-@test
 def test_desktop_xfce(lab):
     """meshvpn desktop setup --xfce, then an Xfce desktop: windows as tabs, typing, persistence, log out."""
     check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
@@ -1641,7 +1417,7 @@ def test_desktop_xfce(lab):
     box.up()
     run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
     out = box.mv("desktop setup --from /tmp/desktop.tar.gz --xfce", timeout=900)
-    check("Xfce installed" in out, out[-500:])
+    check("xfce installed" in out, out[-500:])
     box.sh("chmod 644 /tmp/desktop.tar.gz")
     box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
     # A company proxy, set where logins get it: the session's programs get it too (the browser
@@ -1809,6 +1585,141 @@ def test_desktop_two_users(lab):
     wait(lambda: box.sh("pgrep -u agent -x Xvfb", ok=False).returncode != 0, "agent's X server gone", 10)
     check(box.sh("pgrep -u bob -x Xvfb", ok=False).returncode == 0, "bob's X server keeps running")
     check(box.sh("pgrep -u bob -x xterm", ok=False).returncode == 0, "bob's xterm keeps running")
+
+
+@test
+def test_desktop_desk(lab):
+    """desktop local (the login entry): the session on the machine's own screen, typing through it, leaving and coming back."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    out = box.mv("desktop setup --from /tmp/desktop.tar.gz --login")
+    check("login screen" in out and "desktop local" in box.sh("cat /usr/share/xsessions/meshvpn-desktop.desktop"), out)
+    # The machine's screen: an X server with its own cookie, as a display manager starts it.
+    box.sh("python3 -c \"import os,struct; c=os.urandom(16); f=open('/home/agent/.Xauthority-desk','wb'); "
+           "f.write(struct.pack('>H',65535)+struct.pack('>H',0)+struct.pack('>H',0)+struct.pack('>H',18)+b'MIT-MAGIC-COOKIE-1'+struct.pack('>H',16)+c)\"",
+           user="agent")
+    xvfb = box.sh("find /home/agent -path '*/bin/Xvfb' -type f | head -1").strip()
+    root = xvfb.rsplit("/bin/", 1)[0]
+    box.sh(f"(MESHVPN_XKB_BIN={root}/bin setsid {xvfb} :5 -auth ~/.Xauthority-desk -nolisten tcp -screen 0 1024x768x24 "
+           f"-fp built-ins -xkbdir {root}/share/xkb > /tmp/xvfb5.log 2>&1 &)", user="agent")
+    wait(lambda: box.sh("test -S /tmp/.X11-unix/X5", ok=False).returncode == 0, "the screen's X server", 20)
+    desk = "DISPLAY=:5 XAUTHORITY=/home/agent/.Xauthority-desk"
+    # Two monitors at the desk (with a program connected: an X server without any resets itself).
+    box.sh(f"({desk} setsid xlogo > /dev/null 2>&1 &)", user="agent")
+    time.sleep(1)
+    box.sh(f"{desk} xrandr --setmonitor L 512/100x768/100+0+0 none && {desk} xrandr --setmonitor R 512/100x768/100+512+0 none",
+           user="agent")
+    login = f"({desk} setsid meshvpn desktop local > /tmp/desk.log 2>&1 &)"
+    box.sh(login, user="agent")
+    sess = "/tmp/meshvpn-desktop-" + box.sh("id -u agent").strip()
+    wait(lambda: box.sh(f"test -f {sess}/display", ok=False).returncode == 0, "the session started", 20)
+    dpy = box.sh(f"cat {sess}/display").strip()
+    inner = f"DISPLAY={dpy} XAUTHORITY={sess}/Xauthority"
+    # The session takes the screen's size.
+    wait(lambda: "current 1024 x 768" in box.sh(f"{inner} xrandr -q", user="agent", ok=False).stdout,
+         f"the session at the screen's size: {box.sh('cat /tmp/desk.log', ok=False).stdout[-500:]}", 15)
+    # The session has the desk's monitors (its panel and maximized windows follow them).
+    mons = box.sh(f"{inner} xrandr --listmonitors", user="agent")
+    check("Monitors: 2" in mons and "512/" in mons and "+512+0" in mons, f"the desk's two monitors in the session: {mons}")
+    # A program in the session; typing at the screen reaches it.
+    box.sh(f"({inner} setsid xterm -e sh -c 'cat > /tmp/desk_typed' > /dev/null 2>&1 &)", user="agent")
+    time.sleep(2)
+    # The screen shows the session as it is.
+    xwd = ("import struct,sys; d=open(sys.argv[1],'rb').read(); h=struct.unpack('>25I',d[:100]); "
+           "print(__import__('hashlib').md5(d[h[0]+h[19]*12:]).hexdigest())")
+    box.sh(f"echo \"{xwd}\" > /tmp/xwdsum.py")
+    def same():
+        a = box.sh(f"{desk} xwd -root -silent > /tmp/a.xwd && python3 /tmp/xwdsum.py /tmp/a.xwd", user="agent", ok=False).stdout
+        b = box.sh(f"{inner} xwd -root -silent > /tmp/b.xwd && python3 /tmp/xwdsum.py /tmp/b.xwd", user="agent", ok=False).stdout
+        return a.strip() and a == b
+    wait(same, "the screen shows the session's picture", 15)
+    # Keys pressed at the screen (XTEST on it, through a shared-screen viewer).
+    env = f"MESHVPN_DESKTOP_BRIDGE='su agent -c \"meshvpn desktop attach --session screen\"'"
+    box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port 18089 > /tmp/desktop.out 2>&1 &)")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18089 {token} keys typed-at-the-desk", ok=False, timeout=60)
+    check(p.returncode == 0, f"typing at the screen: {p.stdout[-1000:]}{p.stderr[-500:]}")
+    wait(lambda: "typed-at-the-desk" in box.sh("cat /tmp/desk_typed", ok=False).stdout, "typing at the screen reaches the session", 10)
+    # Ctrl+Alt+End: the desk is left, the session keeps running.
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18089 {token} keys leave", ok=False, timeout=60)
+    wait(lambda: box.sh("pgrep -u agent -f '[d]esktop local'", ok=False).returncode != 0, "the desk viewer ends", 10)
+    check(box.sh("pgrep -u agent -x xterm", ok=False).returncode == 0, "the session keeps running")
+    # Coming back: the same session.
+    box.sh(login, user="agent")
+    wait(same, "back at the desk, the same session", 15)
+    check(box.sh(f"cat {sess}/display").strip() == dpy and box.sh("pgrep -c -u agent -x Xvfb").strip() == "2",
+          "no second session")
+
+
+def desktop_from_packages(lab, name, session_cmd, terminal):
+    """setup --desktop NAME, then that desktop by default: its session runs, a terminal of it takes typing."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    out = box.mv(f"desktop setup --from /tmp/desktop.tar.gz --desktop {name}", timeout=1500)
+    check(f"{name} installed" in out, out[-800:])
+    check(box.sh("cat /var/lib/meshvpn/desktop/default-session").strip() == name, "the machine's choice is noted")
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    env = "MESHVPN_DESKTOP_BRIDGE='su agent -c \"meshvpn desktop attach\"'"
+    box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port 18090 > /tmp/desktop.out 2>&1 &)")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18090 {token} de '{terminal}'", ok=False, timeout=400)
+    sess = "/tmp/meshvpn-desktop-" + box.sh("id -u agent").strip()
+    log = box.sh(f"tail -c 3000 {sess}/session.log", ok=False).stdout
+    check(p.returncode == 0, f"{name} session: {p.stdout[-1500:]}{p.stderr[-500:]}\nsession log: {log}")
+    check(box.sh(f"cat {sess}/mode").strip() == name, f"{name} by default: {log}")
+    check(box.sh(f"pgrep -u agent -f '{session_cmd}'", ok=False).returncode == 0, f"{session_cmd} runs as agent: {log}")
+    wait(lambda: box.sh("cat /tmp/de_typed", ok=False).stdout.strip() == "typed-in-the-desktop",
+         f"typing into {name}'s terminal", 15)
+    # No screen locker in a session only a browser shows (Cinnamon starts its own over D-Bus).
+    if name != "cinnamon":
+        check(box.sh("pgrep -u agent -f 'screensaver|light-locker'", ok=False).returncode != 0, "no screen locker")
+
+
+@test
+def test_desktop_mate(lab):
+    """meshvpn desktop setup --desktop mate: MATE from the packages, the machine's default, typing into its terminal."""
+    desktop_from_packages(lab, "mate", "mate-session", "mate-terminal")
+
+
+@test
+def test_desktop_cinnamon(lab):
+    """meshvpn desktop setup --desktop cinnamon: Cinnamon on the system's Xvfb with software OpenGL."""
+    desktop_from_packages(lab, "cinnamon", "cinnamon-session", "x-terminal-emulator")
+
+
+@test
+def test_desktop_gpu(lab):
+    """setup --gpu: OpenGL through VirtualGL (on Mesa's software EGL device here), the picture as H.264 (x264 standing in for NVENC)."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    out = box.mv("desktop setup --from /tmp/desktop.tar.gz --gpu", timeout=1500)
+    check("GPU support installed" in out and box.sh("test -f /usr/lib/libvglfaker.so", ok=False).returncode == 0, out[-800:])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    attach = "MESHVPN_DESKTOP_GPU=egl MESHVPN_DESKTOP_ENCODER=libx264 meshvpn desktop attach --session plain"
+    env = f"MESHVPN_DESKTOP_BRIDGE='su agent -c \"{attach}\"'"
+    box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port 18093 > /tmp/desktop.out 2>&1 &)")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18093 {token} video", ok=False, timeout=180)
+    sess = "/tmp/meshvpn-desktop-" + box.sh("id -u agent").strip()
+    log = box.sh(f"tail -c 2000 {sess}/session.log", ok=False).stdout
+    check(p.returncode == 0, f"video: {p.stdout[-1500:]}{p.stderr[-500:]}\nsession log: {log}")
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+    check(r["kinds"][:2] == [0, 1] and r["avcc"][0] == 1 and len(r["kinds"]) >= 3,
+          f"setup, a key frame, more frames: {r}")
+    check(r["size"] == [1000, 640] and r["tiles_after"] == 0, f"the stream at the screen's size, no tiles: {r}")
+    check("VirtualGL on egl" in log and "video: x264" in log, f"the session log: {log}")
+    glx = wait(lambda: (lambda t: t if "renderer" in t else None)(box.sh("cat /tmp/glx", ok=False).stdout), "glxinfo", 15)
+    check("VirtualGL" in glx, f"OpenGL through VirtualGL: {glx[:1500]}")
 
 
 @test
@@ -1999,11 +1910,10 @@ def run_test(name, keep):
 
 
 def main():
-    global BINARY, DESKTOP_BUNDLE, FULL_RUN
+    global BINARY, DESKTOP_BUNDLE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--binary", required=True, help="static meshvpn binary to test")
     ap.add_argument("--desktop-bundle", help="meshvpn-desktop-<arch>.tar.gz (desktop/build-bundle.sh) for the desktop test")
-    ap.add_argument("--desktop-full", help="meshvpn-full-<arch>.run (desktop/make-run.sh), adds the desktop_full tests")
     ap.add_argument("-j", "--jobs", type=int, default=3, help="tests in parallel")
     ap.add_argument("--keep", action="store_true", help="keep containers of failed tests for debugging")
     ap.add_argument("--list", action="store_true")
@@ -2015,8 +1925,7 @@ def main():
         return 0
     BINARY = os.path.abspath(a.binary)
     DESKTOP_BUNDLE = a.desktop_bundle and os.path.abspath(a.desktop_bundle)
-    FULL_RUN = a.desktop_full and os.path.abspath(a.desktop_full)
-    names = a.tests or [n for n in TESTS if not n.startswith("desktop_full") or FULL_RUN]
+    names = a.tests or list(TESTS)
     unknown = [n for n in names if n not in TESTS]
     if unknown:
         print(f"unknown tests: {unknown}; see --list")
