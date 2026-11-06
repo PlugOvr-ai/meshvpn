@@ -3706,7 +3706,10 @@ fn known_hosts_path(dir: &std::path::Path) -> PathBuf {
 /// userspace mode `ssh user@host.mesh` goes through meshvpn.
 fn ssh_client_config(dir: &std::path::Path, userspace: bool) {
     #[cfg(windows)]
-    windows_ssh_config(true, userspace);
+    {
+        let _ = dir;
+        windows_ssh_config(true, userspace);
+    }
     #[cfg(unix)]
     match crate::networks::name(dir) {
         Some(n) => unix_ssh_client_config_extra(dir, &n, userspace),

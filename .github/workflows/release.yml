@@ -71,8 +71,6 @@ jobs:
           path: dist/*
 
   macos:
-    # Paused: Linux first (enterprise). Remove this line to build and test it again.
-    if: false
     # Built natively on a Mac (both architectures), after the macOS smoke test.
     name: build macOS
     runs-on: macos-latest
@@ -107,8 +105,6 @@ jobs:
           path: dist/*
 
   windows:
-    # Paused: Linux first (enterprise). Remove this line to build and test it again.
-    if: false
     name: build Windows
     runs-on: windows-latest
     steps:
@@ -217,8 +213,7 @@ jobs:
 
   release:
     # Published only when every end-to-end test passed.
-    # (macOS and Windows are paused: add them back to `needs` with them)
-    needs: [build, desktop, desktop-full, e2e]
+    needs: [build, macos, windows, desktop, desktop-full, e2e]
     runs-on: ubuntu-latest
     steps:
       - name: Make room

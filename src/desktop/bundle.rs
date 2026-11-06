@@ -136,6 +136,12 @@ pub fn install_xfce() -> Result<()> {
 /// The packed desktop was built for /nix/store, and that path is compiled into its programs and
 /// libraries. Without root it can't be there, so every mention becomes another path of the same
 /// length, which leaves the offsets inside the files valid.
+#[cfg(not(unix))]
+pub fn relocate(_dir: &Path, _from: &str, _to: &str) -> Result<()> {
+    bail!("the packed desktop is for Linux")
+}
+
+#[cfg(unix)]
 pub fn relocate(dir: &Path, from: &str, to: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if from.len() != to.len() || from.is_empty() {
@@ -295,6 +301,7 @@ mod tests {
         assert_eq!(replace_same_length(&mut short, b"/nix/store", b"/tmp/mvab1"), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn relocating_a_tree() {
         use std::os::unix::fs::PermissionsExt;
