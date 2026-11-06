@@ -365,6 +365,13 @@ applications you want to run.
   opens an Xfce desktop: panel with the applications menu, file manager, terminal, windows you can move and resize.
   The tabs in the browser bar follow Xfce's windows; logging out of Xfce ends the session. `--plain` keeps the
   built-in minimal desktop, `--xfce` insists on Xfce. A running session keeps its desktop until `meshvpn desktop stop`.
+* **The machine's own screen:** `meshvpn desktop <node> --screen` shows the desktop you are logged in to at that
+  machine, with its windows and programs as they are (your Chrome included), instead of a desktop of its own. It keeps the
+  monitor's size (the browser scales it); with several monitors the bar shows *Screen 1*, *Screen 2*, … and *All*,
+  starting with the primary one. It stays visible at the machine while shared (with a notification there), and ends
+  when you close the tab; the programs keep running. X11 desktops only (Xorg: Cinnamon, MATE, Xfce, KDE or GNOME on X11);
+  a Wayland session is refused with a note. Chrome in a desktop of its own uses a separate profile while your usual one
+  is open on the machine's screen, because Chrome would otherwise open its windows there.
 * **Everything in one file:** `install.sh --full` (or `meshvpn-full-<arch>.run` from the release, for machines without
   internet) brings meshvpn, Xfce and the Chromium browser with all their libraries, so the node needs no package manager
   and it works the same on Debian, Ubuntu, Fedora and Alpine: `curl -fsSL .../install.sh | sudo sh -s -- --full join mesh1-...`.

@@ -13,6 +13,7 @@ pub const S_NOTICE: u8 = 8; // UTF-8 text to show
 pub const S_FILES: u8 = 9; // JSON {path, parent, entries: [{name, dir, size, mtime, link}], error}
 pub const S_FILE_DATA: u8 = 10; // id u32, offset u64, total u64, bytes (a file being read)
 pub const S_FILE_DONE: u8 = 11; // JSON {id, ok, error}: end of a read error, upload or file operation
+pub const S_MONITORS: u8 = 12; // JSON {monitors: [{name, primary, x, y, w, h}], view: index or null (all)}
 
 // browser -> session
 pub const C_POINTER: u8 = 101; // x u16, y u16, buttons u8 (1 left, 2 right, 4 middle)
@@ -29,6 +30,7 @@ pub const C_FILES: u8 = 111; // UTF-8 directory (empty: home)
 pub const C_FILE_READ: u8 = 112; // id u32, UTF-8 path
 pub const C_FILE_WRITE: u8 = 113; // id u32, offset u64, total u64, path length u16, path, bytes
 pub const C_FILE_OP: u8 = 114; // JSON {id, op: mkdir|delete|rename, path, to}
+pub const C_MONITOR: u8 = 115; // index u8 (255: all monitors), --screen only
 pub const C_STOP: u8 = 120; // end the session (closes all apps)
 
 pub const MAX_MESSAGE: usize = 32 << 20;

@@ -5,7 +5,7 @@ RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       openssh-server openssh-client sudo iproute2 iputils-ping procps netcat-openbsd \
       python3 iptables conntrack curl ca-certificates tinyproxy tar rsync \
-      xterm x11-apps xclip >/dev/null \
+      xterm x11-apps x11-xserver-utils xclip >/dev/null \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /run/sshd && ssh-keygen -A \
  && useradd -m -s /bin/bash agent

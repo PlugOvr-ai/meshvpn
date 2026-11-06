@@ -286,8 +286,12 @@ enum Cmd {
         #[arg(long, conflicts_with = "plain")]
         xfce: bool,
         /// Use meshvpn's built-in minimal desktop even if Xfce is installed.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "screen")]
         plain: bool,
+        /// Share the node's own screen instead: the desktop you are logged in to at that machine,
+        /// with its windows as they are (X11 only; visible there while shared).
+        #[arg(long, conflicts_with = "xfce")]
+        screen: bool,
     },
     /// Connect stdin/stdout to HOST:PORT in the mesh (for ssh's ProxyCommand in userspace mode).
     Nc { host: String, port: u16 },
@@ -1755,6 +1759,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             no_browser,
             xfce,
             plain,
+            screen,
         } => match cmd {
             Some(DesktopCmd::Setup { from, xfce }) => {
                 let b = desktop::bundle::setup(from.as_deref())?;
@@ -1786,7 +1791,9 @@ fn real_main(cli: Cli) -> Result<i32> {
                 };
                 if std::env::var_os("MESHVPN_DESKTOP_BRIDGE").is_some() {
                     let mut target = desktop::client::Target::test(&node, user.as_deref());
-                    target.session = if xfce {
+                    target.session = if screen {
+                        "screen"
+                    } else if xfce {
                         "xfce"
                     } else if plain {
                         "plain"
@@ -1806,7 +1813,9 @@ fn real_main(cli: Cli) -> Result<i32> {
                     socks: st.socks.is_some(),
                     timeout: std::time::Duration::from_secs(30),
                 };
-                let session = if xfce {
+                let session = if screen {
+                    "screen"
+                } else if xfce {
                     "xfce"
                 } else if plain {
                     "plain"

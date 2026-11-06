@@ -8,7 +8,8 @@ import base64, json, os, select, socket, struct, sys, time
 
 S_INIT, S_TILE, S_FRAME_END, S_WINDOWS, S_CLIPBOARD, S_CURSOR, S_APPS, S_NOTICE, S_FILES, S_FILE_DATA, S_FILE_DONE = range(1, 12)
 C_POINTER, C_WHEEL, C_KEY, C_CLIPBOARD, C_ACTIVATE, C_CLOSE, C_LAUNCH, C_ACK, C_REFRESH, C_RESIZE = range(101, 111)
-C_FILES, C_FILE_READ, C_FILE_WRITE, C_FILE_OP = range(111, 115)
+C_FILES, C_FILE_READ, C_FILE_WRITE, C_FILE_OP, C_MONITOR = range(111, 116)
+S_MONITORS = 12
 
 
 class Viewer:
@@ -25,7 +26,7 @@ class Viewer:
         self.buf = b""
         self.size = None; self.windows = []; self.apps = None; self.clip = None; self.notices = []
         self.tiles = {1: 0, 2: 0}; self.frames = 0; self.cursor = False
-        self.listing = None; self.reads = {}; self.done = {}
+        self.listing = None; self.reads = {}; self.done = {}; self.monitors = None
 
     def send(self, kind, payload=b""):
         data = bytes([kind]) + struct.pack("<I", len(payload)) + payload
@@ -71,6 +72,7 @@ class Viewer:
             fid, off, total = struct.unpack("<IQQ", p[:20])
             r = self.reads.setdefault(fid, {"data": bytearray(), "total": total})
             r["data"] += p[20:]
+        elif kind == S_MONITORS: self.monitors = json.loads(p)
         elif kind == S_FILE_DONE:
             v = json.loads(p); self.done[v["id"]] = v
 
@@ -182,8 +184,53 @@ def full(port, token):
     print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
 
 
+def screen(port, token):
+    """The machine's own screen: its size stays, typing reaches its programs."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
+    v.until(lambda: v.size is not None and v.frames >= 1, "first frame", 60)
+    v.settle(1)
+    size = v.size
+    v.send(C_POINTER, struct.pack("<HHB", 40, 40, 0))  # over the xterm (focus follows the pointer)
+    v.settle(0.5)
+    for ch in "on-the-screen €":
+        v.key(ord(ch), 1)
+    v.key(0xFF0D, 0)
+    v.settle(1.5)
+    r = {"size": size, "frames": v.frames, "notices": v.notices, "monitors": v.monitors}
+    if v.monitors and len(v.monitors["monitors"]) > 1:
+        # Several monitors: one at a time, or all of them.
+        v.send(C_MONITOR, bytes([1]))
+        v.until(lambda: v.monitors["view"] == 1, "the second monitor")
+        r["second"] = v.size
+        v.send(C_MONITOR, bytes([255]))
+        v.until(lambda: v.monitors["view"] is None, "all monitors")
+        v.until(lambda: v.frames >= 2, "a frame of all monitors")
+        r["all"] = v.size
+    print(json.dumps(r))
+
+
+def own(port, token, word):
+    """One user's own window: a titled xterm that writes what is typed to ~/typed."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 900, 600))
+    v.until(lambda: v.size == [900, 600] and v.frames >= 1, "first frame", 90)
+    v.send(C_LAUNCH, f"xterm -T {word} -e sh -c 'cat > $HOME/typed'".encode())
+    v.until(lambda: any(w["title"] == word for w in v.windows), "the xterm window", 30)
+    v.settle(1.5)
+    for ch in word:
+        v.key(ord(ch), 1)
+    v.key(0xFF0D, 0)
+    v.settle(1.5)
+    print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
+
+
 def main():
     port, token = int(sys.argv[1]), sys.argv[2]
+    if len(sys.argv) > 4 and sys.argv[3] == "own":
+        return own(port, token, sys.argv[4])
+    if len(sys.argv) > 3 and sys.argv[3] == "screen":
+        return screen(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "full":
         return full(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "xfce":

@@ -15,6 +15,8 @@
     padding: 3px 9px; font: inherit; cursor: pointer; white-space: nowrap; }
   #bar button:hover { border-color: var(--acc); }
   #title { color: var(--dim); margin-right: 6px; white-space: nowrap; }
+  #mons { display: flex; gap: 2px; }
+  #mons button.on { border-color: var(--acc); background: #34404d; }
   #tabs { display: flex; gap: 4px; overflow-x: auto; flex: 1; min-width: 0; }
   #tabs .tab { display: flex; align-items: center; gap: 6px; max-width: 220px; }
   #tabs .tab span { overflow: hidden; text-overflow: ellipsis; }
@@ -82,6 +84,7 @@
   <span id="title">__TITLE__</span>
   <button id="appsBtn">Apps ▾</button>
   <button id="filesBtn" title="Files on the node: browse, view images, download, upload (drag files here)">Files</button>
+  <div id="mons" hidden></div>
   <div id="tabs"></div>
   <button id="clipBtn" title="Clipboard">Clipboard</button>
   <button id="fullBtn" title="Fullscreen (keyboard shortcuts like Ctrl+W go to the desktop)">⛶</button>
@@ -129,9 +132,9 @@
   <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button id="dlgCancel">Cancel</button><button id="dlgOk">OK</button></div></div>
 <script>
 "use strict";
-const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8,S_FILES=9,S_FILE_DATA=10,S_FILE_DONE=11;
+const S_INIT=1,S_TILE=2,S_FRAME_END=3,S_WINDOWS=4,S_CLIPBOARD=5,S_CURSOR=6,S_APPS=7,S_NOTICE=8,S_FILES=9,S_FILE_DATA=10,S_FILE_DONE=11,S_MONITORS=12;
 const C_POINTER=101,C_WHEEL=102,C_KEY=103,C_CLIPBOARD=104,C_ACTIVATE=105,C_CLOSE=106,C_LAUNCH=107,C_ACK=108,C_REFRESH=109,C_RESIZE=110;
-const C_FILES=111,C_FILE_READ=112,C_FILE_WRITE=113,C_FILE_OP=114,C_STOP=120;
+const C_FILES=111,C_FILE_READ=112,C_FILE_WRITE=113,C_FILE_OP=114,C_MONITOR=115,C_STOP=120;
 const $ = id => document.getElementById(id);
 const canvas = $("screen"), ctx = canvas.getContext("2d"), area = $("area");
 const token = location.hash.slice(1);
@@ -202,6 +205,7 @@ function handle(m) {
     case S_FILES: onFiles(JSON.parse(dec.decode(p))); break;
     case S_FILE_DATA: onFileData(p); break;
     case S_FILE_DONE: onFileDone(JSON.parse(dec.decode(p))); break;
+    case S_MONITORS: monitors(JSON.parse(dec.decode(p))); break;
   }
 }
 
@@ -218,6 +222,19 @@ function tabs(list) {
     b.onauxclick = e => { if (e.button === 1) send(C_CLOSE, u32(w.id)); };
     t.append(b);
   }
+}
+// The machine's own screen with several monitors: one at a time, or all.
+function monitors(v) {
+  const m = $("mons"); m.textContent = "";
+  m.hidden = v.monitors.length < 2;
+  const add = (label, title, idx, on) => {
+    const b = document.createElement("button");
+    b.textContent = label; b.title = title; if (on) b.className = "on";
+    b.onclick = () => { send(C_MONITOR, new Uint8Array([idx])); canvas.focus(); };
+    m.append(b);
+  };
+  v.monitors.forEach((x, i) => add(`Screen ${i + 1}`, `${x.name} ${x.w}×${x.h}${x.primary ? " (primary)" : ""}`, i, v.view === i));
+  add("All", "All monitors side by side", 255, v.view === null);
 }
 function u32(v) { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0, true); return b; }
 

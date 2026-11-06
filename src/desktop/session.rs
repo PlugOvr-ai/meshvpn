@@ -81,6 +81,22 @@ pub fn runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where a session of `mode` keeps its files: the shared screen apart from the desktop of its
+/// own, so both can run at once.
+fn session_dir(mode_name: &str) -> Result<PathBuf> {
+    let dir = runtime_dir()?;
+    if mode_name != "screen" {
+        return Ok(dir);
+    }
+    let dir = dir.join("screen");
+    match std::fs::create_dir(&dir) {
+        Ok(()) => std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    Ok(dir)
+}
+
 pub fn socket_path(dir: &Path) -> PathBuf {
     dir.join("session.sock")
 }
@@ -137,6 +153,8 @@ fn write_fonts_conf(path: &Path, bundle: &Bundle, cache: &Path) -> Result<()> {
 pub enum Mode {
     Plain,
     Xfce,
+    /// The screen of the machine itself: the desktop someone is logged in to there (X11).
+    Screen,
 }
 
 impl Mode {
@@ -144,6 +162,7 @@ impl Mode {
         match self {
             Mode::Plain => "plain",
             Mode::Xfce => "xfce",
+            Mode::Screen => "screen",
         }
     }
 }
@@ -159,6 +178,7 @@ pub fn has_xfce() -> bool {
 pub fn resolve_mode(want: &str) -> Result<Mode> {
     match want {
         "plain" => Ok(Mode::Plain),
+        "screen" => Ok(Mode::Screen),
         "xfce" if has_xfce() => Ok(Mode::Xfce),
         "xfce" => bail!(
             "Xfce is not installed on this machine - install it with `sudo meshvpn desktop setup --xfce` there, \
@@ -197,7 +217,7 @@ pub fn attach(want: &str) -> Result<()> {
         let _ = out.write_all(&frame(S_NOTICE, text.as_bytes()));
         let _ = out.flush();
     };
-    let dir = match runtime_dir() {
+    let dir = match session_dir(want) {
         Ok(d) => d,
         Err(e) => {
             notice(&format!("{e:#}"));
@@ -212,7 +232,7 @@ pub fn attach(want: &str) -> Result<()> {
             let running = std::fs::read_to_string(dir.join("mode")).unwrap_or_else(|_| "plain".into());
             let running = running.trim();
             let explicit = (want == "xfce" || want == "plain") && running != want;
-            if explicit || (want == "auto" && running != "xfce" && has_xfce()) {
+            if want != "screen" && (explicit || (want == "auto" && running != "xfce" && has_xfce())) {
                 let other = if running == "xfce" {
                     "the built-in desktop"
                 } else {
@@ -238,7 +258,14 @@ pub fn attach(want: &str) -> Result<()> {
                     return Err(e);
                 }
             };
-            if bundle::find().is_none() {
+            // Nothing to share: say why right away.
+            if mode == Mode::Screen
+                && let Err(e) = local_screen(&dir)
+            {
+                notice(&format!("{e:#}"));
+                return Err(e);
+            }
+            if mode != Mode::Screen && bundle::find().is_none() {
                 notice("first use: installing the desktop components (about 5 MB)...");
                 if let Err(e) = bundle::setup(None) {
                     notice(&format!("{e:#}"));
@@ -336,10 +363,13 @@ enum Cmd {
 
 pub fn run(want: &str) -> Result<()> {
     let mode = resolve_mode(want)?;
-    let dir = runtime_dir()?;
+    let dir = session_dir(mode.name())?;
     let sock = socket_path(&dir);
     if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
         bail!("a desktop session is already running");
+    }
+    if mode == Mode::Screen {
+        return run_screen(&dir, &sock);
     }
     let bundle = bundle::find().ok_or_else(|| anyhow!("desktop components missing: run meshvpn desktop setup"))?;
     let mut cookie = [0u8; 16];
@@ -361,8 +391,9 @@ pub fn run(want: &str) -> Result<()> {
 
     let env = AppEnv {
         display: format!(":{dpy}"),
-        xauthority: xauth.clone(),
-        fonts_conf: fonts_conf.clone(),
+        xauthority: Some(xauth.clone()),
+        fonts_conf: Some(fonts_conf.clone()),
+        dir: dir.clone(),
         proxy: login_proxy(),
         chrome_home: browser_home(),
     };
@@ -388,10 +419,18 @@ pub fn run(want: &str) -> Result<()> {
         info!("Xfce started");
     }
 
+    let result = serve(&mut desk, &sock, cmd_tx, cmd_rx);
+    let _ = xvfb.kill();
+    let _ = xvfb.wait();
+    result
+}
+
+/// Takes browsers on `sock` and runs the session until it ends.
+fn serve(desk: &mut Desk, sock: &Path, cmd_tx: mpsc::Sender<Cmd>, cmd_rx: mpsc::Receiver<Cmd>) -> Result<()> {
     // The socket for attaching browsers.
-    let _ = std::fs::remove_file(&sock);
-    let listener = std::os::unix::net::UnixListener::bind(&sock)?;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+    let _ = std::fs::remove_file(sock);
+    let listener = std::os::unix::net::UnixListener::bind(sock)?;
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -414,11 +453,205 @@ pub fn run(want: &str) -> Result<()> {
     });
 
     let result = desk.run(cmd_rx);
-    let _ = std::fs::remove_file(&sock);
-    let _ = xvfb.kill();
-    let _ = xvfb.wait();
+    let _ = std::fs::remove_file(sock);
     drop(rt);
     result
+}
+
+/// `meshvpn desktop <node> --screen`: the machine's own screen, as the person logged in there
+/// sees it. Nothing is started or resized; it ends when the last browser leaves.
+fn run_screen(dir: &Path, sock: &Path) -> Result<()> {
+    let (screen, xauth) = local_screen(dir)?;
+    info!("sharing the screen {screen}");
+    if let Some(x) = &xauth {
+        // Safety: no other threads yet.
+        unsafe { std::env::set_var("XAUTHORITY", x) };
+    }
+    let (conn, _) =
+        RustConnection::connect(Some(&screen)).with_context(|| format!("connecting to the screen {screen}"))?;
+    let env = AppEnv {
+        display: screen,
+        xauthority: xauth,
+        fonts_conf: None,
+        dir: dir.to_path_buf(),
+        proxy: vec![],
+        chrome_home: None,
+    };
+    std::fs::write(dir.join("mode"), Mode::Screen.name())?;
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+    let mut desk = Desk::new(conn, env, Mode::Screen)?;
+    let result = serve(&mut desk, sock, cmd_tx, cmd_rx);
+    desk.restore_keys();
+    result
+}
+
+/// "7" for ":7" or ":7.0".
+fn display_number(d: &str) -> String {
+    d.trim_start_matches(':').split('.').next().unwrap_or("").to_string()
+}
+
+/// The (real) user running the X server of display `n`, if there is one.
+fn x_server_uid(n: &str) -> Option<u32> {
+    let want = format!(":{n}");
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+        if !comm.starts_with('X') {
+            continue;
+        }
+        let cmdline = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+        if !cmdline.split(|b| *b == 0).any(|a| a == want.as_bytes()) {
+            continue;
+        }
+        let status = std::fs::read_to_string(e.path().join("status")).ok()?;
+        return status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok());
+    }
+    None
+}
+
+/// The X display of this user's desktop at the machine (logind's local session), and its
+/// Xauthority. Without logind: the display the user's own programs use.
+fn local_screen(own: &Path) -> Result<(String, Option<PathBuf>)> {
+    let uid = unsafe { libc::geteuid() };
+    let mut display = None;
+    let mut wayland = false;
+    let mut others: Vec<String> = vec![];
+    if let Ok(o) = std::process::Command::new("loginctl")
+        .args(["list-sessions", "--no-legend"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        for id in String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+        {
+            let Ok(o) = std::process::Command::new("loginctl")
+                .args([
+                    "show-session",
+                    id,
+                    "-p",
+                    "User",
+                    "-p",
+                    "Type",
+                    "-p",
+                    "Display",
+                    "-p",
+                    "Remote",
+                    "-p",
+                    "State",
+                ])
+                .stderr(std::process::Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&o.stdout).into_owned();
+            let get = |k: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if get("User") != uid.to_string() {
+                // Someone else's screen: never this user's, whatever their programs say.
+                if !get("Display").is_empty() {
+                    others.push(display_number(&get("Display")));
+                }
+                continue;
+            }
+            if get("Remote") != "no" || get("State") == "closing" {
+                continue;
+            }
+            match get("Type").as_str() {
+                "x11" if !get("Display").is_empty() => display = Some(get("Display")),
+                "wayland" => wayland = true,
+                _ => {}
+            }
+        }
+    }
+    // The environments of this user's programs: the Xauthority of that display, or the display
+    // itself where there is no logind. Not those of meshvpn's own desktops.
+    let mut seen: Vec<(String, Option<PathBuf>)> = vec![];
+    let base = own.parent().unwrap_or(own).to_path_buf();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            if !e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if e.metadata().map(|m| m.uid() != uid).unwrap_or(true) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read(e.path().join("environ")) else {
+                continue;
+            };
+            let vars: HashMap<&str, &str> = raw
+                .split(|b| *b == 0)
+                .filter_map(|kv| std::str::from_utf8(kv).ok()?.split_once('='))
+                .collect();
+            let Some(d) = vars.get("DISPLAY").filter(|d| d.starts_with(':')) else {
+                continue;
+            };
+            let xa = vars.get("XAUTHORITY").map(PathBuf::from);
+            if xa
+                .as_ref()
+                .is_some_and(|x| x.starts_with(&base) || x.starts_with("/tmp/meshvpn-desktop-"))
+            {
+                continue;
+            }
+            if vars.get("XDG_SESSION_TYPE") == Some(&"wayland") {
+                wayland = true;
+                continue;
+            }
+            seen.push((d.to_string(), xa));
+        }
+    }
+    let display = match display {
+        Some(d) => d,
+        None => {
+            // The display most of them use, if its X server is there and runs as this user (not
+            // knowing logind, nothing else says whose screen it is: a display someone else opened
+            // to all, `xhost +`, stays theirs).
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for (d, _) in &seen {
+                *counts.entry(d.as_str()).or_default() += 1;
+            }
+            let running: Vec<(&str, usize)> = counts
+                .into_iter()
+                .filter(|(d, _)| Path::new(&format!("/tmp/.X11-unix/X{}", display_number(d))).exists())
+                .collect();
+            let found = running
+                .iter()
+                .filter(|(d, _)| !others.contains(&display_number(d)) && x_server_uid(&display_number(d)) == Some(uid))
+                .max_by_key(|(_, c)| *c)
+                .map(|(d, _)| d.to_string());
+            match found {
+                Some(d) => d,
+                None if !running.is_empty() => bail!(
+                    "the screen your programs here use ({}) is not yours - only the person logged in at a screen \
+                     can share it",
+                    running.iter().map(|(d, _)| *d).collect::<Vec<_>>().join(", ")
+                ),
+                None if wayland => bail!(
+                    "the desktop on this machine's screen is a Wayland session, which can't be shared this way -                      log in there with an X11 (Xorg) session to share it, or use the desktop of its own                      (meshvpn desktop <node>, without --screen)"
+                ),
+                None => bail!(
+                    "nobody is logged in to a desktop on this machine's screen as this user -                      use the desktop of its own (meshvpn desktop <node>, without --screen)"
+                ),
+            }
+        }
+    };
+    let xauth = seen
+        .iter()
+        .filter(|(d, _)| *d == display)
+        .find_map(|(_, x)| x.clone())
+        .filter(|x| x.is_file())
+        .or_else(|| {
+            let h = PathBuf::from(std::env::var_os("HOME")?).join(".Xauthority");
+            h.is_file().then_some(h)
+        });
+    Ok((display, xauth))
 }
 
 async fn serve_client(stream: tokio::net::UnixStream, id: u64, tx: mpsc::Sender<Cmd>) {
@@ -542,8 +775,10 @@ fn start_xvfb(bundle: &Bundle, xauth: &Path) -> Result<(std::process::Child, u32
 
 struct AppEnv {
     display: String,
-    xauthority: PathBuf,
-    fonts_conf: PathBuf,
+    xauthority: Option<PathBuf>,
+    fonts_conf: Option<PathBuf>,
+    /// The session's own directory (session.log, mode).
+    dir: PathBuf,
     /// The proxy settings of a login (see `login_proxy`).
     proxy: Vec<(String, String)>,
     /// Chrome's own profile for this desktop (see `browser_home`).
@@ -699,6 +934,25 @@ struct Desk {
     external_wm: bool,
     /// The desktop session (Xfce); when it ends (log out), so does this session.
     session: Option<std::process::Child>,
+    /// The machine's own screen (--screen): its size stays, and it is shared only while watched.
+    screen: bool,
+    /// --screen: the monitors of that screen, and the one shown (`None`: all of them).
+    monitors: Vec<Monitor>,
+    view: Option<usize>,
+    /// Where the part shown starts on the X screen.
+    ox: u16,
+    oy: u16,
+}
+
+/// A monitor of the shared screen (RandR).
+#[derive(serde::Serialize, Clone)]
+struct Monitor {
+    name: String,
+    primary: bool,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
 }
 
 impl Desk {
@@ -708,8 +962,10 @@ impl Desk {
         let atoms = Atoms::new(&conn)?.reply()?;
         conn.damage_query_version(1, 1)?.reply().context("DAMAGE extension")?;
         conn.xfixes_query_version(5, 0)?.reply().context("XFIXES extension")?;
-        let _ = conn.randr_query_version(1, 3)?.reply();
-        let external_wm = mode == Mode::Xfce;
+        // 1.5 for the monitors of a shared screen.
+        let _ = conn.randr_query_version(1, 5)?.reply();
+        let external_wm = mode != Mode::Plain;
+        let shared = mode == Mode::Screen;
 
         if external_wm {
             // Follow the window manager's client list and active window.
@@ -779,8 +1035,10 @@ impl Desk {
             )?;
         }
         // A plain dark background instead of X's stipple (Xfce paints its own).
-        conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().background_pixel(0x2b2f36))?;
-        conn.clear_area(false, root, 0, 0, 0, 0)?;
+        if !shared {
+            conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().background_pixel(0x2b2f36))?;
+            conn.clear_area(false, root, 0, 0, 0, 0)?;
+        }
 
         let damage = conn.generate_id()?;
         conn.damage_create(damage, root, damage::ReportLevel::NON_EMPTY)?;
@@ -826,7 +1084,15 @@ impl Desk {
             stop: false,
             external_wm,
             session: None,
+            screen: shared,
+            monitors: vec![],
+            view: None,
+            ox: 0,
+            oy: 0,
         };
+        if shared {
+            d.load_monitors();
+        }
         d.load_keymap()?;
         d.resize(1280, 800);
         d.update_cursor();
@@ -925,6 +1191,10 @@ impl Desk {
     fn command(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Join(id, tx) => {
+                if self.screen {
+                    // Monitors plugged in or arranged since.
+                    self.load_monitors();
+                }
                 let c = Client { id, tx, inflight: 0 };
                 let mut hello = frame(S_INIT, &[self.w.to_le_bytes(), self.h.to_le_bytes()].concat());
                 hello.extend(self.windows_msg());
@@ -935,12 +1205,21 @@ impl Desk {
                     hello.extend(cur.clone());
                 }
                 if c.tx.try_send(hello).is_ok() {
+                    if self.screen && self.clients.is_empty() {
+                        self.tell_screen("Your screen is being shared through meshvpn desktop.");
+                    }
                     self.clients.push(c);
                 }
                 self.full = true;
                 self.dirty = true;
             }
-            Cmd::Leave(id) => self.clients.retain(|c| c.id != id),
+            Cmd::Leave(id) => {
+                self.clients.retain(|c| c.id != id);
+                if self.screen && self.clients.is_empty() {
+                    self.tell_screen("Your screen is no longer shared.");
+                    self.stop = true;
+                }
+            }
             Cmd::Msg(id, m) => {
                 let (kind, p) = (m[0], &m[5..]);
                 if let Err(e) = self.input(id, kind, p) {
@@ -997,6 +1276,13 @@ impl Desk {
                 }
             }
             C_STOP => self.stop = true,
+            C_MONITOR if self.screen => {
+                self.load_monitors();
+                let v = p.first().copied().unwrap_or(255) as usize;
+                self.view = (v < self.monitors.len()).then_some(v);
+                let (w, h) = (self.w, self.h);
+                self.resize(w, h);
+            }
             C_FILES => {
                 let msg = files::list(&String::from_utf8_lossy(p));
                 self.send_to(from, msg);
@@ -1042,8 +1328,8 @@ impl Desk {
         c.arg("-c")
             .arg(line)
             .env("DISPLAY", &self.env.display)
-            .env("XAUTHORITY", &self.env.xauthority)
-            .env("FONTCONFIG_FILE", &self.env.fonts_conf)
+            .envs(self.env.xauthority.iter().map(|x| ("XAUTHORITY", x)))
+            .envs(self.env.fonts_conf.iter().map(|f| ("FONTCONFIG_FILE", f)))
             .env("NO_AT_BRIDGE", "1")
             .env("GDK_BACKEND", "x11")
             .env("QT_QPA_PLATFORM", "xcb")
@@ -1071,7 +1357,10 @@ impl Desk {
 
     fn resize(&mut self, w: u16, h: u16) {
         let (w, h) = (w.clamp(320, MAX_W), h.clamp(240, MAX_H));
-        if (w, h) != (self.w, self.h) || self.prev.is_empty() {
+        if self.screen {
+            // A real screen keeps its size (the browser scales it): the monitor shown, or all.
+            self.show_view();
+        } else if (w, h) != (self.w, self.h) || self.prev.is_empty() {
             if let Err(e) = self.set_screen_size(w, h) {
                 warn!("resizing the screen to {w}x{h}: {e:#}");
             }
@@ -1097,6 +1386,65 @@ impl Desk {
         self.dirty = true;
         let init = frame(S_INIT, &[self.w.to_le_bytes(), self.h.to_le_bytes()].concat());
         self.broadcast(&init);
+    }
+
+    /// --screen: the monitors as RandR has them now, left to right; shown first: the primary.
+    fn load_monitors(&mut self) {
+        let Ok(Ok(r)) = self.conn.randr_get_monitors(self.root, true).map(|c| c.reply()) else {
+            return;
+        };
+        let mut list: Vec<Monitor> = r
+            .monitors
+            .iter()
+            .filter(|m| m.width > 0 && m.height > 0)
+            .map(|m| Monitor {
+                name: self
+                    .conn
+                    .get_atom_name(m.name)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|n| String::from_utf8_lossy(&n.name).into_owned())
+                    .unwrap_or_default(),
+                primary: m.primary,
+                x: m.x.max(0) as u16,
+                y: m.y.max(0) as u16,
+                w: m.width,
+                h: m.height,
+            })
+            .collect();
+        // One spanning others (a virtual screen's own output, say) isn't a monitor of its own.
+        let inside =
+            |a: &Monitor, b: &Monitor| a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h;
+        let all = list.clone();
+        list.retain(|b| !all.iter().any(|a| (a.w, a.h) != (b.w, b.h) && inside(a, b)));
+        list.sort_by_key(|m| (m.x, m.y));
+        let first = self.monitors.len() < 2;
+        self.monitors = list;
+        if self.monitors.len() < 2 {
+            self.view = None;
+        } else if first || self.view.is_some_and(|v| v >= self.monitors.len()) {
+            self.view = Some(self.monitors.iter().position(|m| m.primary).unwrap_or(0));
+        }
+    }
+
+    /// --screen: the part of the screen shown to the browsers, and the monitor list for its
+    /// switcher.
+    fn show_view(&mut self) {
+        let (ox, oy, w, h) = match self.view.and_then(|v| self.monitors.get(v)) {
+            Some(m) => (m.x, m.y, m.w, m.h),
+            None => {
+                let g = self.conn.get_geometry(self.root).ok().and_then(|c| c.reply().ok());
+                g.map(|g| (0, 0, g.width, g.height)).unwrap_or((0, 0, self.w, self.h))
+            }
+        };
+        let (w, h) = (w.min(MAX_W), h.min(MAX_H));
+        if (ox, oy, w, h) != (self.ox, self.oy, self.w, self.h) || self.prev.is_empty() {
+            (self.ox, self.oy, self.w, self.h) = (ox, oy, w, h);
+            self.prev = vec![0; w as usize * h as usize * 4];
+        }
+        let list = serde_json::json!({ "monitors": self.monitors, "view": self.view });
+        let msg = frame(S_MONITORS, list.to_string().as_bytes());
+        self.broadcast(&msg);
     }
 
     fn set_screen_size(&mut self, w: u16, h: u16) -> Result<()> {
@@ -1161,14 +1509,32 @@ impl Desk {
             && len <= s.size
         {
             self.conn
-                .shm_get_image(self.root, 0, 0, w, h, !0, ImageFormat::Z_PIXMAP.into(), s.seg, 0)?
+                .shm_get_image(
+                    self.root,
+                    self.ox as i16,
+                    self.oy as i16,
+                    w,
+                    h,
+                    !0,
+                    ImageFormat::Z_PIXMAP.into(),
+                    s.seg,
+                    0,
+                )?
                 .reply()?;
             let data = unsafe { std::slice::from_raw_parts(s.addr, len) };
             return Ok(data.to_vec());
         }
         let r = self
             .conn
-            .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, w, h, !0)?
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                self.ox as i16,
+                self.oy as i16,
+                w,
+                h,
+                !0,
+            )?
             .reply()?;
         Ok(r.data)
     }
@@ -1501,7 +1867,7 @@ impl Desk {
             AtomEnum::WINDOW,
             &[self.support],
         )?;
-        let _ = std::fs::write(self.env.xauthority.with_file_name("mode"), "plain");
+        let _ = std::fs::write(self.env.dir.join("mode"), "plain");
         self.windows.clear();
         let tree = self.conn.query_tree(self.root)?.reply()?;
         for win in tree.children {
@@ -1664,8 +2030,8 @@ impl Desk {
 
     fn pointer(&mut self, x: u16, y: u16, buttons: u8) -> Result<()> {
         let (x, y) = (
-            x.min(self.w.saturating_sub(1)) as i16,
-            y.min(self.h.saturating_sub(1)) as i16,
+            (x.min(self.w.saturating_sub(1)) + self.ox) as i16,
+            (y.min(self.h.saturating_sub(1)) + self.oy) as i16,
         );
         self.conn
             .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, self.root, x, y, 0)?;
@@ -1744,6 +2110,25 @@ impl Desk {
         self.conn.change_keyboard_mapping(1, kc, per, &[keysym; 4])?;
         self.char_keys.insert(keysym, kc);
         Ok(Some(kc))
+    }
+
+    /// The spare keycodes bound to typed characters free again (on a real screen they would
+    /// stay in its keymap).
+    fn restore_keys(&mut self) {
+        for (_, kc) in self.char_keys.drain() {
+            let _ = self.conn.change_keyboard_mapping(1, kc, 4, &[0; 4]);
+        }
+        for (_, kc) in self.pressed.drain() {
+            let _ = self.conn.xtest_fake_input(KEY_RELEASE_EVENT, kc, 0, self.root, 0, 0, 0);
+        }
+        let _ = self.conn.flush();
+    }
+
+    /// A notification on the shared screen itself, for whoever sits in front of it.
+    fn tell_screen(&self, text: &str) {
+        if which("notify-send") {
+            let _ = self.spawn(&format!("exec notify-send -a meshvpn meshvpn '{text}'"));
+        }
     }
 
     fn key(&mut self, down: bool, is_char: bool, keysym: u32) -> Result<()> {

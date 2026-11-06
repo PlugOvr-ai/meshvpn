@@ -1694,6 +1694,124 @@ def test_desktop_fallback(lab):
 
 
 @test
+def test_desktop_screen(lab):
+    """desktop --screen: the machine's own screen as it is (found from the user's programs), typing, ends with the viewer."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    # Nobody logged in at the screen: said so.
+    out = box.sh("meshvpn desktop attach --session screen < /dev/null | tr -c '[:print:]' ' '", user="agent", ok=False).stdout
+    check("nobody is logged in" in out, f"no screen to share: {out[-400:]}")
+    # Someone else's screen, even one open to everybody (-ac, like `xhost +`), that a program of
+    # this user points at: not shared.
+    xvfb = box.sh("find / -path '*/bin/Xvfb' -type f 2>/dev/null | head -1").strip()
+    root = xvfb.rsplit("/bin/", 1)[0]
+    box.sh("useradd -m other")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="other")
+    oroot = root.replace("/home/agent/", "/home/other/")
+    box.sh(f"(MESHVPN_XKB_BIN={oroot}/bin setsid {oroot}/bin/Xvfb :8 -ac -nolisten tcp -screen 0 800x600x24 "
+           f"-fp built-ins -xkbdir {oroot}/share/xkb > /tmp/xvfb8.log 2>&1 &)", user="other")
+    wait(lambda: box.sh("test -S /tmp/.X11-unix/X8", ok=False).returncode == 0, "the other user's X server", 20)
+    box.sh("(DISPLAY=:8 setsid sleep 600 > /dev/null 2>&1 &)", user="agent")
+    check(box.sh("DISPLAY=:8 xrandr -q >/dev/null 2>&1", user="agent", ok=False).returncode == 0,
+          "the other screen is open to everybody")
+    out = box.sh("meshvpn desktop attach --session screen < /dev/null | tr -c '[:print:]' ' '", user="agent", ok=False).stdout
+    check("is not yours" in out, f"someone else's screen is refused: {out[-400:]}")
+    box.sh("pkill -u agent -x sleep", ok=False)
+    # The machine's own screen: an X server with its own cookie, an xterm the user runs on it.
+    box.sh("python3 -c \"import os,struct; c=os.urandom(16); f=open('/home/agent/.Xauthority-local','wb'); "
+           "f.write(struct.pack('>H',65535)+struct.pack('>H',0)+struct.pack('>H',0)+struct.pack('>H',18)+b'MIT-MAGIC-COOKIE-1'+struct.pack('>H',16)+c)\"",
+           user="agent")
+    box.sh(f"(MESHVPN_XKB_BIN={root}/bin setsid {xvfb} :7 -auth ~/.Xauthority-local -nolisten tcp -screen 0 1024x768x24 "
+           f"-fp built-ins -xkbdir {root}/share/xkb > /tmp/xvfb7.log 2>&1 &)", user="agent")
+    wait(lambda: box.sh("test -S /tmp/.X11-unix/X7", ok=False).returncode == 0, "the screen's X server", 20)
+    box.sh("(LANG=C.UTF-8 DISPLAY=:7 XAUTHORITY=/home/agent/.Xauthority-local setsid xterm -geometry 80x20+0+0 -e sh -c 'cat > /tmp/screen_typed' "
+           "> /dev/null 2>&1 &)", user="agent")
+    time.sleep(2)
+    env = f"MESHVPN_DESKTOP_BRIDGE='su agent -c \"meshvpn desktop attach --session screen\"'"
+    box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port 18086 > /tmp/desktop.out 2>&1 &)")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18086 {token} screen", ok=False, timeout=120)
+    check(p.returncode == 0, f"screen: {p.stdout[-2000:]}{p.stderr[-1000:]}")
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+    check(r["size"] == [1024, 768], f"the screen keeps its size: {r}")
+    # Two monitors side by side: the first shown, then each one, then both.
+    box.sh("export DISPLAY=:7 XAUTHORITY=/home/agent/.Xauthority-local; "
+           "xrandr --setmonitor L 512/100x768/100+0+0 none && xrandr --setmonitor R 512/100x768/100+512+0 none", user="agent")
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18086 {token} screen", ok=False, timeout=120)
+    check(p.returncode == 0, f"screen with two monitors: {p.stdout[-2000:]}{p.stderr[-1000:]}")
+    r = json.loads(p.stdout.strip().splitlines()[-1])
+    check(r["size"] == [512, 768] and [m["name"] for m in r["monitors"]["monitors"]] == ["L", "R"],
+          f"one monitor at a time, the first one first: {r}")
+    check(r["second"] == [512, 768] and r["all"] == [1024, 768], f"the other monitor, then both: {r}")
+    wait(lambda: "on-the-screen €" in box.sh("cat /tmp/screen_typed", ok=False).stdout, "typing on the screen", 10)
+    # No X server of its own, and sharing ends with the last viewer.
+    check(box.sh("pgrep -c -u agent -x Xvfb", ok=False).stdout.strip() == "1", "only the screen's own X server")
+    wait(lambda: box.sh("pgrep -f '[d]esktop session --session screen'", ok=False).returncode != 0,
+         "sharing ends when the viewer leaves", 15)
+    check(box.sh("pgrep -x xterm", ok=False).returncode == 0, "the screen's programs keep running")
+
+
+@test
+def test_desktop_two_users(lab):
+    """Two users' desktops at the same time: each its own X server, windows and typing; neither reaches the other's."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    box.sh("useradd -m -s /bin/bash bob")
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    users = {"agent": 18087, "bob": 18088}
+    for u in users:
+        box.mv("desktop setup --from /tmp/desktop.tar.gz", user=u)
+    # Both viewers at once, each logged in as its user (through `su` here instead of SSH).
+    for u, port in users.items():
+        env = f"MESHVPN_DESKTOP_BRIDGE='su {u} -c \"meshvpn desktop attach --session plain\"'"
+        box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port {port} > /tmp/desktop-{u}.out 2>&1 &)")
+    tokens = {}
+    for u in users:
+        out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh(f"cat /tmp/desktop-{u}.out", ok=False).stdout),
+                   f"viewer link for {u}", 10)
+        tokens[u] = out.split("#", 1)[1].split()[0]
+    for u, port in users.items():
+        box.sh(f"(python3 /usr/local/bin/desktop_client.py {port} {tokens[u]} own word-{u} > /tmp/client-{u}.out 2>&1; "
+               f"echo $? > /tmp/client-{u}.rc) &")
+    for u in users:
+        wait(lambda: box.sh(f"cat /tmp/client-{u}.rc", ok=False).stdout.strip() != "", f"{u}'s viewer done", 180)
+        out = box.sh(f"cat /tmp/client-{u}.out", ok=False).stdout
+        check(box.sh(f"cat /tmp/client-{u}.rc").strip() == "0", f"{u}'s desktop: {out[-1500:]}")
+        r = json.loads(out.strip().splitlines()[-1])
+        check(r["windows"] == [f"word-{u}"], f"{u} sees only their own window: {r}")
+        typed = box.sh(f"stat -c %U /home/{u}/typed && cat /home/{u}/typed", ok=False).stdout.split()
+        check(typed == [u, f"word-{u}"], f"{u}'s typing reached only {u}'s xterm: {typed}")
+    # Two X servers, one per user, on different displays.
+    xs = box.sh("ps -o user=,args= -C Xvfb", ok=False).stdout.strip().splitlines()
+    owners = sorted(l.split()[0] for l in xs)
+    check(owners == ["agent", "bob"], f"one X server per user: {xs}")
+    dpys = {}
+    for u in users:
+        log = box.sh(f"cat /tmp/meshvpn-desktop-$(id -u {u})/session.log", user=u)
+        dpys[u] = log.rsplit("as display :", 1)[1].split()[0]
+    check(dpys["agent"] != dpys["bob"], f"different displays: {dpys}")
+    sess = "/tmp/meshvpn-desktop-" + box.sh("id -u agent").strip()
+    dpy = dpys["agent"]
+    # bob can't reach agent's session: not its socket, not its key, not its display.
+    p = box.sh(f"python3 -c \"import socket; socket.socket(socket.AF_UNIX).connect('{sess}/session.sock')\"",
+               user="bob", ok=False)
+    check(p.returncode != 0 and "Permission" in p.stderr, f"bob can't attach to agent's session: {p.stderr[-300:]}")
+    check(box.sh(f"cat {sess}/Xauthority", user="bob", ok=False).returncode != 0, "bob can't read agent's key")
+    p = box.sh(f"DISPLAY=:{dpy} XAUTHORITY=/dev/null xrandr -q", user="bob", ok=False)
+    check(p.returncode != 0, f"bob can't use agent's display :{dpy}: {p.stdout[-300:]}")
+    # Ending agent's session leaves bob's running.
+    check("ended" in box.mv("desktop stop", user="agent"), "agent's desktop stop")
+    wait(lambda: box.sh("pgrep -u agent -x Xvfb", ok=False).returncode != 0, "agent's X server gone", 10)
+    check(box.sh("pgrep -u bob -x Xvfb", ok=False).returncode == 0, "bob's X server keeps running")
+    check(box.sh("pgrep -u bob -x xterm", ok=False).returncode == 0, "bob's xterm keeps running")
+
+
+@test
 def test_console(lab):
     """meshvpn console: node list, shells as tabs with each node's default user (or the one last used), desktop link."""
     net = lab.network("net")
