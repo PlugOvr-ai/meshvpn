@@ -364,7 +364,11 @@ pub fn run(want: &str) -> Result<()> {
         xauthority: xauth.clone(),
         fonts_conf: fonts_conf.clone(),
         proxy: login_proxy(),
+        chrome_home: browser_home(),
     };
+    if let Some(h) = &env.chrome_home {
+        info!("Chrome runs with its own profile here: {}", h.display());
+    }
     if !env.proxy.is_empty() {
         let names: Vec<&str> = env.proxy.iter().map(|(k, _)| k.as_str()).collect();
         info!("proxy settings of a login: {}", names.join(", "));
@@ -542,6 +546,48 @@ struct AppEnv {
     fonts_conf: PathBuf,
     /// The proxy settings of a login (see `login_proxy`).
     proxy: Vec<(String, String)>,
+    /// Chrome's own profile for this desktop (see `browser_home`).
+    chrome_home: Option<PathBuf>,
+}
+
+/// Chrome and Chromium hand a start over to a browser of the same profile that already runs on
+/// this machine, and that one opens the window on its own screen: on a machine with a local
+/// desktop, Chrome would appear there and not here. So while the usual profile is in use, the
+/// browsers of this desktop get a profile of their own (`CHROME_CONFIG_HOME`), and keep it from
+/// then on, so bookmarks and logins don't change between sessions.
+fn browser_home() -> Option<PathBuf> {
+    if std::env::var_os("CHROME_CONFIG_HOME").is_some() {
+        return None;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let own = home.join(".config/meshvpn-desktop");
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    const PROFILES: &[&str] = &[
+        "google-chrome",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "chromium",
+        "microsoft-edge",
+        "BraveSoftware/Brave-Browser",
+        "vivaldi",
+    ];
+    let host = crate::sys::hostname();
+    // The lock names "<host>-<pid>" of the browser holding it.
+    let running = |dir: &str| {
+        std::fs::read_link(config.join(dir).join("SingletonLock"))
+            .ok()
+            .and_then(|t| {
+                let t = t.to_string_lossy().into_owned();
+                let (h, pid) = t.rsplit_once('-')?;
+                Some(h == host && Path::new(&format!("/proc/{pid}")).exists())
+            })
+            .unwrap_or(false)
+    };
+    let used = PROFILES.iter().any(|d| own.join(d).exists());
+    (used || PROFILES.iter().any(|d| running(d))).then_some(own)
 }
 
 const PROXY_VARS: &[&str] = &[
@@ -1003,6 +1049,7 @@ impl Desk {
             .env("QT_QPA_PLATFORM", "xcb")
             .env_remove("WAYLAND_DISPLAY")
             .envs(self.env.proxy.iter().map(|(k, v)| (k, v)))
+            .envs(self.env.chrome_home.iter().map(|h| ("CHROME_CONFIG_HOME", h)))
             .stdin(std::process::Stdio::null());
         // Containers often set no locale: apps would fall back to ASCII/Latin-1.
         if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {
