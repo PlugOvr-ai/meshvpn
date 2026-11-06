@@ -363,7 +363,12 @@ pub fn run(want: &str) -> Result<()> {
         display: format!(":{dpy}"),
         xauthority: xauth.clone(),
         fonts_conf: fonts_conf.clone(),
+        proxy: login_proxy(),
     };
+    if !env.proxy.is_empty() {
+        let names: Vec<&str> = env.proxy.iter().map(|(k, _)| k.as_str()).collect();
+        info!("proxy settings of a login: {}", names.join(", "));
+    }
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let mut desk = Desk::new(conn, env, mode)?;
     std::fs::write(dir.join("mode"), mode.name())?;
@@ -535,6 +540,59 @@ struct AppEnv {
     display: String,
     xauthority: PathBuf,
     fonts_conf: PathBuf,
+    /// The proxy settings of a login (see `login_proxy`).
+    proxy: Vec<(String, String)>,
+}
+
+const PROXY_VARS: &[&str] = &[
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+];
+
+/// The proxy settings a login of this user gets: from /etc/environment, and from the login
+/// scripts (/etc/profile, /etc/profile.d, ~/.profile), where companies usually set them. This
+/// session starts over ssh without a login, so it lacks them, and a browser that doesn't know the
+/// proxy can't log in to it. Those already set here win.
+fn login_proxy() -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = vec![];
+    let mut add = |k: &str, v: &str| {
+        let v = v.trim().trim_matches('"').trim_matches('\'');
+        if PROXY_VARS.contains(&k)
+            && !v.is_empty()
+            && std::env::var_os(k).is_none()
+            && !found.iter().any(|(f, _)| f == k)
+        {
+            found.push((k.to_string(), v.to_string()));
+        }
+    };
+    let etc = std::fs::read_to_string("/etc/environment").unwrap_or_default();
+    // A login shell's environment, in a few seconds at most (a script could wait for input).
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| s.starts_with('/'))
+        .unwrap_or("/bin/sh".into());
+    let login = std::process::Command::new("timeout")
+        .args(["5", &shell, "-l", "-c", "env"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    for line in login.lines().chain(etc.lines()) {
+        let line = line.trim().trim_start_matches("export ");
+        if let Some((k, v)) = line.split_once('=') {
+            add(k.trim(), v);
+        }
+    }
+    found
 }
 
 struct Client {
@@ -944,6 +1002,7 @@ impl Desk {
             .env("GDK_BACKEND", "x11")
             .env("QT_QPA_PLATFORM", "xcb")
             .env_remove("WAYLAND_DISPLAY")
+            .envs(self.env.proxy.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::null());
         // Containers often set no locale: apps would fall back to ASCII/Latin-1.
         if std::env::var_os("LANG").is_none() && std::env::var_os("LC_ALL").is_none() {

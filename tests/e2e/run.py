@@ -1624,6 +1624,9 @@ def test_desktop_xfce(lab):
     check("Xfce installed" in out, out[-500:])
     box.sh("chmod 644 /tmp/desktop.tar.gz")
     box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    # A company proxy, set where logins get it: the session's programs get it too (the browser
+    # can only log in to a proxy it knows), though the session starts over ssh without a login.
+    box.sh("echo 'export https_proxy=http://proxy.example:3128' > /etc/profile.d/proxy.sh")
     wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
          "ssh from hub to box", 60)
     hub.sh("cd /home/agent && (meshvpn desktop box --no-browser --port 18081 > /tmp/desktop.out 2>&1 &)", user="agent")
@@ -1638,6 +1641,8 @@ def test_desktop_xfce(lab):
     for p_ in ("xfwm4", "xfce4-panel", "Xvfb"):
         check(p_ in procs, f"{p_} should run as agent: {procs}")
     check(box.sh("cat /tmp/xfce_typed", ok=False).stdout.strip() == "typed-in-xfce", "typing into the Xfce terminal")
+    env = box.sh("tr '\\0' '\\n' < /proc/$(pgrep -u agent -x xfce4-session | head -1)/environ", user="agent", ok=False).stdout
+    check("https_proxy=http://proxy.example:3128" in env, f"the session has the login's proxy: {env[-800:]}")
     # Logging out of Xfce ends the session.
     sess = box.sh("ls -d /tmp/meshvpn-desktop-*", user="agent").strip()
     box.sh(f"DISPLAY=$(grep -o 'display :[0-9]*' {sess}/session.log | tail -1 | cut -c9-) XAUTHORITY={sess}/Xauthority "
