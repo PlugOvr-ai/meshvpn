@@ -408,7 +408,7 @@ pub fn login_users() -> Vec<(String, std::path::PathBuf)> {
 
 /// An account of a person: from 1000, without nobody (65534) and the "no account" numbers at
 /// the top. Large numbers are people too (LDAP, SSSD and clusters hand out uids in the millions).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn person_uid(uid: u32) -> bool {
     uid >= 1000 && !matches!(uid, 65534 | 65535 | 4294967294 | 4294967295)
 }
