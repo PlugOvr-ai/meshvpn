@@ -213,12 +213,17 @@ pub fn setup(from: Option<&Path>) -> Result<Bundle> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let client = crate::update::client(None)?;
-                let tag = if crate::update::is_dev_build() {
-                    crate::update::latest_tag(&client).await?
-                } else {
+                // The bundle is published with meshvpn's own releases, also for builds with an
+                // extension (their releases elsewhere, their version number their own): those
+                // and development builds take the newest one.
+                let repo = crate::update::REPO;
+                let own = crate::ext::get().and_then(|e| e.version()).is_none();
+                let tag = if own && !crate::update::is_dev_build() {
                     format!("v{}", env!("CARGO_PKG_VERSION"))
+                } else {
+                    crate::update::latest_tag_of(&client, repo).await?
                 };
-                crate::update::download_verified(&client, &tag, &archive_name())
+                crate::update::download_verified(&client, repo, &tag, &archive_name())
                     .await
                     .with_context(|| {
                         format!(

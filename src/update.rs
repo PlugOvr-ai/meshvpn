@@ -54,7 +54,12 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 /// Tag of the latest release (e.g. `v0.2.0`). Uses the `releases/latest` redirect instead of
 /// the GitHub API, so there is no rate limit to run into.
 pub async fn latest_tag(client: &reqwest::Client) -> Result<String> {
-    let url = format!("https://github.com/{}/releases/latest", repo());
+    latest_tag_of(client, &repo()).await
+}
+
+/// The newest release of GitHub repository `repo` ("owner/name").
+pub async fn latest_tag_of(client: &reqwest::Client, repo: &str) -> Result<String> {
+    let url = format!("https://github.com/{repo}/releases/latest");
     let resp = client.head(&url).send().await.context("contacting github.com")?;
     let final_url = resp.url().clone();
     let tag = final_url
@@ -77,9 +82,10 @@ pub fn current_exe() -> Result<PathBuf> {
     Ok(PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s)))
 }
 
-/// Downloads file `name` of release `tag` and checks it against the published `<name>.sha256`.
-pub async fn download_verified(client: &reqwest::Client, tag: &str, name: &str) -> Result<Vec<u8>> {
-    let base = format!("https://github.com/{}/releases/download/{tag}", repo());
+/// Downloads file `name` of release `tag` of GitHub repository `repo` and checks it against the
+/// published `<name>.sha256`.
+pub async fn download_verified(client: &reqwest::Client, repo: &str, tag: &str, name: &str) -> Result<Vec<u8>> {
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let get = |url: String| async move {
         let r = client
             .get(&url)
