@@ -170,9 +170,10 @@ pub fn network_of_node(base: &Path, node: &str) -> Option<String> {
 /// Names of the nodes a network knows: from its daemon, else from what it saved.
 fn known_names(dir: &Path) -> Vec<String> {
     let Ok(cfg) = Config::load(dir) else { return vec![] };
-    let asked = tokio::runtime::Runtime::new()
-        .ok()
-        .and_then(|rt| rt.block_on(crate::control::request(dir, &crate::control::Request::Status)).ok());
+    let asked = tokio::runtime::Runtime::new().ok().and_then(|rt| {
+        rt.block_on(crate::control::request(dir, &crate::control::Request::Status))
+            .ok()
+    });
     if let Some(crate::control::Response::Status(st)) = asked {
         let mut names: Vec<String> = st.peers.into_iter().map(|p| p.name).collect();
         names.push(st.name);
