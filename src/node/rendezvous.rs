@@ -542,7 +542,15 @@ mod tests {
     /// Publish and look up through a DHT on localhost.
     #[tokio::test(flavor = "multi_thread")]
     async fn through_a_local_dht() {
-        let testnet = mainline::Testnet::new_async(5).await.unwrap();
+        // On 127.0.0.1: the default 0.0.0.0 isn't reachable as a destination on macOS/Windows.
+        let testnet = tokio::task::spawn_blocking(|| {
+            mainline::Testnet::builder(5)
+                .bind_address(std::net::Ipv4Addr::LOCALHOST)
+                .build()
+                .unwrap()
+        })
+        .await
+        .unwrap();
         let client = |_: ()| {
             Dht::builder()
                 .bootstrap(&testnet.bootstrap)
