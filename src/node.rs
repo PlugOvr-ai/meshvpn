@@ -252,7 +252,8 @@ struct State {
     /// Addresses of nodes found through the rendezvous (newer than their records).
     dht_hints: HashMap<NodeId, (Vec<String>, Instant)>,
     /// IPv6 addresses of nodes for hole punching, found through the rendezvous.
-    punch_hints: HashMap<NodeId, (Vec<SocketAddr>, Instant)>,
+    /// (addresses, when found, when the node made the entry in ms)
+    punch_hints: HashMap<NodeId, (Vec<SocketAddr>, Instant, u64)>,
     /// Since when we try to punch towards a node (no link yet).
     punch_since: HashMap<NodeId, Instant>,
     rendezvous: rendezvous::RendezvousState,

@@ -25,7 +25,8 @@ use mainline::{Dht, MutableItem, RequestFilter, RequestSpecific, ServerSettings,
 
 /// Entries are put again this often (DHT nodes drop them after about two hours).
 const PUBLISH_EVERY: Duration = Duration::from_secs(30 * 60);
-/// How often a node that is gone is looked up: soon while we have no link at all.
+/// How often a node that is gone is looked up: soon while we have no link at all, or it is
+/// gone only lately.
 const LOOKUP_EVERY: Duration = Duration::from_secs(10 * 60);
 const LOOKUP_ALONE: Duration = Duration::from_secs(2 * 60);
 /// Nodes not heard of for a day are looked up rarely.
@@ -33,7 +34,9 @@ const LOOKUP_STALE: Duration = Duration::from_secs(60 * 60);
 /// Lookups at a time.
 const LOOKUPS_PER_ROUND: usize = 4;
 /// An entry older than this is ignored.
-const MAX_AGE_MS: u64 = 3 * 3600 * 1000;
+/// (Entries are put again every half hour: an old one is from a node that moved or is gone, and
+/// one found then would only send the others to an address that no longer holds.)
+const MAX_AGE_MS: u64 = 75 * 60 * 1000;
 /// An entry stored at fewer DHT nodes is put again soon.
 const MIN_STORED: u32 = 8;
 /// Addresses found are tried for this long.
@@ -59,6 +62,8 @@ struct Entry {
 pub(super) struct Found {
     pub ep: Vec<String>,
     pub v6: Vec<SocketAddr>,
+    /// When the node made the entry (ms).
+    pub at: u64,
 }
 
 fn day(now_ms: u64) -> u64 {
@@ -145,7 +150,7 @@ fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -
         .filter(|a| matches!(a.ip(), IpAddr::V6(ip) if ip.segments()[0] & 0xe000 == 0x2000))
         .collect();
     v6.truncate(4);
-    (!ep.is_empty() || !v6.is_empty()).then_some(Found { ep, v6 })
+    (!ep.is_empty() || !v6.is_empty()).then_some(Found { ep, v6, at: entry.at })
 }
 
 /// Never answer other people's DHT queries: this node only asks and stores its own entries.
@@ -189,6 +194,11 @@ pub(super) struct RendezvousState {
     running: usize,
     /// The DHT couldn't be started or reached (last error).
     error: Option<String>,
+    /// The last put: when, at how many DHT nodes, and whether a lookup of our own then found it
+    /// (or still an older one: the entry didn't reach the nodes others ask).
+    put_at: Option<Instant>,
+    stored_at: u32,
+    visible: Option<bool>,
 }
 
 impl Node {
@@ -268,9 +278,14 @@ impl Node {
                 .filter(|r| !st.banned.contains_key(&r.info.id))
                 .filter_map(|r| {
                     let stale = now.saturating_sub(r.info.seq) > 86_400_000;
+                    // Just gone (hole punching runs all the time then): often, so both sides
+                    // soon try each other's current addresses - also while other links are up.
+                    let fresh = self
+                        .offline_for(&st, &r.info.id)
+                        .is_some_and(|d| d < super::punch::EAGER);
                     let every = if stale {
                         LOOKUP_STALE
-                    } else if alone {
+                    } else if alone || fresh {
                         LOOKUP_ALONE
                     } else {
                         LOOKUP_EVERY
@@ -304,12 +319,25 @@ impl Node {
             let dht = dht.clone();
             tokio::spawn(async move {
                 let ok = node.rendezvous_publish(&dht, &key, &endpoints, &v6, now).await;
+                // Look it up ourselves: does a lookup find this version, or still an older one?
+                let visible = match ok {
+                    Ok(_) => Some(node.rendezvous_readback(&dht, &key, now).await),
+                    Err(_) => None,
+                };
                 let mut st = node.state.lock().unwrap();
                 st.rendezvous.publishing = false;
                 match ok {
                     Ok(stored) => {
-                        // Stored at few nodes: again soon, not in half an hour.
-                        let at = if stored < MIN_STORED {
+                        st.rendezvous.put_at = Some(Instant::now());
+                        st.rendezvous.stored_at = stored;
+                        st.rendezvous.visible = visible;
+                        if visible == Some(false) {
+                            info!(
+                                "rendezvous: published, but a lookup still finds an older entry - again in 2 minutes"
+                            );
+                        }
+                        // Stored at few nodes or not found: again soon, not in half an hour.
+                        let at = if stored < MIN_STORED || visible == Some(false) {
                             Instant::now().checked_sub(PUBLISH_EVERY - Duration::from_secs(120))
                         } else {
                             None
@@ -334,7 +362,7 @@ impl Node {
                 if let Some(found) = found {
                     let name = st.records.get(&id).map(|r| r.info.name.clone()).unwrap_or_default();
                     let known = st.dht_hints.get(&id).is_some_and(|(e, _)| *e == found.ep)
-                        && st.punch_hints.get(&id).is_some_and(|(v, _)| *v == found.v6);
+                        && st.punch_hints.get(&id).is_some_and(|(v, _, _)| *v == found.v6);
                     if !known {
                         let mut all = found.ep.clone();
                         all.extend(found.v6.iter().map(|a| a.to_string()));
@@ -344,7 +372,7 @@ impl Node {
                         st.dht_hints.insert(id, (found.ep, Instant::now()));
                     }
                     if !found.v6.is_empty() {
-                        st.punch_hints.insert(id, (found.v6, Instant::now()));
+                        st.punch_hints.insert(id, (found.v6, Instant::now(), found.at));
                     }
                     // Try the new address now, not at the next backoff step.
                     st.backoff.remove(&id.hex());
@@ -378,7 +406,17 @@ impl Node {
         Ok(out.stored_at)
     }
 
-    /// `id`'s endpoints from today's entry, or yesterday's (just after midnight).
+    /// Whether a lookup finds the entry we just put (seq `now` in seconds).
+    async fn rendezvous_readback(&self, dht: &AsyncDht, key: &[u8; 32], now: u64) -> bool {
+        let d = day(now);
+        let public = signing_key(key, d).verifying_key().to_bytes();
+        let salt = salt(key, d, &self.ident.id);
+        dht.get_mutable_most_recent(&public, Some(&salt))
+            .await
+            .is_some_and(|item| item.seq() >= (now / 1000) as i64)
+    }
+
+    /// What `id`'s entry of today says, or yesterday's (just after midnight).
     async fn rendezvous_lookup(&self, dht: &AsyncDht, key: &[u8; 32], id: &NodeId) -> Option<Found> {
         let now = now_ms();
         for d in [day(now), day(now).saturating_sub(1)] {
@@ -400,14 +438,24 @@ impl Node {
         }
         let r = &st.rendezvous;
         let mut parts = vec![];
-        match &r.published {
-            Some((ep, at, _)) => parts.push(format!(
-                "published {} ({} ago)",
-                ep.join(", "),
-                ago(at.elapsed().as_secs())
-            )),
-            None if st.my_endpoints.is_empty() => {}
-            None => parts.push("not published yet".into()),
+        match (&r.published, r.put_at) {
+            (Some((ep, _, _)), Some(at)) => {
+                let check = match r.visible {
+                    Some(true) => format!(", stored at {} DHT nodes, found by a lookup", r.stored_at),
+                    Some(false) => format!(
+                        ", stored at {} DHT nodes, but a lookup still finds an older entry (trying again)",
+                        r.stored_at
+                    ),
+                    None => String::new(),
+                };
+                parts.push(format!(
+                    "published {} ({} ago{check})",
+                    ep.join(", "),
+                    ago(at.elapsed().as_secs())
+                ))
+            }
+            _ if st.my_endpoints.is_empty() && self.punch_candidates().is_empty() => {}
+            _ => parts.push("not published yet".into()),
         }
         let found = st.dht_hints.values().filter(|(_, at)| at.elapsed() < HINT_TTL).count();
         if found > 0 {
@@ -446,7 +494,8 @@ mod tests {
             open(&key, &v, &me.id, "net1", now),
             Some(Found {
                 ep: vec!["2.243.3.46:7870".to_string()],
-                v6: vec![]
+                v6: vec![],
+                at: now
             })
         );
         assert_eq!(open(&[8u8; 32], &v, &me.id, "net1", now), None, "another network's key");
@@ -582,7 +631,8 @@ mod tests {
             open(&key, item.value(), &me.id, "net1", now),
             Some(Found {
                 ep: vec!["2.243.3.46:7870".to_string()],
-                v6: vec![]
+                v6: vec![],
+                at: now
             })
         );
     }

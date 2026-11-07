@@ -30,7 +30,7 @@ const MAX_RUNS: usize = 8;
 /// Addresses from the rendezvous count this long.
 pub(super) const PUNCH_HINT_TTL: Duration = Duration::from_secs(2 * 3600);
 /// Tried all the time for this long, then only in the first minute of every five.
-const EAGER: Duration = Duration::from_secs(15 * 60);
+pub(super) const EAGER: Duration = Duration::from_secs(15 * 60);
 const SLOT_SECS: u64 = 300;
 const WINDOW_SECS: u64 = 60;
 
@@ -80,23 +80,21 @@ impl Node {
         if !in_window(st.punch_since.get(id).map(|t| t.elapsed()), unix_secs()) {
             return vec![];
         }
-        let mut out: Vec<SocketAddr> = st
+        // The newer source only: a fresh rendezvous entry beats the record it is newer than (the
+        // node moved since), a record that came later (over a link since) beats the entry.
+        let hint = st
             .punch_hints
             .get(id)
-            .filter(|(_, at)| at.elapsed() < PUNCH_HINT_TTL)
-            .map(|(a, _)| a.clone())
-            .unwrap_or_default();
-        if let Some(r) = st.records.get(id)
-            && now_ms().saturating_sub(r.info.seq) < RECORD_FRESH_MS
-        {
-            for c in &r.info.udp6 {
-                if let Ok(a) = c.parse::<SocketAddr>()
-                    && !out.contains(&a)
-                {
-                    out.push(a);
-                }
-            }
-        }
+            .filter(|(_, at, _)| at.elapsed() < PUNCH_HINT_TTL);
+        let record = st
+            .records
+            .get(id)
+            .filter(|r| now_ms().saturating_sub(r.info.seq) < RECORD_FRESH_MS);
+        let mut out: Vec<SocketAddr> = match (hint, record) {
+            (Some((addrs, _, made)), r) if r.is_none_or(|r| *made >= r.info.seq) => addrs.clone(),
+            (_, Some(r)) => r.info.udp6.iter().filter_map(|c| c.parse().ok()).collect(),
+            _ => vec![],
+        };
         out.retain(|a| matches!(a.ip(), IpAddr::V6(ip) if global(&ip)));
         out.truncate(6);
         out
@@ -156,10 +154,21 @@ impl Node {
         let started = Instant::now();
         let port = self.punch_port();
         while started.elapsed() < RUN && !self.linked(&id) && !self.leaving.load(Ordering::Relaxed) {
+            // All addresses at once (one of them may be the one the other side tries right now).
+            let mut attempts = tokio::task::JoinSet::new();
             for target in &targets {
-                let Some(stream) = self.punch_connect(*target, port).await else {
-                    continue;
-                };
+                let (node, target) = (self.clone(), *target);
+                attempts.spawn(async move { node.punch_connect(target, port).await.map(|s| (target, s)) });
+            }
+            let mut got = None;
+            while let Some(r) = attempts.join_next().await {
+                if let Ok(Some(c)) = r {
+                    got = Some(c);
+                    break;
+                }
+            }
+            attempts.abort_all();
+            if let Some((target, stream)) = got {
                 if self.linked(&id) {
                     return;
                 }
