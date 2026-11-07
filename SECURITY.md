@@ -41,6 +41,8 @@ where appropriate) and named in the release notes.
 ## What helps you check a release
 
 - `SHA256SUMS` and a `.sha256` file for every archive of a release; `meshvpn update` checks them.
+  They come from the same GitHub release as the archives, so they catch a broken download, not a
+  release that someone else published: releases aren't signed yet.
 - A software bill of materials (CycloneDX, `meshvpn-<version>.cdx.json`) with every crate the
   release is built from, to match against vulnerability databases.
 

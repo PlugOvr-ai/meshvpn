@@ -181,7 +181,16 @@ fn node_script(env: &HashMap<String, String>, workdir: Option<&str>, command: &[
     } else {
         cmd.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
     };
-    let mut vars: Vec<String> = env.iter().map(|(k, v)| format!("{k}={}", sh_quote(v))).collect();
+    // Names as the shell takes them (they come from another node's answer): others are left out.
+    let name_ok = |k: &str| {
+        k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let mut vars: Vec<String> = env
+        .iter()
+        .filter(|(k, _)| name_ok(k))
+        .map(|(k, v)| format!("{k}={}", sh_quote(v)))
+        .collect();
     vars.sort();
     let cd = workdir.map(|w| format!("cd {} && ", sh_quote(w))).unwrap_or_default();
     let job = format!("{cd}export {}; {line}", vars.join(" "));

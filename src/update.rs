@@ -2,6 +2,11 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
+
+/// SHA-256 of `data`, as hex.
+pub fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;

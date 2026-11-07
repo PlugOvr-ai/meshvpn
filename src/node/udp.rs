@@ -17,6 +17,7 @@
 //! destination (mobile networks, CGNAT), where IPv4 hole punching fails, usually get a direct
 //! path over IPv6.
 //!   data   A3 | src id prefix 8 | nonce 24 | XChaCha20-Poly1305(packet)   (49 bytes overhead)
+//!          (the nonce counts packets: each is taken once, see `replay`)
 //!   frag   A4 | src id prefix 8 | message 4 | index 1 | count 1 | part of a data datagram
 //!
 //! Path MTU: a full-size packet makes a datagram of about 1450 bytes, more than some paths
@@ -43,6 +44,8 @@ pub(super) const PATH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
 /// Below the ~30 s after which NATs forget an idle UDP mapping, so both sides' holes overlap.
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// An answer to a probe counts only this soon.
+const PROBE_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
 pub(super) struct UdpPath {
     pub addr: SocketAddr,
@@ -120,7 +123,17 @@ impl Node {
         for a in &st.udp_reflexive {
             out.push(a.to_string());
         }
-        out.dedup();
+        for (_, a, _) in &st.stun_mapped {
+            out.push(a.to_string());
+        }
+        // A port opened on the router (see portmap).
+        if let Some(m) = st.port_mapping.as_ref().filter(|m| m.public())
+            && let Some(p) = m.external_port(crate::portmap::UDP)
+        {
+            out.push(SocketAddr::new(IpAddr::V4(m.external), p).to_string());
+        }
+        let mut seen = HashSet::new();
+        out.retain(|c| seen.insert(c.clone()));
         out.truncate(8);
         out
     }
@@ -145,6 +158,8 @@ impl Node {
         let observed: Vec<SocketAddr> = st
             .udp_seen
             .values()
+            // Not what STUN servers saw: they may be reached another way than the nodes (a VPN,
+            // a second router), which would look like a NAT that changes ports.
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(600))
             .map(|(a, _)| *a)
             .collect();
@@ -186,7 +201,7 @@ impl Node {
             }
         }
         out.extend(info.udp6.iter().filter_map(|c| c.parse::<SocketAddr>().ok()));
-        out.retain(|a| !is_overlay(a.ip()) && !a.ip().is_unspecified());
+        out.retain(|a| !is_overlay(a.ip()) && super::address_dialable(a.ip()));
         out.sort();
         out.dedup();
         out
@@ -236,6 +251,30 @@ impl Node {
         let m = mac(key, &d);
         d.extend_from_slice(&m);
         d
+    }
+
+    /// A nonce for a probe to `peer`, remembered so its answer can be told from a replayed one.
+    fn probe_nonce(st: &mut State, peer: &NodeId) -> u64 {
+        let n = rand::rngs::OsRng.next_u64();
+        let sent = st.udp_probes_sent.entry(*peer).or_default();
+        sent.retain(|(_, at)| at.elapsed() < PROBE_ANSWER_WITHIN);
+        sent.push_back((n, Instant::now()));
+        while sent.len() > 32 {
+            sent.pop_front();
+        }
+        n
+    }
+
+    /// One probe to `peer` at `addr` (its answer is recorded in `udp_answered_from`).
+    pub(super) fn udp_probe_to(&self, peer: &NodeId, addr: SocketAddr) {
+        let mut st = self.state.lock().unwrap();
+        let Some(key) = self.probe_key(&mut st, peer) else {
+            return;
+        };
+        let n = Self::probe_nonce(&mut st, peer);
+        let d = self.probe_datagram(PROBE, peer, now_ms(), n, None, &key);
+        drop(st);
+        self.udp_send(&d, addr);
     }
 
     /// Sends probes: keepalives on live paths, punching attempts towards the others.
@@ -311,7 +350,8 @@ impl Node {
             if let Some(c) = st.why_counts.get_mut(&peer) {
                 c.sent += targets.len() as u32;
             }
-            let d = self.probe_datagram(PROBE, &peer, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
+            let n = Self::probe_nonce(&mut st, &peer);
+            let d = self.probe_datagram(PROBE, &peer, now_ms(), n, None, &key);
             for t in targets {
                 self.udp_send(&d, t);
             }
@@ -332,21 +372,23 @@ impl Node {
             let p = st.udp_paths.get_mut(dst).filter(|p| p.usable())?;
             // Quiet for a while although we are sending: check the path along the way, so a
             // dead one is noticed in seconds rather than at the timeout.
-            if p.last_rx.elapsed() > Duration::from_secs(3)
-                && p.last_probe.elapsed() > Duration::from_secs(1)
-                && let Some(key) = key
-            {
+            let check = key.is_some()
+                && p.last_rx.elapsed() > Duration::from_secs(3)
+                && p.last_probe.elapsed() > Duration::from_secs(1);
+            if check {
                 p.last_probe = Instant::now();
                 p.unanswered += 1;
-                let addr = p.addr;
-                let probe = self.probe_datagram(PROBE, dst, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
+            }
+            let (addr, split) = (p.addr, p.splitting());
+            if check && let Some(key) = key {
+                let n = Self::probe_nonce(&mut st, dst);
+                let probe = self.probe_datagram(PROBE, dst, now_ms(), n, None, &key);
                 self.udp_send(&probe, addr);
             }
-            (p.addr, p.splitting())
+            (addr, split)
         };
         let (addr, split) = addr;
-        let mut nonce = [0u8; 24];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce = self.nonces.nonce();
         let ct = cipher.encrypt(&XNonce::from(nonce), pkt).ok()?;
         let mut d = Vec::with_capacity(33 + ct.len());
         d.push(DATA);
@@ -385,7 +427,9 @@ impl Node {
         let prefix: [u8; 8] = d[1..9].try_into().ok()?;
         let id = u32::from_be_bytes(d[9..13].try_into().ok()?);
         let (index, count) = (d[13] as usize, d[14] as usize);
-        if !(2..=8).contains(&count) || index >= count {
+        // Parts are cut to fit SAFE_DATAGRAM: anything bigger isn't one of ours, and holding
+        // it would let anyone who knows a node's id prefix fill memory.
+        if !(2..=8).contains(&count) || index >= count || d.len() > SAFE_DATAGRAM {
             return None;
         }
         let mut st = self.state.lock().unwrap();
@@ -395,6 +439,11 @@ impl Node {
             if st.udp_frags.len() > 256 {
                 return None;
             }
+        }
+        // At most 32 unfinished per sender: one can't crowd out the others.
+        if !st.udp_frags.contains_key(&(prefix, id)) && st.udp_frags.keys().filter(|(p, _)| *p == prefix).count() >= 32
+        {
+            return None;
         }
         let r = st.udp_frags.entry((prefix, id)).or_insert_with(|| Reassembly {
             started: Instant::now(),
@@ -434,6 +483,7 @@ impl Node {
                         self.deliver(pkt).await;
                     }
                 }
+                Some(&0x01) => self.stun_answer(d, from),
                 _ => {}
             }
         }
@@ -476,7 +526,8 @@ impl Node {
             let _ = sock.try_send_to(&reply, from);
             // Answer with a probe of our own right away: this opens our NAT towards them.
             if !st.udp_paths.contains_key(&src) {
-                let p = self.probe_datagram(PROBE, &src, now_ms(), rand::rngs::OsRng.next_u64(), None, &key);
+                let n = Self::probe_nonce(&mut st, &src);
+                let p = self.probe_datagram(PROBE, &src, now_ms(), n, None, &key);
                 let _ = sock.try_send_to(&p, from);
             }
             return;
@@ -493,6 +544,21 @@ impl Node {
             p.last_rx = Instant::now();
             return;
         }
+        // Only an answer to a probe we sent lately, and only once: a recorded answer sent
+        // again (from anywhere) must not create or move a path.
+        let Some(sent) = st.udp_probes_sent.get_mut(&src) else {
+            return;
+        };
+        let Some(i) = sent
+            .iter()
+            .position(|(n, at)| *n == nonce && at.elapsed() < PROBE_ANSWER_WITHIN)
+        else {
+            return;
+        };
+        sent.remove(i);
+        let heard = st.udp_answered_from.entry(src).or_default();
+        heard.retain(|(a, at)| *a != from.ip() && at.elapsed() < Duration::from_secs(120));
+        heard.push((from.ip(), Instant::now()));
         let rtt = Duration::from_millis(now_ms().saturating_sub(ts));
         let seen = if len == 115 {
             let ip: [u8; 16] = d[81..97].try_into().unwrap();
@@ -576,12 +642,20 @@ impl Node {
         if !self.source_ok(&src, &pkt) {
             return None;
         }
-        // Authentic: the path is alive (and follows the peer if its NAT mapping changed).
+        // Each packet once: a copy sent again from elsewhere must not move the path there.
+        let verdict = self.replayed(&src, &nonce);
+        if verdict == super::replay::Verdict::Replay {
+            return None;
+        }
+        // Authentic and new: the path is alive, and follows the peer if its NAT mapping changed
+        // (only for its newest packet; nodes without counters as before).
         let mut st = self.state.lock().unwrap();
         if let Some(p) = st.udp_paths.get_mut(&src) {
             p.last_rx = Instant::now();
             p.unanswered = 0;
-            p.addr = from;
+            if verdict != super::replay::Verdict::Late {
+                p.addr = from;
+            }
         }
         Some(pkt)
     }
@@ -681,6 +755,114 @@ pub(super) async fn bind6(v4: Option<&Arc<UdpSocket>>) -> Option<Arc<UdpSocket>>
     UdpSocket::from_std(s.into()).ok().map(Arc::new)
 }
 
+// ----------------------------------------------------------------------------- STUN
+
+/// RFC 5389: binding request/success, the magic cookie, XOR-MAPPED-ADDRESS and MAPPED-ADDRESS.
+const STUN_REQUEST: u16 = 0x0001;
+const STUN_SUCCESS: u16 = 0x0101;
+const STUN_COOKIE: u32 = 0x2112_A442;
+/// How often our public UDP address is asked for (sooner while no node is connected).
+const STUN_EVERY: Duration = Duration::from_secs(600);
+const STUN_ALONE: Duration = Duration::from_secs(60);
+
+pub(super) fn stun_request(txid: &[u8; 12]) -> [u8; 20] {
+    let mut r = [0u8; 20];
+    r[..2].copy_from_slice(&STUN_REQUEST.to_be_bytes());
+    r[4..8].copy_from_slice(&STUN_COOKIE.to_be_bytes());
+    r[8..20].copy_from_slice(txid);
+    r
+}
+
+/// The address a binding success for `txid` reports (IPv4 only: the socket is IPv4).
+pub(super) fn stun_parse(d: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+    if d.len() < 20
+        || u16::from_be_bytes([d[0], d[1]]) != STUN_SUCCESS
+        || u32::from_be_bytes(d[4..8].try_into().unwrap()) != STUN_COOKIE
+        || &d[8..20] != txid
+    {
+        return None;
+    }
+    let len = (u16::from_be_bytes([d[2], d[3]]) as usize).min(d.len() - 20);
+    let mut attrs = &d[20..20 + len];
+    let mut plain = None;
+    while attrs.len() >= 4 {
+        let ty = u16::from_be_bytes([attrs[0], attrs[1]]);
+        let n = u16::from_be_bytes([attrs[2], attrs[3]]) as usize;
+        let Some(v) = attrs.get(4..4 + n) else { break };
+        // Family 1 = IPv4: 0, family, port, address.
+        if v.len() >= 8 && v[1] == 1 {
+            let port = u16::from_be_bytes([v[2], v[3]]);
+            let ip = Ipv4Addr::new(v[4], v[5], v[6], v[7]);
+            match ty {
+                0x0020 => {
+                    let c = STUN_COOKIE.to_be_bytes();
+                    let port = port ^ (STUN_COOKIE >> 16) as u16;
+                    let ip = Ipv4Addr::new(v[4] ^ c[0], v[5] ^ c[1], v[6] ^ c[2], v[7] ^ c[3]);
+                    return Some(SocketAddr::new(IpAddr::V4(ip), port));
+                }
+                0x0001 => plain = Some(SocketAddr::new(IpAddr::V4(ip), port)),
+                _ => {}
+            }
+        }
+        attrs = attrs.get(4 + n.div_ceil(4) * 4..).unwrap_or(&[]);
+    }
+    plain
+}
+
+impl Node {
+    /// Asks the STUN servers for our public UDP address now and then: what other nodes see,
+    /// also while none is connected (after a new address from the provider, say), so this
+    /// node's record and its rendezvous entry name the right address.
+    pub(super) async fn stun_loop(self: Arc<Self>) {
+        let Some(sock) = self.udp.clone() else { return };
+        if self.cfg.stun.is_empty() {
+            return;
+        }
+        loop {
+            let mut servers: Vec<SocketAddr> = vec![];
+            for s in &self.cfg.stun {
+                if let Ok(Ok(addrs)) = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(s)).await
+                    && let Some(a) = addrs.filter(|a| a.is_ipv4()).find(|a| address_dialable(a.ip()))
+                {
+                    servers.push(a);
+                }
+            }
+            {
+                let mut st = self.state.lock().unwrap();
+                st.stun_pending
+                    .retain(|(_, _, at)| at.elapsed() < Duration::from_secs(30));
+                for server in &servers {
+                    let txid: [u8; 12] = crate::keys::random32()[..12].try_into().unwrap();
+                    st.stun_pending.push((txid, *server, Instant::now()));
+                    let _ = sock.try_send_to(&stun_request(&txid), *server);
+                }
+            }
+            let alone = self.state.lock().unwrap().links.is_empty();
+            tokio::time::sleep(if alone { STUN_ALONE } else { STUN_EVERY }).await;
+        }
+    }
+
+    fn stun_answer(&self, d: &[u8], from: SocketAddr) {
+        let mut st = self.state.lock().unwrap();
+        // Only an answer to a request of ours, from the server we asked.
+        let Some(i) = st
+            .stun_pending
+            .iter()
+            .position(|(txid, server, _)| *server == from && stun_parse(d, txid).is_some())
+        else {
+            return;
+        };
+        let (txid, server, _) = st.stun_pending.remove(i);
+        let Some(mapped) = stun_parse(d, &txid) else { return };
+        if is_overlay(mapped.ip()) || !address_dialable(mapped.ip()) {
+            return;
+        }
+        st.stun_mapped.retain(|(s, _, _)| *s != server);
+        st.stun_mapped.insert(0, (server, mapped, Instant::now()));
+        st.stun_mapped.truncate(2);
+    }
+}
+
 /// The UDP socket: the listen port if free, a random one otherwise.
 pub(super) async fn bind(cfg: &Config) -> Option<Arc<UdpSocket>> {
     if !cfg.udp || cfg.no_outbound || cfg.effective_socks().is_some() {
@@ -698,6 +880,29 @@ pub(super) async fn bind(cfg: &Config) -> Option<Arc<UdpSocket>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stun_answers() {
+        let txid = [3u8; 12];
+        let req = stun_request(&txid);
+        assert_eq!(&req[..2], &[0, 1]);
+        // A binding success with XOR-MAPPED-ADDRESS 2.243.3.46:61000 (as Google's servers send).
+        let mut ans = vec![0x01, 0x01, 0, 12];
+        ans.extend_from_slice(&STUN_COOKIE.to_be_bytes());
+        ans.extend_from_slice(&txid);
+        let c = STUN_COOKIE.to_be_bytes();
+        let port = 61000u16 ^ (STUN_COOKIE >> 16) as u16;
+        ans.extend_from_slice(&[0x00, 0x20, 0, 8, 0, 1]);
+        ans.extend_from_slice(&port.to_be_bytes());
+        ans.extend_from_slice(&[2 ^ c[0], 243 ^ c[1], 3 ^ c[2], 46 ^ c[3]]);
+        assert_eq!(stun_parse(&ans, &txid), Some("2.243.3.46:61000".parse().unwrap()));
+        assert_eq!(stun_parse(&ans, &[4u8; 12]), None, "another transaction");
+        // MAPPED-ADDRESS only (old servers).
+        let mut old = ans[..20].to_vec();
+        old.extend_from_slice(&[0x00, 0x01, 0, 8, 0, 1, 0x1f, 0x90, 80, 1, 2, 3]);
+        assert_eq!(stun_parse(&old, &txid), Some("80.1.2.3:8080".parse().unwrap()));
+        assert_eq!(stun_parse(&ans[..19], &txid), None);
+    }
 
     #[test]
     fn nat_kinds() {

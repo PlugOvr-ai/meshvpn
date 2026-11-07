@@ -74,6 +74,10 @@ pub fn hint(text: &str) -> String {
 fn default_iface() -> String {
     "mesh0".into()
 }
+fn default_stun() -> Vec<String> {
+    vec!["stun.l.google.com:19302".into(), "stun.cloudflare.com:3478".into()]
+}
+
 fn default_true() -> bool {
     true
 }
@@ -308,6 +312,19 @@ pub struct Config {
     /// Direct UDP paths between nodes, also through NATs (falls back to TCP/relays).
     #[serde(default = "default_true")]
     pub udp: bool,
+    /// Behind a home router: open the listen port on it (UPnP IGD, PCP, NAT-PMP), so other
+    /// nodes can connect to this one from the internet.
+    #[serde(default = "default_true")]
+    pub port_mapping: bool,
+    /// STUN servers that tell this node its public UDP address (also while no other node is
+    /// connected). Empty: none.
+    #[serde(default = "default_stun")]
+    pub stun: Vec<String>,
+    /// Find nodes again whose address changed through BitTorrent's Mainline DHT (encrypted
+    /// entries only members can read): no server or DynDNS needed. Off by default: firewalls
+    /// in company networks may take the traffic for BitTorrent.
+    #[serde(default)]
+    pub dht: bool,
     /// Labels other nodes and agents can select this node by (`tag:gpu`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -379,6 +396,9 @@ impl Config {
             userspace: if rootless() { Userspace::Always } else { Userspace::Auto },
             ssh_server: SshServer::Auto,
             udp: true,
+            port_mapping: true,
+            stun: default_stun(),
+            dht: false,
             tags: vec![],
             socks_listen: default_socks_listen(),
             ssh_allow: vec![],

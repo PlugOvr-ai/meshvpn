@@ -1517,7 +1517,9 @@ impl Desk {
                 self.full = true;
                 self.dirty = true;
             }
-            C_LOCAL => {
+            // The desk viewer of a virtual session (`local`). A shared physical screen has a
+            // desk of its own: nobody changes its keyboard or monitors from elsewhere.
+            C_LOCAL if !self.screen => {
                 if let Some(c) = self.clients.iter_mut().find(|c| c.id == from) {
                     c.local = true;
                 }
@@ -1549,7 +1551,7 @@ impl Desk {
                 self.full = true;
                 self.dirty = true;
             }
-            C_RAWKEY => {
+            C_RAWKEY if !self.screen => {
                 let (down, kc) = (p.first().copied().unwrap_or(0) == 1, p.get(1).copied().unwrap_or(0));
                 if kc >= 8 {
                     let kind = if down { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT };
@@ -2762,7 +2764,10 @@ fn encode_tile(buf: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize
         return (1, png);
     }
     let mut jpg = vec![];
-    let enc = jpeg_encoder::Encoder::new(&mut jpg, 80);
+    // Text and edges stay sharp: high quality, and colour at full resolution (no 4:2:0, which
+    // smears coloured text).
+    let mut enc = jpeg_encoder::Encoder::new(&mut jpg, 90);
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
     if enc
         .encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
         .is_ok()

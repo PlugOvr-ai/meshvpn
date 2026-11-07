@@ -412,6 +412,8 @@ Start with `sudo meshvpn doctor` on the node in question. These are the problems
 | Rootless: `ssh node.mesh` works, `curl http://node.mesh` doesn't | Without root, only ssh and the SOCKS proxy know the names: `ALL_PROXY=socks5h://127.0.0.1:1055 curl …`. |
 | The desktop shows the built-in desktop although Xfce is installed | The session started before Xfce was there. ⏻ (End session), then reconnect. |
 | `this invite expired …` / `not admitted: … already been used` | Ask an admin for a new invite (`sudo meshvpn invite`). |
+| `port mapping: … not authorized` on a FRITZ!Box | Allow it for this device: Internet > Freigaben > Portfreigaben > device > *Selbstständige Portfreigaben für dieses Gerät erlauben*. |
+| `port mapping: the router has no public IPv4 address itself` | DS-Lite or carrier-grade NAT: no port can be opened. Use IPv6 or one node with a public address (a small VPS). |
 | The VERSION column shows `?` | The node where you run `meshvpn status` is older than 0.13.1 and doesn't report versions yet; update it. |
 
 Logs: `journalctl -u meshvpn -f` (service), `/var/log/meshvpn.log` (background daemon without systemd),
@@ -445,6 +447,9 @@ Logs: `journalctl -u meshvpn -f` (service), `/var/log/meshvpn.log` (background d
 |---|---|
 | `endpoints = ["host:7870"]` | addresses others use to reach this node |
 | `udp = false` | no direct UDP paths (TCP and relays only) |
+| `port_mapping = false` | don't open the port on the home router (UPnP/PCP/NAT-PMP) |
+| `dht = true` | find nodes whose address changed through the BitTorrent DHT (off by default; see the README, "Without any server") |
+| `stun = []` | don't ask STUN servers for the public address (default: Google's and Cloudflare's) |
 | `mtu = 1200` | smaller packets (only needed for old versions on difficult networks) |
 | `manage_hosts = false` | don't write `<name>.mesh` into `/etc/hosts` |
 | `publish_ssh_keys = false` | don't publish this machine's SSH keys |

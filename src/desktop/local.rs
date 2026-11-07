@@ -278,11 +278,45 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // Nobody at the desk for a while: back to the login screen (which asks for the password
+    // again); the session goes on. Nothing locks the monitor otherwise - the session's own
+    // screen locker is off, it would lock browsers out too.
+    // Seconds since the desk opened, on a clock that only goes forward.
+    let opened = std::time::Instant::now();
+    let now_secs = move || opened.elapsed().as_secs();
+    let last_input = Arc::new(std::sync::atomic::AtomicU64::new(now_secs()));
+    if let Some(limit) = idle_limit() {
+        let last_input = last_input.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let idle = now_secs().saturating_sub(last_input.load(std::sync::atomic::Ordering::Relaxed));
+                if idle >= limit {
+                    eprintln!(
+                        "meshvpn desktop: nobody at the desk for {} min: leaving it (the session goes on)",
+                        limit / 60
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
     // Keyboard and mouse.
     let mut pressed: HashSet<u8> = HashSet::new();
     let mut buttons = 0u8;
     loop {
         let ev = screen.conn.wait_for_event()?;
+        if matches!(
+            ev,
+            Event::KeyPress(_)
+                | Event::KeyRelease(_)
+                | Event::MotionNotify(_)
+                | Event::ButtonPress(_)
+                | Event::ButtonRelease(_)
+        ) {
+            last_input.store(now_secs(), std::sync::atomic::Ordering::Relaxed);
+        }
         match ev {
             Event::Expose(e) => screen.expose(e.x, e.y, e.width, e.height),
             Event::KeyPress(e) => {
@@ -334,6 +368,16 @@ pub fn run() -> Result<()> {
             _ => {}
         }
     }
+}
+
+/// How long the desk may sit unused before it goes back to the login screen: 15 minutes, or
+/// MESHVPN_DESK_IDLE_MIN (e.g. in /etc/environment; 0: never).
+fn idle_limit() -> Option<u64> {
+    let min = std::env::var("MESHVPN_DESK_IDLE_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(15);
+    (min > 0).then_some(min * 60)
 }
 
 /// The monitors of this screen, for the session to have the same (its panel on the primary

@@ -223,6 +223,9 @@ pub struct Lease {
     pub gpus: Vec<u32>,
     pub holder: String,
     pub expires: u64,
+    /// The local user who reserved them: only they (or root) may release or renew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -487,12 +490,44 @@ impl SignedInfo {
 
 /// "Forget node `id` up to version `seq`": removes an offline node everywhere. A node that is
 /// actually alive comes back with its next (newer) record.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+///
+/// Signed by the node that issued it (`by`): only a member may ask the others to forget a node,
+/// in a managed network only an admin (`crate::node`).
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Forget {
     pub id: NodeId,
     pub seq: u64,
     /// When it was issued (ms since epoch), so it can expire.
     pub at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<NodeId>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sig: String,
+}
+
+impl Forget {
+    fn message(&self) -> Vec<u8> {
+        format!("meshvpn forget v1 {} {} {}", self.id.hex(), self.seq, self.at).into_bytes()
+    }
+
+    pub fn sign(id: NodeId, seq: u64, at: u64, ident: &Identity) -> Self {
+        let mut f = Forget {
+            id,
+            seq,
+            at,
+            by: Some(ident.id),
+            sig: String::new(),
+        };
+        f.sig = b64(&ident.sign(&f.message()));
+        f
+    }
+
+    /// Who signed it, if the signature is good.
+    pub fn signer(&self) -> Option<NodeId> {
+        let by = self.by?;
+        verify(&by, &self.message(), &unb64(&self.sig).ok()?).ok()?;
+        Some(by)
+    }
 }
 
 /// The new network key, sealed for one member.
@@ -568,6 +603,21 @@ mod tests {
 
     fn ident() -> Identity {
         Identity::from_config(&Config::new("n".into(), "net".into(), crate::keys::random32())).unwrap()
+    }
+
+    #[test]
+    fn forgets_are_signed() {
+        let (a, b) = (ident(), ident());
+        let f = Forget::sign(b.id, 7, 1000, &a);
+        assert_eq!(f.signer(), Some(a.id));
+        let mut changed = f.clone();
+        changed.seq = u64::MAX;
+        assert_eq!(changed.signer(), None, "the version is signed");
+        let mut other = f.clone();
+        other.by = Some(b.id);
+        assert_eq!(other.signer(), None, "the signer is the one named");
+        let old: Forget = serde_json::from_str(&format!(r#"{{"id":"{}","seq":1,"at":2}}"#, b.id.hex())).unwrap();
+        assert_eq!(old.signer(), None, "unsigned (older versions)");
     }
 
     fn info(id: &Identity, name: &str) -> NodeInfo {

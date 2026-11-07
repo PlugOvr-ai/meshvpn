@@ -57,6 +57,20 @@ impl Node {
         }
     }
 
+    /// Which of the nodes publishing the same name gets it (the smallest key): one online first;
+    /// in a managed network then the one admitted first (a member can't take another's name by
+    /// publishing a newer record - its own admission's time is fixed); then the newest record
+    /// (a machine set up again gets its name back from its old identity).
+    pub(super) fn name_rank(&self, st: &State, r: &super::Record) -> (bool, u64, std::cmp::Reverse<u64>, NodeId) {
+        let id = r.info.id;
+        let admitted_at = match &st.roster {
+            None => 0,
+            Some((_, roster)) if roster.admins.contains(&id) || roster.members.contains(&id) => 0,
+            Some(_) => st.claims.get(&id).map_or(u64::MAX, |a| a.claim.at),
+        };
+        (!self.is_online(st, &id), admitted_at, std::cmp::Reverse(r.info.seq), id)
+    }
+
     /// `id` is a client (a user's computer, admitted for a time), and whose.
     pub(super) fn client_of<'a>(st: &'a State, id: &NodeId) -> Option<&'a crate::proto::ClientGrant> {
         if let Some((_, r)) = &st.roster
@@ -160,20 +174,29 @@ impl Node {
         // Fresh (made recently, before the ticket expired) - or vouched for by a member that
         // saw it fresh.
         let now = now_ms();
-        let fresh = claim.at <= ticket.expires && now.saturating_sub(claim.at) < FRESH_MS && claim.at <= now + FRESH_MS;
+        // Never after the ticket expired, never in the future - also when vouched for (the
+        // node making the claim chooses its time).
+        if claim.at > ticket.expires {
+            bail!("the invite has expired - ask an admin for a new one");
+        }
+        if claim.at > now + FRESH_MS {
+            bail!("the admission is dated in the future");
+        }
+        let fresh = now.saturating_sub(claim.at) < FRESH_MS;
         let mut msg = msg;
         if !fresh {
+            // Members see the tickets in the claims they pass on, so a member's word counts only
+            // while the ticket is still valid, and a client's never; an admin's always.
             let witnessed = msg.witness.as_ref().is_some_and(|(w, sig)| {
-                Self::admitted(st, w)
+                let trusted = Self::admitted(st, w)
+                    && (Self::is_admin(st, w) || (Self::client_of(st, w).is_none() && ticket.expires > now));
+                trusted
                     && *w != claim.node
                     && crate::keys::unb64(sig)
                         .ok()
                         .is_some_and(|s| crate::keys::verify(w, &witness_bytes(&msg.claim), &s).is_ok())
             });
             if !witnessed {
-                if claim.at > ticket.expires {
-                    bail!("the invite has expired - ask an admin for a new one");
-                }
                 bail!("the admission is too old and nobody vouched for it - ask an admin for a new invite");
             }
         } else if msg.witness.is_none() {
@@ -195,6 +218,11 @@ impl Node {
             .map(|(_, n)| *n)
             .collect();
         if !winners.contains(&claim.node) {
+            bail!("this invite has already been used - ask an admin for a new one");
+        }
+        // A late claim (only vouched for) never pushes out a node already admitted with the
+        // same invite: its time is the claimer's word.
+        if !fresh && rivals.len() > ticket.uses.max(1) as usize {
             bail!("this invite has already been used - ask an admin for a new one");
         }
         for (_, loser) in rivals.iter().skip(ticket.uses.max(1) as usize) {
@@ -354,10 +382,25 @@ impl Node {
             .values()
             .filter(|r| r.info.name == w || (w.len() >= 4 && r.info.id.hex().starts_with(&w)))
             .collect();
-        m.sort_by_key(|r| (!self.is_online(st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+        Self::one_node(&m, &w)?;
+        m.sort_by_key(|r| self.name_rank(st, r));
         m.first()
             .map(|r| (r.info.id, r.info.name.clone()))
             .ok_or_else(|| anyhow!("no node named {w:?} (see meshvpn status)"))
+    }
+
+    /// Several nodes go by this name: a decision about one (admin, exit) needs its id - not
+    /// whichever took the name last.
+    pub(super) fn one_node(found: &[&Record], name: &str) -> Result<()> {
+        if found.len() > 1 {
+            let ids: Vec<String> = found.iter().map(|r| r.info.id.short()).collect();
+            bail!(
+                "{} nodes are called {name}: give the id instead (one of {})",
+                found.len(),
+                ids.join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// `meshvpn admin add/rm <node>`.

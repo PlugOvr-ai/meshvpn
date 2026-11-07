@@ -311,9 +311,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
             indices,
             ttl_ms,
             holder,
-        }) => lease_reply(node.gpu_reserve(count, indices, ttl_ms, holder)),
-        Ok(Request::GpuRelease { id }) => lease_reply(node.gpu_release(&id)),
-        Ok(Request::GpuRenew { id, ttl_ms }) => lease_reply(node.gpu_renew(&id, ttl_ms)),
+        }) => lease_reply(node.gpu_reserve(count, indices, ttl_ms, holder, caller.user.clone())),
+        Ok(Request::GpuRelease { id }) => lease_reply(node.gpu_release(&id, &caller)),
+        Ok(Request::GpuRenew { id, ttl_ms }) => lease_reply(node.gpu_renew(&id, ttl_ms, &caller)),
         Ok(Request::AdminStatus) => Response::Message {
             text: node.admin_status().to_string(),
         },

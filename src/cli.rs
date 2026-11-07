@@ -302,6 +302,10 @@ enum Cmd {
     /// SFTP on stdin/stdout (started by the built-in SSH server as the logged-in user).
     #[command(hide = true)]
     SftpServer,
+    /// A port forward of the built-in SSH server: stdin/stdout to HOST:PORT, connected as the
+    /// logged-in user (not as the daemon).
+    #[command(hide = true)]
+    ForwardTcp { host: String, port: u16 },
     /// Used by sshd (AuthorizedKeysCommand): prints the keys that may log in as USER.
     #[command(hide = true)]
     SshAuthorizedKeys { user: String },
@@ -1748,6 +1752,23 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::SftpServer => sshserver::sftp_server()?,
+        Cmd::ForwardTcp { host, port } => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                let s = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+                let (mut r, mut w) = s.into_split();
+                let up = async {
+                    let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut w).await;
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+                };
+                let down = async {
+                    let mut out = tokio::io::stdout();
+                    let _ = tokio::io::copy(&mut r, &mut out).await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut out).await;
+                };
+                tokio::join!(up, down);
+                anyhow::Ok(())
+            })?;
+        }
         Cmd::Console { user } => console::run(&dir, user)?,
         Cmd::Guide { skill } => {
             if skill {
@@ -1845,7 +1866,16 @@ fn real_main(cli: Cli) -> Result<i32> {
                     timeout: std::time::Duration::from_secs(30),
                 };
                 let session = desktop_session(session.as_deref(), xfce, plain, screen);
-                desktop::client::run(desktop::client::Target { node, remote, session }, port, !no_browser)?;
+                desktop::client::run(
+                    desktop::client::Target {
+                        node,
+                        remote,
+                        session,
+                        control: None,
+                    },
+                    port,
+                    !no_browser,
+                )?;
             }
         },
         Cmd::Nc { host, port } => {
@@ -2128,6 +2158,7 @@ fn load_proxy_env(dir: &Path) {
         if !set(key) && !set(&key.to_uppercase()) {
             // Still single-threaded here: no other thread reads the environment yet.
             unsafe { std::env::set_var(key, value) };
+            crate::sys::FROM_PROXY_FILE.lock().unwrap().push(key.to_string());
         }
     }
 }
@@ -2885,6 +2916,12 @@ fn print_status(st: &node::Status) {
         for line in e.status_lines(v) {
             println!("  {line}");
         }
+    }
+    if let Some(p) = &st.port_mapping {
+        println!("  port mapping: {p}");
+    }
+    if let Some(r) = &st.rendezvous {
+        println!("  rendezvous:   {r}");
     }
     if let Some(nat) = &st.nat {
         println!("  NAT (IPv4):   {nat}");

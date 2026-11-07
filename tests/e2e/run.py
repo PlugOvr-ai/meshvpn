@@ -220,6 +220,7 @@ def test_basics(lab):
     check(ping(a, "b.mesh"), "names don't resolve (b.mesh)")
     check(len(a.mvj("nodes")) == 3, "nodes --json should list 3 nodes")
     st = a.status()
+    check(st.get("rendezvous") is None, "the DHT rendezvous is off by default")
     check(all(p["version"] == st["version"] for p in st["peers"]), f"peer versions: {[p['version'] for p in st['peers']]}")
     check(f"meshvpn {st['version']}" in a.mv("status") and "VERSION" in a.mv("nodes"), "versions shown")
     p = a.mv("nodes nope", ok=False)
@@ -468,6 +469,26 @@ def test_ban(lab):
 
 
 @test
+def test_forget(lab):
+    """Forgetting an offline node: signed, so in a managed network only an admin's reaches every node."""
+    net, (hub, a, b, gone) = mesh(lab, ["hub", "a", "b", "gone"])
+    wait(lambda: all(n.online("gone") for n in (a, b)), "gone known everywhere", 40)
+    knows = lambda n: any(p["name"] == "gone" for p in n.status()["peers"])
+    gone.stop()
+    wait(lambda: not hub.online("gone") and not a.online("gone") and not b.online("gone"), "gone offline", 150)
+    # A member: only here.
+    out = a.mv("forget gone")
+    check("forgot gone here" in out, out)
+    check(not knows(a), "a forgot it")
+    time.sleep(5)
+    check(knows(b) and knows(hub), "a member's forget reached the others")
+    # The admin: everywhere.
+    out = hub.mv("forget gone")
+    check("on every node" in out, out)
+    wait(lambda: not knows(b), "the admin's forget reaches b", 20)
+
+
+@test
 def test_clients(lab):
     """A user's computer joins as a client for a time: reaches the nodes, relays nothing, is dropped when its time is up, renews."""
     net, (hub, a) = mesh(lab, ["hub", "a"])
@@ -542,6 +563,38 @@ def test_nat_traversal(lab):
     wait(lambda: "relay" in (a.peer("clientb") or {}).get("path", ""), "fallback to the relay", timeout=30)
     # The other side notices a few seconds later (once our traffic reaches it over the relay).
     wait(lambda: ping(a, bip, 2), "connectivity over the relay", timeout=30)
+
+
+@test
+def test_rendezvous(lab):
+    """The hub gets a new address; a node that only dials out finds it again through the DHT."""
+    if not os.environ.get("MESHVPN_E2E_INTERNET"):
+        print("  (skipped: uses the public BitTorrent DHT - set MESHVPN_E2E_INTERNET=1)")
+        return
+    net = lab.network("pub", subnet="198.51.103.0/24")
+    hub = lab.node("hub", [net], ip="198.51.103.10")
+    b = lab.node("b", [net])
+    dht_on = "sed -i 's/^dht = false$/dht = true/' /etc/meshvpn/config.toml && grep -q '^dht = true$' /etc/meshvpn/config.toml"
+    hub.mv("init --name hub")
+    hub.sh(dht_on)
+    hub.up()
+    b.mv(f"join {invite(hub)} --name b --no-listen")
+    b.sh(dht_on)
+    b.up()
+    wait(lambda: hub.online("b"), "b online")
+    check(not (b.status().get("rendezvous") is None), "rendezvous on with dht = true")
+    wait(lambda: "published 198.51.103.10:7870" in (hub.status().get("rendezvous") or ""),
+         "hub's entry in the DHT", timeout=180, interval=3)
+    # A new address from the provider: everything b knows about the hub is out of date.
+    hub.stop()
+    run(["docker", "network", "disconnect", net, hub.c])
+    run(["docker", "network", "connect", "--ip", "198.51.103.20", net, hub.c])
+    hub.up()
+    wait(lambda: "published 198.51.103.20:7870" in (hub.status().get("rendezvous") or ""),
+         "hub's new entry", timeout=180, interval=3)
+    wait(lambda: b.online("hub"), "b finds the hub at its new address", timeout=300, interval=3)
+    check("rendezvous: hub" in b.log(), "found through the rendezvous")
+    check("198.51.103.20" in (b.peer("hub") or {}).get("path", ""), f"path: {b.peer('hub')}")
 
 
 @test

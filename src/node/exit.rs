@@ -258,6 +258,13 @@ impl Node {
             return false;
         }
         let from = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+        let st = self.state.lock().unwrap();
+        // An address this machine's first network has (`sync_routes`): never from here, or a
+        // node of this network could pass as that one.
+        if st.v4_withheld.contains(&from) {
+            return false;
+        }
+        drop(st);
         if from == overlay_ip(src) {
             return self.owns_ip(src);
         }
@@ -363,12 +370,12 @@ impl Node {
                 if st.exit_offer {
                     bail!("this node is an exit node itself - `meshvpn exit offer --stop` first");
                 }
-                let mut found: Vec<&Record> = st
+                let found: Vec<&Record> = st
                     .records
                     .values()
                     .filter(|r| r.info.name == *n || (n.len() >= 4 && r.info.id.hex().starts_with(n.as_str())))
                     .collect();
-                found.sort_by_key(|r| (!self.is_online(&st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+                Self::one_node(&found, n)?;
                 let r = found
                     .first()
                     .ok_or_else(|| anyhow!("no node {n} (see meshvpn status)"))?;

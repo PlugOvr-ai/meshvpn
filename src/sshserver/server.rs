@@ -119,6 +119,15 @@ struct Account {
     groups: Vec<libc::gid_t>,
 }
 
+/// A shell that means "this account doesn't log in".
+fn no_login_shell(shell: &str) -> bool {
+    let name = Path::new(shell)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    matches!(name.as_str(), "nologin" | "false" | "git-shell" | "scponly" | "rssh")
+}
+
 fn lookup(name: &str) -> Option<Account> {
     let cname = CString::new(name).ok()?;
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
@@ -136,7 +145,14 @@ fn lookup(name: &str) -> Option<Account> {
         }
     };
     let home = PathBuf::from(s(pw.pw_dir));
-    let shell = Some(s(pw.pw_shell))
+    let configured = s(pw.pw_shell);
+    // An account that may not log in (nologin, false): not here either - no shell, no SFTP, no
+    // forwards. Also when that program is missing, which would otherwise make it /bin/sh.
+    if no_login_shell(&configured) {
+        return None;
+    }
+    // A shell missing in this image (bash in a minimal container): /bin/sh.
+    let shell = Some(configured)
         .filter(|sh| !sh.is_empty() && Path::new(sh).exists())
         .unwrap_or_else(|| "/bin/sh".into());
     let mut groups = vec![0 as libc::gid_t; 64];
@@ -207,7 +223,7 @@ fn own_authorized_keys(acct: &Account, key: &PublicKey) -> std::result::Result<b
     // Non-blocking: as root this opens a path the user chose, which could be a pipe nobody writes to.
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
         .open(&path)
     {
         Ok(f) => f,
@@ -467,18 +483,46 @@ impl russh::server::Handler for Conn {
             reply.reject(ChannelOpenFailure::ConnectFailed).await;
             return Ok(());
         };
+        // Accounts that may not log in (nologin, false) forward nothing either.
+        let shell = acct
+            .shell
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if matches!(shell.as_str(), "nologin" | "false") {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            return Ok(());
+        }
+        let Ok(exe) = crate::update::current_exe() else {
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
         debug!("ssh: {} as {}: forwarding to {host}:{port}", self.who, acct.name);
-        let target = format!("{host}:{port}");
+        // The connection is made as the account, not as the daemon: what the account may reach
+        // (firewall rules by user, e.g. no cloud metadata service) holds for its forwards too.
+        let mut cmd = forward_command(acct, &exe, host, port);
         tokio::spawn(async move {
-            let out = tokio::time::timeout(Duration::from_secs(15), tokio::net::TcpStream::connect(&target)).await;
-            match out {
-                Ok(Ok(mut tcp)) => {
-                    reply.accept().await;
-                    let mut stream = channel.into_stream();
-                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
-                }
-                _ => reply.reject(ChannelOpenFailure::ConnectFailed).await,
-            }
+            let Ok(mut child) = cmd.spawn() else {
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                return;
+            };
+            let (Some(mut to), Some(mut from)) = (child.stdin.take(), child.stdout.take()) else {
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                return;
+            };
+            reply.accept().await;
+            let stream = channel.into_stream();
+            let (mut r, mut w) = tokio::io::split(stream);
+            let up = async {
+                let _ = tokio::io::copy(&mut r, &mut to).await;
+                drop(to);
+            };
+            let down = async {
+                let _ = tokio::io::copy(&mut from, &mut w).await;
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
+            };
+            tokio::join!(up, down);
+            let _ = child.kill().await;
         });
         Ok(())
     }
@@ -603,6 +647,35 @@ pub(crate) fn set_winsize(fd: libc::c_int, cols: u16, rows: u16) {
     unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
 }
 
+/// `meshvpn forward-tcp HOST PORT` as the account (its uid, gid and groups), pipes on both
+/// ends: a port forward made by the account itself.
+fn forward_command(acct: &Account, exe: &Path, host: &str, port: u16) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(exe);
+    c.args(["forward-tcp", "--", host, &port.to_string()])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let switch = unsafe { libc::geteuid() } == 0;
+    let (uid, gid, groups) = (acct.uid, acct.gid, acct.groups.clone());
+    unsafe {
+        c.pre_exec(move || {
+            if switch
+                && (libc::setgroups(groups.len() as _, groups.as_ptr()) < 0
+                    || libc::setgid(gid) < 0
+                    || libc::setuid(uid) < 0)
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    c
+}
+
 /// Variables of the daemon's own environment that must not leak into sessions.
 fn inherit(name: &str) -> bool {
     const DROP: &[&str] = &[
@@ -625,7 +698,13 @@ fn inherit(name: &str) -> bool {
         "SHELL",
         "TERM",
     ];
-    !DROP.contains(&name) && !name.starts_with("SSH_") && !name.starts_with("SUDO_") && !name.starts_with("LISTEN_")
+    // Root's proxy settings (proxy.env is root's alone; they may hold a password).
+    let from_proxy_file = crate::sys::FROM_PROXY_FILE.lock().unwrap().iter().any(|k| k == name);
+    !DROP.contains(&name)
+        && !from_proxy_file
+        && !name.starts_with("SSH_")
+        && !name.starts_with("SUDO_")
+        && !name.starts_with("LISTEN_")
 }
 
 /// The command for a session: the user's shell (login shell, or `-c command`), with the

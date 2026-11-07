@@ -248,6 +248,11 @@ impl Remote {
 
     /// A shell command on `node`: locally for this machine, over ssh otherwise.
     pub(crate) fn command(&self, node: &NodeView, script: &str) -> Command {
+        self.command_via(node, script, None)
+    }
+
+    /// `command`, through the shared connection at `control` if there is one (`login`).
+    pub(crate) fn command_via(&self, node: &NodeView, script: &str, control: Option<&Path>) -> Command {
         if node.is_self {
             let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
             let mut c = Command::new(shell);
@@ -257,6 +262,9 @@ impl Remote {
         let mut c = Command::new("ssh");
         c.args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"])
             .args(["-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"]);
+        if let Some(path) = control {
+            c.arg("-S").arg(path).args(["-o", "ControlMaster=no"]);
+        }
         if self.socks {
             let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
             c.args([
@@ -270,6 +278,68 @@ impl Remote {
         }
         c.arg(self.destination(node)).arg(script);
         c
+    }
+
+    /// For logins that need a password (no key for the node): one SSH connection made now, with
+    /// the prompt on this terminal, that later commands share (`command_via`). None: keys work
+    /// (or nothing to do here). Unix only (OpenSSH's connection sharing).
+    pub(crate) fn login(&self, node: &NodeView) -> Result<Option<std::path::PathBuf>> {
+        if node.is_self || cfg!(windows) {
+            return Ok(None);
+        }
+        let probe = self
+            .command(node, "true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if probe.is_ok_and(|s| s.success()) {
+            return Ok(None);
+        }
+        // A directory of our own for the connection's socket.
+        let dir = std::env::temp_dir().join(format!("meshvpn-ssh-{:016x}", rand::random::<u64>()));
+        {
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut b = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+            b.create(&dir)?;
+        }
+        let path = dir.join("c");
+        println!(
+            "No SSH key login to {} - log in once (the connection is kept for this):",
+            self.destination(node)
+        );
+        let mut c = Command::new("ssh");
+        c.args([
+            "-M",
+            "-f",
+            "-N",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=10",
+        ])
+        .args(["-o", "ControlPersist=10m", "-o", "LogLevel=ERROR"])
+        .arg("-S")
+        .arg(&path);
+        if self.socks {
+            let exe = crate::update::current_exe().unwrap_or_else(|_| "meshvpn".into());
+            c.args([
+                "-o",
+                &format!(
+                    "ProxyCommand={}{} nc %h %p",
+                    exe.display(),
+                    crate::networks::current_dir_args()
+                ),
+            ]);
+        }
+        c.arg(self.destination(node));
+        if !c.status()?.success() || !path.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+            bail!("could not log in to {}", self.destination(node));
+        }
+        Ok(Some(path))
     }
 
     /// An interactive login shell on `node` (for a terminal): ssh -t, prompts allowed.

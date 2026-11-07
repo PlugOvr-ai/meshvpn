@@ -393,6 +393,29 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             c.push(check("nat", Level::Info, format!("{nat}; {v6}"), None));
         }
     }
+    if let Some(p) = &st.port_mapping {
+        let ok = p.contains(" open on the router") && !p.starts_with("the router has no public");
+        c.push(check(
+            "port mapping",
+            if ok { Level::Ok } else { Level::Info },
+            p.clone(),
+            (!ok).then_some(
+                "without it, others reach this node only if a port is forwarded by hand, or through a node with a                  public address",
+            ),
+        ));
+    }
+    if let Some(r) = &st.rendezvous {
+        c.push(check(
+            "rendezvous",
+            if r.contains("last error") {
+                Level::Info
+            } else {
+                Level::Ok
+            },
+            r.clone(),
+            None,
+        ));
+    }
     if st.endpoints.is_empty() && st.socks.is_none() {
         c.push(check(
             "reachability",

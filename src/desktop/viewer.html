@@ -137,7 +137,21 @@ const C_POINTER=101,C_WHEEL=102,C_KEY=103,C_CLIPBOARD=104,C_ACTIVATE=105,C_CLOSE
 const C_FILES=111,C_FILE_READ=112,C_FILE_WRITE=113,C_FILE_OP=114,C_MONITOR=115,C_CAPS=118,C_STOP=120;
 const $ = id => document.getElementById(id);
 const canvas = $("screen"), ctx = canvas.getContext("2d"), area = $("area");
-const token = location.hash.slice(1);
+// The link's token works once (it may show in the list of processes on this computer): it is
+// swapped for a session token kept in this tab only.
+const linkToken = location.hash.slice(1);
+let token = null;
+try { token = sessionStorage.getItem("meshvpn-viewer"); } catch {}
+async function session() {
+  if (linkToken) {
+    try {
+      const r = await fetch(`/session?token=${encodeURIComponent(linkToken)}`, { method: "POST" });
+      if (r.ok) { token = (await r.json()).session; try { sessionStorage.setItem("meshvpn-viewer", token); } catch {} }
+    } catch {}
+    history.replaceState(null, "", location.pathname);
+  }
+  return token;
+}
 let ws = null, drawQ = Promise.resolve(), buttons = 0, pressed = new Map();
 const enc = new TextEncoder(), dec = new TextDecoder();
 
@@ -152,6 +166,15 @@ function u16s(...v) { const b = new Uint8Array(v.length * 2); const d = new Data
 function notice(text, ms) { const n = $("notice"); n.textContent = text; n.hidden = false; clearTimeout(notice.t); if (ms) notice.t = setTimeout(() => n.hidden = true, ms); }
 
 function wantedSize() { return [Math.floor(area.clientWidth), Math.floor(area.clientHeight)]; }
+// On high-density screens (Retina: 2 screen pixels per page pixel) the browser smooths the
+// picture when it scales it up, which looks blurry. Where each remote pixel becomes a whole
+// block of screen pixels, they are drawn as such: as sharp as on a normal screen.
+function crisp() {
+  const r = canvas.getBoundingClientRect();
+  const k = canvas.width ? r.width * devicePixelRatio / canvas.width : 1;
+  canvas.style.imageRendering = (k > 1.01 && Math.abs(k - Math.round(k)) < 0.02) ? "pixelated" : "auto";
+}
+window.addEventListener("resize", () => setTimeout(crisp, 300));
 let resizeTimer = null;
 window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => send(C_RESIZE, u16s(...wantedSize())), 250); });
 
@@ -176,7 +199,7 @@ function handle(m) {
   switch (kind) {
     case S_INIT: {
       const w = d.getUint16(0, true), h = d.getUint16(2, true);
-      drawQ = drawQ.then(() => { if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; } });
+      drawQ = drawQ.then(() => { if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; } crisp(); });
       break;
     }
     case S_TILE: {
@@ -546,8 +569,10 @@ $("textClose").onclick = closeText;
 $("textDown").onclick = () => download(textPath, textName);
 $("textv").addEventListener("keydown", e => { if (e.key === "Escape") { closeText(); e.preventDefault(); } });
 
-if (!token) notice("Open this page with the link meshvpn printed (it contains the access token).");
-else connect();
+session().then(t => {
+  if (!t) notice("Open this page with the link meshvpn printed (it contains the access token, and works once: for another tab, run meshvpn desktop again).");
+  else connect();
+});
 </script>
 </body>
 </html>

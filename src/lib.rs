@@ -32,6 +32,7 @@ mod net;
 mod netcheck;
 mod networks;
 mod node;
+mod portmap;
 mod proto;
 mod share;
 mod ssh;

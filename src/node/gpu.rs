@@ -23,6 +23,7 @@ impl Node {
         indices: Option<Vec<u32>>,
         ttl_ms: u64,
         holder: String,
+        owner: Option<String>,
     ) -> Result<Lease> {
         if !crate::proto::clean_text(&holder) {
             bail!("invalid holder text");
@@ -75,6 +76,7 @@ impl Node {
             gpus: picked,
             holder,
             expires: now_ms().saturating_add(ttl_ms.min(MAX_LEASE_MS)),
+            owner,
         };
         st.leases.push(lease.clone());
         self.announce(&mut st);
@@ -83,13 +85,26 @@ impl Node {
         Ok(lease)
     }
 
-    pub fn gpu_release(&self, id: &str) -> Result<Lease> {
+    /// May `caller` change lease `l`? Whoever made it, and root.
+    fn lease_mine(l: &Lease, caller: &crate::ext::Caller) -> Result<()> {
+        if caller.privileged || (l.owner.is_some() && l.owner == caller.user) {
+            return Ok(());
+        }
+        bail!(
+            "reservation {} is {}'s - only they (or root) can release or renew it",
+            l.id,
+            l.owner.as_deref().unwrap_or("root")
+        )
+    }
+
+    pub fn gpu_release(&self, id: &str, caller: &crate::ext::Caller) -> Result<Lease> {
         let mut st = self.state.lock().unwrap();
         let pos = st
             .leases
             .iter()
             .position(|l| l.id == id)
             .ok_or_else(|| anyhow!("reservation {id} not found on {}", st.my_name))?;
+        Self::lease_mine(&st.leases[pos], caller)?;
         let lease = st.leases.remove(pos);
         self.announce(&mut st);
         drop(st);
@@ -97,7 +112,7 @@ impl Node {
         Ok(lease)
     }
 
-    pub fn gpu_renew(&self, id: &str, ttl_ms: u64) -> Result<Lease> {
+    pub fn gpu_renew(&self, id: &str, ttl_ms: u64, caller: &crate::ext::Caller) -> Result<Lease> {
         let mut st = self.state.lock().unwrap();
         Self::prune_leases(&mut st);
         let my_name = st.my_name.clone();
@@ -106,6 +121,7 @@ impl Node {
             .iter_mut()
             .find(|l| l.id == id)
             .ok_or_else(|| anyhow!("reservation {id} not found on {my_name} (expired?)"))?;
+        Self::lease_mine(lease, caller)?;
         lease.expires = now_ms().saturating_add(ttl_ms.min(MAX_LEASE_MS));
         let lease = lease.clone();
         self.announce(&mut st);

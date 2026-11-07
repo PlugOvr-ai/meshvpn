@@ -18,6 +18,8 @@ pub struct Target {
     pub remote: Remote,
     /// "auto" (the node's choice), "xfce", "mate", "cinnamon", "plain" or "screen".
     pub session: &'static str,
+    /// A shared SSH connection (a login with a password: `Remote::login`).
+    pub control: Option<std::path::PathBuf>,
 }
 
 impl Target {
@@ -31,6 +33,7 @@ impl Target {
                 timeout: std::time::Duration::from_secs(30),
             },
             session: "auto",
+            control: None,
         }
     }
 
@@ -52,7 +55,9 @@ impl Target {
         if self.session != "auto" {
             script.push_str(&format!(" --session {}", self.session));
         }
-        self.remote.command(&self.node, &script).into()
+        self.remote
+            .command_via(&self.node, &script, self.control.as_deref())
+            .into()
     }
 }
 
@@ -88,11 +93,14 @@ pub fn start(target: Target, port: u16) -> Result<Viewer> {
                 return;
             };
             let target = Arc::new(target);
-            let token = Arc::new(token);
+            let tokens = Arc::new(std::sync::Mutex::new(Tokens {
+                link: Some(token),
+                sessions: std::collections::HashSet::new(),
+            }));
             while let Ok((stream, _)) = listener.accept().await {
-                let (target, token) = (target.clone(), token.clone());
+                let (target, tokens) = (target.clone(), tokens.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, &target, &token).await {
+                    if let Err(e) = handle(stream, &target, &tokens).await {
                         tracing::debug!("viewer connection: {e:#}");
                     }
                 });
@@ -103,8 +111,12 @@ pub fn start(target: Target, port: u16) -> Result<Viewer> {
 }
 
 /// `meshvpn desktop <node>`: print the link, open the browser, serve until Ctrl+C.
-pub fn run(target: Target, port: u16, open_browser: bool) -> Result<()> {
+pub fn run(mut target: Target, port: u16, open_browser: bool) -> Result<()> {
     let label = target.label();
+    // No key for the node: log in once now (password), every tab uses that connection.
+    if std::env::var_os("MESHVPN_DESKTOP_BRIDGE").is_none() && target.control.is_none() {
+        target.control = target.remote.login(&target.node)?;
+    }
     let v = start(target, port)?;
     println!("Desktop of {label}: {}", v.url);
     match ssh_hint(v.port) {
@@ -153,7 +165,7 @@ pub fn ssh_hint(port: u16) -> Option<Vec<String>> {
     ])
 }
 
-fn open_url(url: &str) -> bool {
+pub fn open_url(url: &str) -> bool {
     for cmd in ["xdg-open", "open", "wslview"] {
         let ok = std::process::Command::new(cmd)
             .arg(url)
@@ -181,7 +193,14 @@ async fn read_head(stream: &mut TcpStream) -> Result<String> {
     Ok(String::from_utf8_lossy(&head).into_owned())
 }
 
-async fn handle(mut stream: TcpStream, target: &Target, token: &str) -> Result<()> {
+/// Who may use the viewer: the link's token, once (it may show in the list of processes, as an
+/// argument of the browser), swapped for a session token the page keeps.
+struct Tokens {
+    link: Option<String>,
+    sessions: std::collections::HashSet<String>,
+}
+
+async fn handle(mut stream: TcpStream, target: &Target, tokens: &std::sync::Mutex<Tokens>) -> Result<()> {
     let head = read_head(&mut stream).await?;
     let mut lines = head.lines();
     let path = lines
@@ -195,6 +214,46 @@ async fn handle(mut stream: TcpStream, target: &Target, token: &str) -> Result<(
             .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case(name)))
             .map(|(_, v)| v.trim().to_string())
     };
+    let given = path
+        .split_once("token=")
+        .map(|(_, t)| t.split('&').next().unwrap_or_default().to_string());
+    // Only this page itself (same address and port; a POST from it), never another site.
+    let own = format!(
+        "http://127.0.0.1:{}",
+        stream.local_addr().map(|a| a.port()).unwrap_or(0)
+    );
+    let same_origin =
+        header("Origin").is_none_or(|o| o == own) && header("Host").is_some_and(|h| own.ends_with(&format!("//{h}")));
+    let method = head.split_whitespace().next().unwrap_or_default().to_string();
+    if path.starts_with("/session") {
+        let session = (method == "POST" && same_origin)
+            .then(|| {
+                let mut t = tokens.lock().unwrap();
+                match (&t.link, &given) {
+                    (Some(l), Some(g)) if l == g => {
+                        t.link = None;
+                        let s: String = crate::keys::random32().iter().map(|b| format!("{b:02x}")).collect();
+                        t.sessions.insert(s.clone());
+                        Some(s)
+                    }
+                    _ => None,
+                }
+            })
+            .flatten();
+        let resp = match session {
+            Some(s) => {
+                let body = format!("{{\"session\":\"{s}\"}}");
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            }
+            None => "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        };
+        stream.write_all(resp.as_bytes()).await?;
+        return Ok(());
+    }
     if !path.starts_with("/ws") {
         let body = PAGE.replace("__TITLE__", &html_escape(&target.label()));
         let resp = format!(
@@ -205,10 +264,8 @@ async fn handle(mut stream: TcpStream, target: &Target, token: &str) -> Result<(
         stream.write_all(resp.as_bytes()).await?;
         return Ok(());
     }
-    // The page passes the token from the URL fragment; other sites can't know it.
-    let ok_token = path
-        .split_once("token=")
-        .is_some_and(|(_, t)| t.split('&').next() == Some(token));
+    // The page passes its session token; other sites can't know it.
+    let ok_token = same_origin && given.is_some_and(|g| tokens.lock().unwrap().sessions.contains(&g));
     let (Some(key), true) = (header("Sec-WebSocket-Key"), ok_token) else {
         stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")

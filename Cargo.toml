@@ -20,6 +20,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
 flate2 = "1.1.10"
 libc = "0.2.189"
+mainline = { version = "8.0.1", default-features = false, features = ["async"] }
 rand = "0.8"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "socks"] }

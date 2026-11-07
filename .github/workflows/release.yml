@@ -11,15 +11,24 @@ on:
         description: "Tag to release (e.g. v0.2.0); created from the selected branch if missing"
         required: true
 
+# Read-only; only the job that publishes may write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
+  tag:
+    # A tag given by hand (workflow_dispatch) goes into sed and file names: only vX.Y.Z.
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || { echo "not a release tag: $TAG"; exit 1; }
+
   build:
+    needs: tag
     name: build ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
@@ -71,6 +80,7 @@ jobs:
           path: dist/*
 
   macos:
+    needs: tag
     # Built natively on a Mac (both architectures), after the macOS smoke test.
     name: build macOS
     runs-on: macos-latest
@@ -105,6 +115,7 @@ jobs:
           path: dist/*
 
   windows:
+    needs: tag
     name: build Windows
     runs-on: windows-latest
     steps:
@@ -144,6 +155,7 @@ jobs:
           path: dist/*
 
   desktop:
+    needs: tag
     # The desktop bundle (static Xvfb etc., see desktop/build-bundle.sh), natively per arch.
     name: desktop bundle ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -165,6 +177,8 @@ jobs:
     uses: ./.github/workflows/e2e.yml
 
   release:
+    permissions:
+      contents: write
     # Published only when every end-to-end test passed.
     needs: [build, macos, windows, desktop, e2e]
     runs-on: ubuntu-latest

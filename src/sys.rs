@@ -495,3 +495,7 @@ pub fn user_name_of(uid: u32) -> Option<String> {
         (!pw.is_null()).then(|| std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
     }
 }
+
+/// Variables the daemon took from root's proxy.env (proxy credentials): not passed on to the
+/// sessions of the built-in SSH server.
+pub static FROM_PROXY_FILE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());

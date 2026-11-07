@@ -149,6 +149,43 @@ The address is remembered, and every other node learns about the public node and
 node that connected. Until then `meshvpn status` on the public node says that it can't reach the network and prints
 this command. Note that a node on the internet can reach every service the other nodes offer on the mesh.
 
+## Without any server: home routers and changing addresses
+
+A network needs one node the others can reach. That can be a node at home, and its address may change every night:
+
+* **Port opened by itself.** Behind a home router, meshvpn opens its port (TCP and UDP 7870) on the router with
+  UPnP, PCP or NAT-PMP, and tells the others the router's public address. On a FRITZ!Box allow it once for that
+  device: *Internet > Freigaben > Portfreigaben > Gerät > Selbstständige Portfreigaben für dieses Gerät erlauben*.
+  `meshvpn status` shows `port mapping: TCP 7870 + UDP 7870 open on the router (UPnP, 192.168.178.1), public …`,
+  or why it failed. Off with `port_mapping = false`.
+* **Found again after a new address (DHT rendezvous, off by default).** A node others can reach puts its current
+  address into BitTorrent's public DHT. Nodes that lost it (a notebook outside the company network, the other home
+  after the nightly reconnect) look it up there and connect again. No DynDNS or server needed. The entry is
+  encrypted with the network key and signed by the node: only members can read it, and they can't forge each
+  other's entries. Where it is stored changes every day, and after a ban the banned node can't find it anymore.
+  meshvpn only asks the DHT; it never stores or answers anything for others.
+
+  It is off by default because firewalls and intrusion detection in company networks may take DHT traffic for
+  BitTorrent. Switch it on **on the node that others connect to and on the nodes that should find it** (best: on
+  all nodes outside company networks). Add this line at the top of the configuration, before any `[section]`:
+
+  ```sh
+  sudoedit /etc/meshvpn/config.toml     # rootless: ~/.config/meshvpn/config.toml
+  #   dht = true                        (or change an existing `dht = false`)
+  sudo systemctl restart meshvpn
+  ```
+
+  `meshvpn status` then shows `rendezvous: DHT, published …` on the reachable node, and the others log
+  `rendezvous: <node> is at …` when they found it.
+* **Its own public address.** STUN servers (Google's and Cloudflare's by default, `stun = [...]` in the config,
+  `stun = []` for none) tell a node its public address also while no other node is connected.
+
+None of this goes through a configured proxy or SSH tunnel: those nodes keep using only them.
+
+What these features can't do: if the router has no public IPv4 address itself (DS-Lite, carrier-grade NAT, most
+mobile networks), no port can be opened on it. `meshvpn status` says so. Then IPv6 often still gives direct paths;
+otherwise one node with a public address is needed, e.g. a small VPS or a free cloud VM.
+
 ## Internet through another node (exit nodes)
 
 One node offers its internet connection, others send their internet traffic through it - e.g. to
@@ -510,7 +547,8 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 | Addresses | `100.64.0.0/10` + 22 bits of `blake3(node id)`. Deterministic, so no allocation server is needed. IPv6: `fd00::/8` + 40 bits of a hash of the network id (a /64 for each network) + 64 bits of a hash of the node id. Nodes say in their record whether they have IPv6 (it's off with `ipv6 = false` in the config, where the machine has IPv6 off, and in userspace mode); names point to the IPv6 address only of those that do. Inbound filtering by the extension and anti-spoofing apply to both. |
 | Transport | TCP links (the only thing an SSH tunnel or proxy can carry) for control traffic, and **direct UDP paths** for data wherever possible. Nodes publish their address candidates (LAN, public address as other nodes see it) and keep sending authenticated probes to each other, which opens a path through both NATs (hole punching). Data then goes directly over UDP; if a path stops answering it falls back to TCP or a relay within seconds. IPv6 addresses are candidates too: without NAT on the way, probes from both sides get through stateful firewalls, also where IPv4 hole punching can't (NATs that change the port per destination, typical for mobile networks - `meshvpn status` and `doctor` say which kind of NAT a node is behind). |
 | Discovery | Nodes sign a record (name, endpoints, neighbors, sequence number) and gossip all records they know. A new link gets the full table; changes are flooded. The state is saved to disk, so the mesh survives losing the bootstrap node. |
-| Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers) or the SSH tunnel's public port. |
+| Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers or STUN servers, the port opened on the home router with UPnP/PCP/NAT-PMP) or the SSH tunnel's public port. |
+| Rendezvous | Nodes with endpoints put them into BitTorrent's Mainline DHT (BEP 44 mutable item, every 30 minutes and when they change): under a key and salt derived from the network key, the node id and the day; XChaCha20-Poly1305 with a key from the network key; signed by the node and dated (older than 3 hours is ignored). Nodes look up those they lost (every 2 minutes while they have no link, 10 minutes otherwise, hourly for nodes gone for a day) and dial the addresses found first. The DHT client never answers or stores anything for others. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
 | Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key bound to the network id). Relays can't read or forge traffic, and the inner source IP must match the sender. |
 | Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable); `<name>.<network>.mesh` for a further network of the machine. |

@@ -362,11 +362,26 @@ async fn serve_conn(node: &Node, mut s: TcpStream) -> Result<()> {
                     let path = s.file(file);
                     let size = s.manifest.files[file].size;
                     let cs = s.manifest.chunk_size;
+                    let want = s.manifest.files[file].chunks[index].clone();
+                    // A few reads at once (each holds up to a whole chunk in memory).
+                    static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+                    let _permit = READS.acquire().await;
                     tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
                         let off = index as u64 * cs;
                         let mut buf = vec![0u8; (size.saturating_sub(off)).min(cs) as usize];
-                        std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
-                        Some(buf)
+                        let mut o = std::fs::OpenOptions::new();
+                        o.read(true);
+                        #[cfg(unix)]
+                        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                        let f = o.open(path).ok()?;
+                        // A regular file only (not a device a directory link leads to).
+                        if !f.metadata().ok()?.is_file() {
+                            return None;
+                        }
+                        f.read_exact_at(&mut buf, off).ok()?;
+                        // Only what was shared: a file changed (or swapped for a link to another
+                        // one) since then gives nothing.
+                        (blake3::hash(&buf).to_hex().as_str() == want).then_some(buf)
                     })
                     .await
                     .ok()
@@ -532,17 +547,27 @@ pub async fn fetch(
     }
     let manifest = manifest.ok_or_else(|| anyhow!("could not get the manifest of {id} from any holder"))?;
     manifest.validate()?;
+    #[cfg(unix)]
+    safe_destination(dest, owner)?;
+    let dest_new = !dest.exists();
     std::fs::create_dir_all(dest)?;
     let dest = dest.canonicalize()?;
 
     // Prepare files; chunks that are already there and correct are kept (resume).
     let man = manifest.clone();
     let root = dest.clone();
-    let (todo, reused) = tokio::task::spawn_blocking(move || -> Result<(VecDeque<(usize, usize)>, u64)> {
+    // (chunks to fetch, bytes already there, directories made)
+    type Prepared = (VecDeque<(usize, usize)>, u64, Vec<PathBuf>);
+    let (todo, reused, mut created) = tokio::task::spawn_blocking(move || -> Result<Prepared> {
         let mut todo = VecDeque::new();
         let mut reused = 0;
+        let mut created = vec![];
         for (fi, f) in man.files.iter().enumerate() {
-            let path = inside(&root, &f.path)?;
+            let path = inside(&root, &f.path, &mut created)?;
+            // Files that weren't there before are this fetch's (and so the user's, `owner`).
+            if std::fs::symlink_metadata(&path).is_err() {
+                created.push(path.clone());
+            }
             let mut opts = std::fs::OpenOptions::new();
             let file = opts
                 .create(true)
@@ -570,9 +595,12 @@ pub async fn fetch(
                 }
             }
         }
-        Ok((todo, reused))
+        Ok((todo, reused, created))
     })
     .await??;
+    if dest_new {
+        created.push(dest.clone());
+    }
 
     let total_chunks = todo.len();
     let queue = Arc::new(Mutex::new(todo));
@@ -672,12 +700,25 @@ pub async fn fetch(
         {
             #[cfg(unix)]
             let _ = file.set_permissions(std::fs::Permissions::from_mode(safe_mode(f.mode)));
+            #[cfg(unix)]
+            if let Some(uid) = owner
+                && created.contains(&path)
+            {
+                let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid_of(uid)));
+            }
             #[cfg(windows)]
             let _ = file;
         }
-        #[cfg(unix)]
-        if let Some(uid) = owner {
-            chown_tree(&dest, &path, uid);
+    }
+    // The directories this fetch made (not ones that were there: `sudo meshvpn fetch` into
+    // /usr/local must not give /usr/local away).
+    #[cfg(unix)]
+    if let Some(uid) = owner {
+        for d in created
+            .iter()
+            .filter(|d| std::fs::symlink_metadata(d).is_ok_and(|m| m.is_dir()))
+        {
+            let _ = std::os::unix::fs::lchown(d, Some(uid), Some(gid_of(uid)));
         }
     }
     let stored = Stored {
@@ -703,32 +744,73 @@ pub(crate) fn safe_mode(mode: u32) -> u32 {
     mode & 0o755
 }
 
-/// `root/rel` with its parent directories created, refusing to leave `root` (a canonical path)
-/// through symlinks already in the tree.
-fn inside(root: &Path, rel: &str) -> Result<PathBuf> {
+/// `root/rel` with its parent directories created (added to `created`), refusing to leave
+/// `root` (a canonical path) through symlinks already in the tree.
+fn inside(root: &Path, rel: &str, created: &mut Vec<PathBuf>) -> Result<PathBuf> {
     let path = root.join(rel);
     let dir = path.parent().ok_or_else(|| anyhow!("bad path {rel}"))?;
+    let mut missing = vec![];
+    let mut d = Some(dir);
+    while let Some(cur) = d.filter(|c| c.starts_with(root) && *c != root) {
+        if std::fs::symlink_metadata(cur).is_ok() {
+            break;
+        }
+        missing.push(cur.to_path_buf());
+        d = cur.parent();
+    }
     std::fs::create_dir_all(dir)?;
+    created.extend(missing);
     if !dir.canonicalize()?.starts_with(root) {
         bail!("{rel} leads outside {}", root.display());
     }
     Ok(path)
 }
 
-/// Gives `path` and its new parent directories below `dest` to `uid`.
+/// Root writes the files: only below directories nobody else can change (no links, none
+/// writable by others unless sticky like /tmp, none of another user's than `owner`), so no
+/// one can swap a part of the way for a link while it writes.
 #[cfg(unix)]
-fn chown_tree(dest: &Path, path: &Path, uid: u32) {
-    let gid = unsafe {
+fn safe_destination(dest: &Path, owner: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let abs = if dest.is_absolute() {
+        dest.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dest)
+    };
+    let mut p = Some(abs.as_path());
+    while let Some(cur) = p {
+        if let Ok(m) = std::fs::symlink_metadata(cur) {
+            if m.file_type().is_symlink() && cur.parent().is_some() {
+                // A link the system made (e.g. /var/run) is fine if root's, in root's directory.
+                let parent_root = cur
+                    .parent()
+                    .and_then(|d| std::fs::metadata(d).ok())
+                    .is_some_and(|d| d.uid() == 0);
+                if m.uid() != 0 || !parent_root {
+                    bail!("{} is a link: fetch into the directory it points to", cur.display());
+                }
+            }
+            let m = std::fs::metadata(cur)?;
+            let theirs = m.uid() != 0 && Some(m.uid()) != owner;
+            let open = m.mode() & 0o002 != 0 && m.mode() & 0o1000 == 0;
+            if m.is_dir() && (theirs || open) {
+                bail!(
+                    "{} can be changed by others: fetch into a directory only you (or root) can write",
+                    cur.display()
+                );
+            }
+        }
+        p = cur.parent();
+    }
+    Ok(())
+}
+
+/// The primary group of `uid`.
+#[cfg(unix)]
+fn gid_of(uid: u32) -> u32 {
+    unsafe {
         let pw = libc::getpwuid(uid);
         if pw.is_null() { uid } else { (*pw).pw_gid }
-    };
-    let mut p = Some(path);
-    while let Some(cur) = p {
-        if !cur.starts_with(dest) {
-            break;
-        }
-        let _ = std::os::unix::fs::lchown(cur, Some(uid), Some(gid));
-        p = cur.parent();
     }
 }
 
@@ -745,12 +827,14 @@ mod tests {
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        assert!(inside(&root, "a/b/c.txt").is_ok());
+        let mut made = vec![];
+        assert!(inside(&root, "a/b/c.txt", &mut made).is_ok());
+        assert_eq!(made.len(), 2, "a and a/b were made: {made:?}");
         // A symlink planted in the destination doesn't lead out of it.
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&dir, root.join("out")).unwrap();
-            assert!(inside(&root, "out/x.txt").is_err());
+            assert!(inside(&root, "out/x.txt", &mut vec![]).is_err());
         }
         std::fs::remove_dir_all(&dir).ok();
     }

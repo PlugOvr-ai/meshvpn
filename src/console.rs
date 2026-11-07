@@ -458,14 +458,39 @@ impl App {
             .and_then(|s| s.title.split('@').next().map(String::from))
             .filter(|_| self.tab > 0)
             .unwrap_or_else(|| self.login_user(node));
+        let remote = Remote {
+            user: user.clone(),
+            socks: self.socks,
+            timeout: Duration::from_secs(30),
+        };
+        // The console can't ask for a password: without a key, the command line can.
+        if !n.is_self {
+            let keys = remote
+                .command(&n, "true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !keys {
+                self.popup = Some(vec![
+                    format!("No SSH key login to {user}@{node}."),
+                    String::new(),
+                    "With a password: quit the console (q) and run".into(),
+                    format!("  meshvpn desktop {node} -u {user}"),
+                    "(it asks once, then the browser opens).".into(),
+                    String::new(),
+                    "Or once: ssh-copy-id, or `meshvpn ssh allow` on that node.".into(),
+                    "(any key closes this)".into(),
+                ]);
+                return;
+            }
+        }
         let target = crate::desktop::client::Target {
             node: n,
-            remote: Remote {
-                user: user.clone(),
-                socks: self.socks,
-                timeout: Duration::from_secs(30),
-            },
+            remote,
             session: "auto",
+            control: None,
         };
         match crate::desktop::client::start(target, 0) {
             Ok(v) => {
@@ -477,7 +502,11 @@ impl App {
                 ];
                 match crate::desktop::client::ssh_hint(v.port) {
                     Some(h) => lines.extend(h),
-                    None => lines.push("Open the link in a browser on this machine.".into()),
+                    None => lines.push(if crate::desktop::client::open_url(&v.url) {
+                        "Opened in your browser.".into()
+                    } else {
+                        "Open the link in a browser on this machine.".into()
+                    }),
                 }
                 lines.push(String::new());
                 lines.push("It stays available until you quit the console. (any key closes this)".into());
@@ -494,7 +523,7 @@ impl App {
                 "meshvpn console - the mesh in your terminal",
                 "",
                 "Nodes tab:   ↑↓ select   Enter shell   u shell as another user",
-                "             d desktop link (browser)   r refresh   q quit",
+                "             d desktop (opens the browser)   r refresh   q quit",
                 "",
                 "Anywhere:    Alt+0 nodes, Alt+1..9 shells, Alt+←/→ previous/next",
                 "             or Ctrl+B then: 0..9, n, p, w close tab, d desktop, ? help",

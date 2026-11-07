@@ -25,6 +25,8 @@ mod admin;
 mod exit;
 mod ext;
 mod gpu;
+mod rendezvous;
+mod replay;
 mod udp;
 pub mod why;
 
@@ -198,6 +200,7 @@ struct State {
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
     bench_ip_done: HashMap<u64, (f32, Instant)>,
     measure_seen: HashSet<u64>,
+    measure_last: Option<Instant>,
     why_seen: HashSet<u64>,
     why_counts: HashMap<NodeId, why::WhyCount>,
     why_replies: HashMap<u64, WhySide>,
@@ -214,6 +217,14 @@ struct State {
     udp_keys: HashMap<NodeId, [u8; 32]>,
     /// First 8 bytes of node ids, for the compact UDP data format.
     id_prefix: HashMap<[u8; 8], NodeId>,
+    /// The packet counters seen from each node (replay protection, `replay`). Kept when a node
+    /// is forgotten: starting afresh would let its old packets in again.
+    replay: HashMap<NodeId, replay::Window>,
+    /// Nonces of the probes we sent lately, per node: only an answer to one of them counts.
+    udp_probes_sent: HashMap<NodeId, VecDeque<(u64, Instant)>>,
+    /// Addresses nodes answered our probes from lately (authenticated): proof that an address
+    /// is theirs (`lan_check`).
+    udp_answered_from: HashMap<NodeId, Vec<(IpAddr, Instant)>>,
     my_udp: Vec<String>,
     my_udp6: Vec<String>,
     /// Admin-signed documents for extensions, newest per kind.
@@ -230,6 +241,16 @@ struct State {
     /// Refused logins to the built-in SSH server, for doctor/status.
     ssh_refused: VecDeque<(u64, String)>,
     leases: Vec<Lease>,
+    /// STUN requests in flight (transaction id, server, sent) and the answers: our public UDP
+    /// address as each server saw it.
+    stun_pending: Vec<([u8; 12], SocketAddr, Instant)>,
+    stun_mapped: Vec<(SocketAddr, SocketAddr, Instant)>,
+    /// Ports opened on the router (see portmap), or why not.
+    port_mapping: Option<crate::portmap::Mapping>,
+    port_mapping_note: Option<String>,
+    /// Addresses of nodes found through the rendezvous (newer than their records).
+    dht_hints: HashMap<NodeId, (Vec<String>, Instant)>,
+    rendezvous: rendezvous::RendezvousState,
 }
 
 pub struct Node {
@@ -244,6 +265,8 @@ pub struct Node {
     state: Mutex<State>,
     next_link_id: AtomicU64,
     started: Instant,
+    /// Nonces of the packets we send (session + counter, `replay`).
+    nonces: replay::Sender,
     socks: Option<String>,
     /// Datasets/checkpoints this node shares (`meshvpn share`).
     pub shares: crate::share::Store,
@@ -257,6 +280,8 @@ pub struct Node {
     ssh_cfg: Arc<russh::server::Config>,
     /// Kernel mode: the built-in SSH server listens on the mesh address.
     ssh_listening: std::sync::atomic::AtomicBool,
+    /// The DHT client for the rendezvous (started when first needed).
+    dht: Mutex<Option<mainline::async_dht::AsyncDht>>,
 }
 
 /// Throughput tests over the data path: IP protocol 253 ("for experimentation", RFC 3692).
@@ -344,6 +369,12 @@ pub struct Status {
     /// Internet traffic goes through this node.
     #[serde(default)]
     pub exit_via: Option<String>,
+    /// Ports opened on the home router (UPnP/PCP/NAT-PMP), or why that failed.
+    #[serde(default)]
+    pub port_mapping: Option<String>,
+    /// The DHT rendezvous: published, found, errors.
+    #[serde(default)]
+    pub rendezvous: Option<String>,
     /// This node's IPv4 NAT as other nodes see it (None: no direct UDP paths).
     #[serde(default)]
     pub nat: Option<String>,
@@ -457,6 +488,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     let socks = cfg.effective_socks();
     let udp = udp::bind(&cfg).await;
     let ident_for_ssh = Identity::from_config(&cfg)?;
+    let nonces = replay::Sender::new(&ident.id.0, Some(&dir));
     let node = Arc::new(Node {
         dir: dir.clone(),
         ident,
@@ -467,6 +499,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         state: Mutex::new(State::default()),
         next_link_id: AtomicU64::new(1),
         started: Instant::now(),
+        nonces,
         socks,
         shares: crate::share::Store::load(&dir),
         udp6: udp::bind6(udp.as_ref()).await,
@@ -474,6 +507,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         udp,
         ssh_cfg: crate::sshserver::config(&ident_for_ssh),
         ssh_listening: std::sync::atomic::AtomicBool::new(false),
+        dht: Mutex::new(None),
         cfg,
     });
 
@@ -518,7 +552,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         }
         let cutoff = now_ms().saturating_sub(FORGET_AFTER_MS);
         for f in saved.forgotten.into_iter().filter(|f| f.at > cutoff) {
-            node.apply_forget(&mut st, f);
+            node.apply_forget(&mut st, f, false);
         }
         for s in saved.peers {
             node.ingest(&mut st, s, false);
@@ -621,7 +655,10 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
                 n.udp_probe_round();
             }
         });
+        tokio::spawn(node.clone().stun_loop());
     }
+    tokio::spawn(node.clone().portmap_loop());
+    tokio::spawn(node.clone().rendezvous_loop());
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
     node.exit_start();
     node.ext_run();
@@ -715,7 +752,20 @@ impl Node {
             .is_some_and(|a| !a.ip().is_loopback());
         if self.cfg.auto_endpoints && listens_publicly {
             let port = listen_port.unwrap();
+            // The port opened on the router first: it is the one that works from outside.
+            if let Some(m) = st.port_mapping.as_ref().filter(|m| m.public())
+                && let Some(p) = m.external_port(crate::portmap::TCP)
+            {
+                eps.push(SocketAddr::new(IpAddr::V4(m.external), p).to_string());
+            }
             let mut ips: Vec<IpAddr> = st.observed_ips.clone();
+            // Our public address as STUN servers see it: right also while no node is
+            // connected to tell us (a new address from the provider).
+            for (_, a, _) in &st.stun_mapped {
+                if !ips.contains(&a.ip()) {
+                    ips.push(a.ip());
+                }
+            }
             if let Some(ip) = primary_ip() {
                 ips.push(ip);
             }
@@ -891,7 +941,7 @@ impl Node {
         if let Some((r, _)) = &st.rotation {
             frames.insert(0, frame(T_ROTATE, &serde_json::to_vec(r).unwrap()));
         }
-        let forgotten: Vec<Forget> = st.forgotten.values().copied().collect();
+        let forgotten: Vec<Forget> = st.forgotten.values().cloned().collect();
         for c in forgotten.chunks(256) {
             frames.push(frame(T_FORGET, &serde_json::to_vec(c).unwrap()));
         }
@@ -1163,7 +1213,7 @@ impl Node {
             .values()
             .filter(|r| r.info.name == node || (node.len() >= 4 && r.info.id.hex().starts_with(&node)))
             .collect();
-        matches.sort_by_key(|r| (!self.is_online(st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+        matches.sort_by_key(|r| self.name_rank(st, r));
         // A permission must not land on whichever device took that name last.
         if matches.len() > 1 {
             let ids: Vec<String> = matches
@@ -1642,12 +1692,22 @@ impl Node {
 
     // ----------------------------------------------------------------------------- forgetting
 
-    /// Records a tombstone and drops the node if we only know that version or older.
-    fn apply_forget(&self, st: &mut State, f: Forget) -> bool {
+    /// Records a tombstone and drops the node if we only know that version or older. One from
+    /// the network (`remote`) needs the signature of a member we know, in a managed network of
+    /// an admin, and can't reach into the future (it would keep the node out for good).
+    fn apply_forget(&self, st: &mut State, f: Forget, remote: bool) -> bool {
         if f.id == self.ident.id || st.forgotten.get(&f.id).is_some_and(|old| old.seq >= f.seq) {
             return false;
         }
-        st.forgotten.insert(f.id, f);
+        if remote {
+            let now = now_ms();
+            let Some(by) = f.signer() else { return false };
+            let known = by == self.ident.id || st.records.contains_key(&by);
+            if !known || !Self::admitted(st, &by) || !Self::is_admin(st, &by) || f.seq > f.at || f.at > now + 300_000 {
+                return false;
+            }
+        }
+        st.forgotten.insert(f.id, f.clone());
         if st.records.get(&f.id).is_some_and(|r| r.info.seq <= f.seq) && !st.links.contains_key(&f.id) {
             let r = st.records.remove(&f.id).unwrap();
             st.ciphers.remove(&f.id);
@@ -1661,7 +1721,10 @@ impl Node {
             return;
         };
         let mut st = self.state.lock().unwrap();
-        let changed: Vec<Forget> = list.into_iter().filter(|f| self.apply_forget(&mut st, *f)).collect();
+        let changed: Vec<Forget> = list
+            .into_iter()
+            .filter(|f| self.apply_forget(&mut st, f.clone(), true))
+            .collect();
         if !changed.is_empty() {
             self.rebuild(&mut st);
             self.broadcast(
@@ -1680,13 +1743,10 @@ impl Node {
         let mut sent = vec![];
         for id in ids {
             let Some(r) = st.records.get(id) else { continue };
-            let f = Forget {
-                id: *id,
-                seq: r.info.seq,
-                at: now_ms(),
-            };
+            // Never dated before the version it forgets (that node's clock may run ahead).
+            let f = Forget::sign(*id, r.info.seq, now_ms().max(r.info.seq), &self.ident);
             names.push(r.info.name.clone());
-            if self.apply_forget(st, f) {
+            if self.apply_forget(st, f.clone(), false) {
                 sent.push(f);
             }
         }
@@ -1738,23 +1798,36 @@ impl Node {
             }
         };
         let names = self.forget_ids(&mut st, &ids);
+        let everywhere = Self::is_admin(&st, &self.ident.id);
         drop(st);
         self.update_hosts();
         Ok(match names.len() {
             0 => "no offline nodes to forget".into(),
-            _ => format!("forgot {} (on every node of the network)", names.join(", ")),
+            _ if everywhere => format!("forgot {} (on every node of the network)", names.join(", ")),
+            _ => format!(
+                "forgot {} here (in a managed network only an admin makes every node forget it)",
+                names.join(", ")
+            ),
         })
     }
 
-    /// A machine that was set up again leaves its old identity behind under the same name.
+    /// A machine that was set up again leaves its old identity behind under the same name. In a
+    /// managed network only for one admitted after the old identity's last record (a reinstall
+    /// joins anew): an existing member taking the name of one that is offline doesn't count.
     fn auto_forget(&self, st: &mut State) {
         let me = st.my_name.clone();
+        let managed = Self::managed(st);
         let mut newest: HashMap<&str, u64> = HashMap::new();
         newest.insert(&me, u64::MAX);
         for r in st.records.values() {
             if self.is_online(st, &r.info.id) {
+                let since = if managed {
+                    st.claims.get(&r.info.id).map_or(0, |a| a.claim.at)
+                } else {
+                    r.info.seq
+                };
                 let e = newest.entry(&r.info.name).or_default();
-                *e = (*e).max(r.info.seq);
+                *e = (*e).max(since);
             }
         }
         let stale: Vec<NodeId> = st
@@ -1810,7 +1883,7 @@ impl Node {
             .map(|id| (id.0[..8].try_into().unwrap(), *id))
             .collect();
 
-        // Breadth-first search over the neighbor lists of online nodes.
+        // Breadth-first search over the neighbor lists of online nodes (links both ends name).
         let mut routes: HashMap<NodeId, NodeId> = HashMap::new();
         let mut queue = VecDeque::new();
         for n in st.links.keys() {
@@ -1824,8 +1897,10 @@ impl Node {
             if !self.is_online(st, &cur) || Self::client_of(st, &cur).is_some() {
                 continue;
             }
+            // Only links both ends name: one node's word alone could pull traffic through it.
             for nb in &rec.info.neighbors {
-                if *nb != self.ident.id && !routes.contains_key(nb) {
+                let mutual = st.records.get(nb).is_some_and(|r| r.info.neighbors.contains(&cur));
+                if mutual && *nb != self.ident.id && !routes.contains_key(nb) {
                     routes.insert(*nb, first);
                     queue.push_back(*nb);
                 }
@@ -1835,6 +1910,13 @@ impl Node {
     }
 
     // ----------------------------------------------------------------------------- data path
+
+    /// The replay check of an authentic packet from `src` (`replay`).
+    fn replayed(&self, src: &NodeId, nonce: &[u8; 24]) -> replay::Verdict {
+        // Only for packets that decrypted: one window per node we have (had) a record of.
+        let mut st = self.state.lock().unwrap();
+        st.replay.entry(*src).or_default().check(nonce)
+    }
 
     fn cipher_for(&self, st: &mut State, peer: &NodeId) -> Option<XChaCha20Poly1305> {
         if let Some(c) = st.ciphers.get(peer) {
@@ -1916,8 +1998,7 @@ impl Node {
             let cipher = self.cipher_for(&mut st, &dst)?;
             (dst, tx, cipher)
         };
-        let mut nonce = [0u8; 24];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce = self.nonces.nonce();
         let ct = cipher.encrypt(&XNonce::from(nonce), pkt).ok()?;
         let mut f = Vec::with_capacity(1 + DATA_HDR + ct.len());
         f.push(T_DATA);
@@ -1959,6 +2040,10 @@ impl Node {
         let pkt = cipher.decrypt(&XNonce::from(nonce), &f[1 + DATA_HDR..]).ok()?;
         // Anti-spoofing: the inner source address must belong to the sender (and only to it).
         if !self.source_ok(&src, &pkt) {
+            return None;
+        }
+        // Each packet once (a relay could send it again).
+        if self.replayed(&src, &nonce) == replay::Verdict::Replay {
             return None;
         }
         Some(pkt)
@@ -2057,7 +2142,7 @@ impl Node {
             return Some(self.my_ip);
         }
         let mut matches: Vec<&Record> = st.records.values().filter(|r| r.info.name == h).collect();
-        matches.sort_by_key(|r| (!self.is_online(&st, &r.info.id), std::cmp::Reverse(r.info.seq)));
+        matches.sort_by_key(|r| self.name_rank(&st, r));
         matches.first().map(|r| overlay_ip(&r.info.id))
     }
 
@@ -2091,12 +2176,40 @@ impl Node {
     // ----------------------------------------------------------------------------- links
 
     async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
+        // Connections still in their handshake (anyone can open them): a limited number, and
+        // only a few per address, so they can't use up memory and descriptors.
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(256));
+        let per_ip: Arc<Mutex<HashMap<IpAddr, u32>>> = Arc::default();
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let src = per_source(addr.ip());
+                    {
+                        let mut m = per_ip.lock().unwrap();
+                        let n = m.entry(src).or_default();
+                        if *n >= 16 {
+                            continue;
+                        }
+                        *n += 1;
+                    }
                     let node = self.clone();
+                    let per_ip = per_ip.clone();
                     tokio::spawn(async move {
-                        match node.establish(stream, false, addr.to_string()).await {
+                        let est = node.establish(stream, false, addr.to_string()).await;
+                        drop(permit);
+                        {
+                            let mut m = per_ip.lock().unwrap();
+                            if let Some(n) = m.get_mut(&src) {
+                                *n -= 1;
+                                if *n == 0 {
+                                    m.remove(&src);
+                                }
+                            }
+                        }
+                        match est {
                             Ok(est) => node.serve(est).await,
                             Err(e)
                                 if ["banned", "outdated network key", "not admitted"]
@@ -2440,6 +2553,78 @@ impl Node {
         }
     }
 
+    // ----------------------------------------------------------------------------- port mapping
+
+    /// Keeps the listen port (TCP, and the UDP port) open on the home router, so this node can
+    /// be reached from the internet: an anchor for the others without a manual port forward.
+    async fn portmap_loop(self: Arc<Self>) {
+        if !self.cfg.port_mapping || self.cfg.no_outbound || self.cfg.effective_socks().is_some() {
+            return;
+        }
+        let tcp = self
+            .cfg
+            .listen
+            .as_ref()
+            .and_then(|l| l.parse::<SocketAddr>().ok())
+            .filter(|a| !a.ip().is_loopback())
+            .map(|a| a.port());
+        let udp = self.udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port());
+        let mut ports = vec![];
+        if let Some(p) = tcp {
+            ports.push((crate::portmap::TCP, p));
+        }
+        if let Some(p) = udp {
+            ports.push((crate::portmap::UDP, p));
+        }
+        if ports.is_empty() {
+            return;
+        }
+        let mut last: Option<String> = None;
+        loop {
+            let res = crate::portmap::map(&ports, &self.cfg.interface).await;
+            let (mapping, note, wait) = match res {
+                Ok(m) => {
+                    let note = if m.public() {
+                        None
+                    } else {
+                        Some(format!(
+                            "the router has no public IPv4 address itself ({}: DS-Lite or carrier-grade NAT),                              so ports opened on it can't be reached from the internet",
+                            m.external
+                        ))
+                    };
+                    let wait = match m.lifetime {
+                        0 => 1800,
+                        l => (l as u64 / 2).clamp(60, 1800),
+                    };
+                    (Some(m), note, wait)
+                }
+                Err(crate::portmap::NoMapping::NotNeeded) | Err(crate::portmap::NoMapping::NoGateway) => {
+                    (None, None, 600)
+                }
+                Err(crate::portmap::NoMapping::Failed(e)) => {
+                    (None, Some(format!("could not open the port on the router: {e}")), 600)
+                }
+            };
+            let summary = match (&mapping, &note) {
+                (Some(m), None) => Some(format!("{}, public {}", m.describe(), m.external)),
+                (_, Some(n)) => Some(n.clone()),
+                _ => None,
+            };
+            if summary != last {
+                if let Some(s) = &summary {
+                    info!("port mapping: {s}");
+                }
+                last = summary;
+            }
+            {
+                let mut st = self.state.lock().unwrap();
+                st.port_mapping = mapping;
+                st.port_mapping_note = note;
+            }
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
+    }
+
     // ----------------------------------------------------------------------------- dialing
 
     fn dial_candidates(&self, st: &mut State) -> Vec<(String, Vec<String>, Option<String>)> {
@@ -2450,12 +2635,25 @@ impl Node {
         let now = Instant::now();
         let ready =
             |st: &State, key: &str| !st.dialing.contains(key) && st.backoff.get(key).is_none_or(|b| b.next <= now);
+        st.dht_hints.retain(|_, (_, at)| at.elapsed() < rendezvous::HINT_TTL);
         for (id, rec) in &st.records {
             let key = id.hex();
-            if st.links.contains_key(id) || rec.info.endpoints.is_empty() || !ready(st, &key) {
+            if st.links.contains_key(id) || !ready(st, &key) {
                 continue;
             }
-            out.push((key, rec.info.endpoints.clone(), None));
+            // Addresses found through the rendezvous first: they are newer than the record.
+            let hinted = st.dht_hints.get(id).map(|(e, _)| e.as_slice()).unwrap_or_default();
+            // A node's word for where it listens: never this machine itself or the link-local
+            // range (cloud metadata services), which would make every node connect there.
+            let mut eps: Vec<String> = vec![];
+            for e in hinted.iter().chain(&rec.info.endpoints) {
+                if dialable(e) && !eps.contains(e) {
+                    eps.push(e.clone());
+                }
+            }
+            if !eps.is_empty() {
+                out.push((key, eps, None));
+            }
         }
         let boots: Vec<String> = self.cfg.bootstrap.iter().chain(&st.extra_bootstrap).cloned().collect();
         let known: HashSet<&String> = st.records.values().flat_map(|r| &r.info.endpoints).collect();
@@ -2593,7 +2791,7 @@ impl Node {
         let saved = SavedState {
             me: st.my_signed.clone(),
             peers: st.records.values().map(|r| r.signed.clone()).collect(),
-            forgotten: st.forgotten.values().copied().collect(),
+            forgotten: st.forgotten.values().cloned().collect(),
             rotation: st.rotation.as_ref().map(|(r, _)| r.clone()),
             roster: st.roster.as_ref().map(|(r, _)| r.clone()),
             claims: st.claims.values().map(|a| a.msg.clone()).collect(),
@@ -2612,13 +2810,7 @@ impl Node {
         let aliases = self.ext_host_names();
         let mut st = self.state.lock().unwrap();
         let mut recs: Vec<_> = st.records.values().collect();
-        recs.sort_by_key(|r| {
-            (
-                !self.is_online(&st, &r.info.id),
-                std::cmp::Reverse(r.info.seq),
-                r.info.id,
-            )
-        });
+        recs.sort_by_key(|r| self.name_rank(&st, r));
         let mut used = HashSet::from([st.my_name.clone()]);
         let mut entries = vec![(st.my_name.clone(), self.my_ip, st.my_ssh_host_key.clone())];
         for r in recs {
@@ -2697,8 +2889,9 @@ impl Node {
             return;
         }
         st.route_ips = ips.clone();
-        // The same address in this machine's first network. With IPv6 the first network keeps
-        // it and this one reaches its node over IPv6; without, this route takes it over here.
+        // The same address in this machine's first network: the first network keeps it (a member
+        // of this one could make an identity with any address, about 2^22 tries). This
+        // network's node is reached over IPv6, or not at all from this machine.
         let first = crate::networks::base(&self.dir);
         let theirs: HashMap<Ipv4Addr, String> = Config::load(&first)
             .map(|c| {
@@ -2721,8 +2914,8 @@ impl Node {
                     .get(ip)
                     .and_then(|id| st.records.get(id))
                     .map_or("?", |r| r.info.name.as_str());
+                withheld.insert(*ip);
                 let text = if self.my_ip6.is_some() {
-                    withheld.insert(*ip);
                     format!(
                         "address clash: {ip} is {ours} in this network and {other} in this machine's first network - \
                          {other} keeps it here, {ours}.{suffix} is reached over IPv6"
@@ -2730,7 +2923,7 @@ impl Node {
                 } else {
                     format!(
                         "address clash: {ip} is {ours} in this network and {other} in this machine's first network - \
-                         here it reaches {ours}, so {other} can't be reached from this machine (with IPv6 on, both could)"
+                         {other} keeps it here, so {ours} can't be reached from this machine (with IPv6 on, it could)"
                     )
                 };
                 if !st.address_clashes.contains(&text) {
@@ -2788,16 +2981,10 @@ impl Node {
             v6: self.my_ip6,
             id: self.ident.id,
         }];
-        // If two nodes share a name, the plain name goes to the one that is online and newest
-        // (e.g. a machine that was set up again gets its name back from its old identity).
+        // If two nodes share a name, the plain name goes to the one `name_rank` puts first (e.g.
+        // a machine that was set up again gets its name back from its old identity).
         let mut others: Vec<_> = st.records.values().collect();
-        others.sort_by_key(|r| {
-            (
-                !self.is_online(&st, &r.info.id),
-                std::cmp::Reverse(r.info.seq),
-                r.info.id,
-            )
-        });
+        others.sort_by_key(|r| self.name_rank(&st, r));
         let others: Vec<_> = others
             .into_iter()
             .map(|r| {
@@ -2931,6 +3118,12 @@ impl Node {
             },
             exit_offer: st.exit_offer,
             exit_via: self.exit_status(&st).0,
+            port_mapping: match (&st.port_mapping, &st.port_mapping_note) {
+                (_, Some(n)) => Some(n.clone()),
+                (Some(m), None) => Some(format!("{}, public {}", m.describe(), m.external)),
+                _ => None,
+            },
+            rendezvous: self.rendezvous_status(&st),
             nat: nat.as_ref().map(|n| n.describe()),
             nat_hard: nat == Some(udp::NatKind::ChangesPort),
             ipv6,
@@ -3033,6 +3226,18 @@ impl Node {
         self.save_state();
         crate::ssh::kill_all();
         std::fs::remove_file(crate::control::socket_path(&self.dir)).ok();
+        // Nothing of this process may live on in the new one: on macOS the utun interface stays
+        // as long as its descriptor is open (one more interface with every update otherwise).
+        #[cfg(unix)]
+        unsafe {
+            let max = libc::sysconf(libc::_SC_OPEN_MAX).clamp(256, 65536) as i32;
+            for fd in 3..max {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+        }
         #[cfg(unix)]
         let err = {
             use std::os::unix::process::CommandExt;
@@ -3283,17 +3488,18 @@ impl Node {
         before
     }
 
-    /// `peer`'s address on a LAN we share, if it answers there (a refused connection counts:
-    /// the machine is reachable).
-    async fn lan_check(info: &NodeInfo) -> Option<Ipv4Addr> {
+    /// `peer`'s address on a LAN we share, if it answers our authenticated UDP probe there
+    /// (only the node itself can: anything else at that address - another site's host in the
+    /// same private range, an address it names that isn't its own - doesn't count).
+    async fn lan_check(&self, info: &NodeInfo) -> Option<Ipv4Addr> {
         let mine = crate::net::local_lans();
-        let mut ports: Vec<u16> = info
-            .endpoints
+        // Its UDP port: that of its first candidates (its own addresses).
+        let port = info
+            .udp
             .iter()
-            .filter_map(|e| e.rsplit(':').next()?.parse().ok())
-            .collect();
-        ports.push(22);
-        ports.dedup();
+            .find_map(|c| c.parse::<SocketAddr>().ok())
+            .map(|a| a.port())?;
+        let mut want = vec![];
         for l in &info.lan {
             let Some((ip, _)) = crate::net::parse_cidr(l) else {
                 continue;
@@ -3304,12 +3510,29 @@ impl Node {
             {
                 continue;
             }
-            for port in &ports {
-                match timeout(Duration::from_secs(1), TcpStream::connect((ip, *port))).await {
-                    Ok(Ok(_)) => return Some(ip),
-                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Some(ip),
-                    _ => {}
-                }
+            want.push(ip);
+        }
+        if want.is_empty() {
+            return None;
+        }
+        let answered = |st: &State| {
+            st.udp_answered_from.get(&info.id).and_then(|l| {
+                want.iter().copied().find(|ip| {
+                    l.iter()
+                        .any(|(a, at)| *a == IpAddr::V4(*ip) && at.elapsed() < Duration::from_secs(120))
+                })
+            })
+        };
+        if let Some(ip) = answered(&self.state.lock().unwrap()) {
+            return Some(ip);
+        }
+        for _ in 0..3 {
+            for ip in &want {
+                self.udp_probe_to(&info.id, SocketAddr::new(IpAddr::V4(*ip), port));
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if let Some(ip) = answered(&self.state.lock().unwrap()) {
+                return Some(ip);
             }
         }
         None
@@ -3380,7 +3603,7 @@ impl Node {
             } else {
                 None
             };
-            let lan_ip = match Self::lan_check(&info).await {
+            let lan_ip = match self.lan_check(&info).await {
                 Some(ip) => Some(ip),
                 None => self.direct_lan(&info),
             };
@@ -3430,12 +3653,21 @@ impl Node {
     /// Floods a measurement request; nodes in it measure towards the others in it.
     pub fn start_measure(self: &Arc<Self>, req: MeasureReq, from: Option<NodeId>) {
         let mut st = self.state.lock().unwrap();
+        // Clients don't start measurements of the whole network.
+        if from.is_some_and(|f| Self::client_of(&st, &f).is_some()) {
+            return;
+        }
         if !st.measure_seen.insert(req.nonce) {
             return;
         }
         if st.measure_seen.len() > 1000 {
             st.measure_seen.clear();
         }
+        // One every 20 s at most, whoever asks (each moves up to 256 MB between every pair).
+        if st.measure_last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
+            return;
+        }
+        st.measure_last = Some(Instant::now());
         self.broadcast(&st, &frame(T_MEASURE, &serde_json::to_vec(&req).unwrap()), from);
         if req.nodes.contains(&self.ident.id) && !st.measuring {
             st.measuring = true;
@@ -4024,6 +4256,46 @@ fn primary_ip() -> Option<IpAddr> {
     s.connect("1.1.1.1:80").ok()?;
     let ip = s.local_addr().ok()?.ip();
     (!ip.is_loopback() && !ip.is_unspecified() && !is_overlay(ip)).then_some(ip)
+}
+
+/// An endpoint from another node's record that may be dialed: host names, and addresses that
+/// aren't loopback, link-local or unspecified (names that look like addresses must be proper
+/// ones: the resolver would take `127.1` for loopback).
+fn dialable(endpoint: &str) -> bool {
+    let host = endpoint.rsplit_once(':').map_or(endpoint, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<IpAddr>() {
+        Ok(ip) => address_dialable(ip),
+        Err(_) => {
+            !host.eq_ignore_ascii_case("localhost")
+                && !host.ends_with(".localhost")
+                && host.contains(|c: char| c.is_ascii_alphabetic())
+                && !host.starts_with("0x")
+        }
+    }
+}
+
+/// An address another node may make us connect or send to.
+pub(crate) fn address_dialable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => address_dialable(IpAddr::V4(v4)),
+            None => !(ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80),
+        },
+    }
+}
+
+/// Whom a connection counts against before its handshake: its IPv4 address, or its IPv6 /64 (one
+/// machine there has a whole /64).
+fn per_source(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]

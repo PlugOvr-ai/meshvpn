@@ -60,6 +60,27 @@ pub fn find() -> Option<Bundle> {
 /// package it).
 const VIRTUALGL: &str = "3.1.5";
 
+/// The SHA-256 of each VirtualGL package (as GitHub records them for the 3.1.5 release): root
+/// installs it, so nothing else will do.
+const VIRTUALGL_SHA256: &[(&str, &str)] = &[
+    (
+        "virtualgl_3.1.5_amd64.deb",
+        "df3f7788ce41b182a47c0d298e5cd6d2d63579522cb41825970b7726e825485e",
+    ),
+    (
+        "virtualgl_3.1.5_arm64.deb",
+        "9ac238e8a18c06d84ef65444a591a7a5bb4c4ce9e8cfdd92f8a2aea35edbb5d7",
+    ),
+    (
+        "VirtualGL-3.1.5.x86_64.rpm",
+        "6670b7f82dd602d47919af3a5c9f4e4348070e4eddce6083d388d14ec0336660",
+    ),
+    (
+        "VirtualGL-3.1.5.aarch64.rpm",
+        "38fb3bbc19cc57911795b30be83f9f701d485c6cbae67a1ccc2df36c2a852795",
+    ),
+];
+
 /// `meshvpn desktop setup --gpu`: 3D on the GPU in desktop sessions (VirtualGL: OpenGL programs
 /// render on the GPU, the picture goes into the session's X server) and the picture to the
 /// browser encoded by the GPU (ffmpeg with NVENC or VA-API, and the VA-API drivers).
@@ -90,7 +111,7 @@ pub fn install_gpu() -> Result<()> {
         let cmd = if has("dnf") {
             "dnf install -y \"$PKG\" ffmpeg-free xorg-x11-server-Xvfb libva mesa-dri-drivers mesa-libEGL glx-utils"
         } else {
-            "zypper --non-interactive --no-gpg-checks install \"$PKG\" ffmpeg xorg-x11-server-Xvfb libva2 Mesa-dri Mesa-libEGL1 Mesa-demo-x"
+            "zypper --non-interactive install --allow-unsigned-rpm \"$PKG\" ffmpeg xorg-x11-server-Xvfb libva2 Mesa-dri Mesa-libEGL1 Mesa-demo-x"
         };
         (file, cmd.to_string())
     } else {
@@ -106,7 +127,26 @@ pub fn install_gpu() -> Result<()> {
             anyhow::Ok(r.bytes().await?)
         })
         .with_context(|| format!("downloading {url}"))?;
-    let tmp = std::env::temp_dir().join(format!("meshvpn-{file}"));
+    let want = VIRTUALGL_SHA256
+        .iter()
+        .find(|(f, _)| *f == file)
+        .map(|(_, h)| *h)
+        .with_context(|| format!("no checksum known for {file}"))?;
+    let got = crate::update::sha256_hex(&data);
+    if got != want {
+        bail!("{url}: checksum {got}, expected {want} - not installed");
+    }
+    // In a new directory of root's alone: nobody can put something else in its place before
+    // the package manager reads it.
+    let dir = std::env::temp_dir().join(format!("meshvpn-gpu-{:016x}", rand::random::<u64>()));
+    {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(&dir)?;
+    }
+    let tmp = dir.join(&file);
     std::fs::write(&tmp, &data)?;
     println!("Installing VirtualGL, ffmpeg and the GPU drivers' video parts...");
     let ok = std::process::Command::new("sh")
@@ -116,7 +156,7 @@ pub fn install_gpu() -> Result<()> {
         .status()
         .context("running the package manager")?
         .success();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir_all(&dir);
     if !ok {
         bail!("installing the GPU support failed (see above)");
     }
@@ -172,8 +212,11 @@ pub fn install_desktop(name: &str) -> Result<()> {
         ),
         "mate" => (
             "MATE",
+            // The applets of Ubuntu's MATE panel layout ("familiar": the Brisk menu, indicators,
+            // trash) - without them its top panel stays empty.
             "mate-session-manager mate-panel marco caja mate-terminal mate-control-center mate-settings-daemon \
-             mate-themes dbus-x11 fonts-dejavu-core librsvg2-common",
+             mate-themes mate-applet-brisk-menu mate-indicator-applet mate-applets dbus-x11 fonts-dejavu-core \
+             librsvg2-common",
             "mate-session-manager mate-panel marco caja mate-terminal mate-control-center mate-settings-daemon \
              mate-themes dbus-x11 dejavu-sans-fonts",
             "mate-session-manager mate-panel marco caja mate-terminal mate-control-center mate-settings-daemon \
@@ -278,7 +321,17 @@ fn install(data: &[u8]) -> Result<Bundle> {
         {
             bail!("unexpected path in the desktop bundle: {}", path.display());
         }
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let mode = entry.header().mode().unwrap_or(0o644);
         entry.unpack_in(&tmp)?;
+        // Programs, but never setuid/setgid ones (root unpacks it), nor writable by others.
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let out = tmp.join(&path);
+        #[cfg(unix)]
+        if mode & 0o7022 != 0 && std::fs::symlink_metadata(&out).is_ok_and(|m| m.is_file() || m.is_dir()) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode & 0o755))?;
+        }
     }
     let unpacked = tmp.join("meshvpn-desktop");
     if !unpacked.join("bin/Xvfb").is_file() {

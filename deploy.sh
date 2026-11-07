@@ -111,6 +111,10 @@ else
     done
     if command -v sha256sum >/dev/null 2>&1; then
         (cd "$TMP" && sha256sum -c "meshvpn-$TARGET.tar.gz.sha256" >/dev/null) || die "checksum mismatch"
+    elif command -v shasum >/dev/null 2>&1; then
+        (cd "$TMP" && shasum -a 256 -c "meshvpn-$TARGET.tar.gz.sha256" >/dev/null) || die "checksum mismatch"
+    else
+        die "neither sha256sum nor shasum is installed: can't check the download"
     fi
     tar -xzf "$TMP/meshvpn-$TARGET.tar.gz" -C "$TMP"
 fi
@@ -137,14 +141,16 @@ rm -f ~/.meshvpn-upload
 \$SUDO mkdir -p /etc/meshvpn
 \$SUDO chmod 700 /etc/meshvpn
 \$SUDO test -f /etc/meshvpn/ssh_key || \$SUDO ssh-keygen -q -t ed25519 -N '' -C \"meshvpn@\$(hostname)\" -f /etc/meshvpn/ssh_key
-\$SUDO cat /etc/meshvpn/ssh_key.pub > /tmp/meshvpn-deploy.pub
-chmod 644 /tmp/meshvpn-deploy.pub"
+# Into the user's own home, not /tmp (where someone else could have put a key of theirs first).
+rm -f ~/.meshvpn-deploy.pub
+\$SUDO cat /etc/meshvpn/ssh_key.pub > ~/.meshvpn-deploy.pub"
 dev_sudo "$@" || die "installing on $HOSTNAME_DEV failed"
-PUBKEY="$(dev 'cat /tmp/meshvpn-deploy.pub; rm -f /tmp/meshvpn-deploy.pub' "$@" </dev/null | tr -d '\r')"
+PUBKEY="$(dev 'cat ~/.meshvpn-deploy.pub; rm -f ~/.meshvpn-deploy.pub' "$@" </dev/null | tr -d '\r')"
 case "$PUBKEY" in ssh-ed25519\ *) ;; *) die "could not read the device's key" ;; esac
 
 # Let the device in here for port forwarding only: any command it tries just prints
-# meshvpn-ok, so a compromised device gets no shell on this machine.
+# meshvpn-ok, so a compromised device gets no shell on this machine. (It may still forward to
+# any address: the mesh endpoints it needs change, and permitopen takes no patterns for hosts.)
 mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
 KEY_BODY="$(echo "$PUBKEY" | awk '{print $2}')"
 if ! grep -qF "$KEY_BODY" ~/.ssh/authorized_keys; then

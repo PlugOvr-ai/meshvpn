@@ -210,7 +210,9 @@ def screen(port, token):
         r["second"] = v.size
         v.send(C_MONITOR, bytes([255]))
         v.until(lambda: v.monitors["view"] is None, "all monitors")
-        v.until(lambda: v.frames >= 2, "a frame of all monitors")
+        # A frame that comes after the switch (the size changes with it).
+        seen = v.frames
+        v.until(lambda: v.frames > seen, "a frame of all monitors")
         r["all"] = v.size
     print(json.dumps(r))
 
@@ -281,8 +283,37 @@ def video(port, token):
                       "tiles_after": sum(v.tiles.values()) - tiles_before, "notices": v.notices}))
 
 
+def session(port, link_token):
+    """What the page does first: the link's token (good once) for a session token (kept, as
+    the page keeps it, for the next run of this script with the same link)."""
+    cache = f"/tmp/desktop-session-{os.getuid()}-{port}-{link_token}"
+    if os.path.exists(cache):
+        return open(cache).read().strip()
+    s = socket.create_connection(("127.0.0.1", port), 10)
+    s.sendall(f"POST /session?token={link_token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\n\r\n".encode())
+    resp = b""
+    while True:
+        b = s.recv(4096)
+        if not b:
+            break
+        resp += b
+    head, _, body = resp.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n")[0]:
+        raise SystemExit(f"no session: {head[:80]!r}")
+    # Once only: a second exchange is refused.
+    s = socket.create_connection(("127.0.0.1", port), 10)
+    s.sendall(f"POST /session?token={link_token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\n\r\n".encode())
+    again = s.recv(4096)
+    if b" 403 " not in again.split(b"\r\n")[0]:
+        raise SystemExit(f"the link's token worked twice: {again[:80]!r}")
+    token = json.loads(body)["session"]
+    with open(cache, "w") as f:
+        f.write(token)
+    return token
+
+
 def main():
-    port, token = int(sys.argv[1]), sys.argv[2]
+    port, token = int(sys.argv[1]), session(int(sys.argv[1]), sys.argv[2])
     if len(sys.argv) > 3 and sys.argv[3] == "video":
         return video(port, token)
     if len(sys.argv) > 4 and sys.argv[3] == "de":
