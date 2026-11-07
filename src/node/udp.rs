@@ -761,9 +761,12 @@ pub(super) async fn bind6(v4: Option<&Arc<UdpSocket>>) -> Option<Arc<UdpSocket>>
 const STUN_REQUEST: u16 = 0x0001;
 const STUN_SUCCESS: u16 = 0x0101;
 const STUN_COOKIE: u32 = 0x2112_A442;
-/// How often our public UDP address is asked for (sooner while no node is connected).
-const STUN_EVERY: Duration = Duration::from_secs(600);
-const STUN_ALONE: Duration = Duration::from_secs(60);
+/// How often it is checked whether STUN is needed (only while no node tells us our address).
+const STUN_EVERY: Duration = Duration::from_secs(300);
+/// What a STUN server said counts this long (the address may change).
+const STUN_VALID: Duration = Duration::from_secs(1800);
+/// Other nodes saw our UDP address this recently: no need to ask a STUN server.
+const SEEN_RECENTLY: Duration = Duration::from_secs(600);
 
 pub(super) fn stun_request(txid: &[u8; 12]) -> [u8; 20] {
     let mut r = [0u8; 20];
@@ -810,15 +813,27 @@ pub(super) fn stun_parse(d: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
 }
 
 impl Node {
-    /// Asks the STUN servers for our public UDP address now and then: what other nodes see,
-    /// also while none is connected (after a new address from the provider, say), so this
-    /// node's record and its rendezvous entry name the right address.
+    /// Asks the STUN servers for our public UDP address while no other node tells us (none is
+    /// connected, or none answers over UDP): after a new address from the provider, say, so
+    /// this node's record and its rendezvous entry name the right address. Not more than
+    /// needed: each request tells the server's operator that this address runs meshvpn.
     pub(super) async fn stun_loop(self: Arc<Self>) {
         let Some(sock) = self.udp.clone() else { return };
         if self.cfg.stun.is_empty() {
             return;
         }
+        // The first links usually tell us within seconds: no request at every start.
+        tokio::time::sleep(Duration::from_secs(30)).await;
         loop {
+            let needed = {
+                let mut st = self.state.lock().unwrap();
+                st.stun_mapped.retain(|(_, _, at)| at.elapsed() < STUN_VALID);
+                st.links.is_empty() || !st.udp_seen.values().any(|(_, at)| at.elapsed() < SEEN_RECENTLY)
+            };
+            if !needed {
+                tokio::time::sleep(STUN_EVERY).await;
+                continue;
+            }
             let mut servers: Vec<SocketAddr> = vec![];
             for s in &self.cfg.stun {
                 if let Ok(Ok(addrs)) = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(s)).await
@@ -837,8 +852,7 @@ impl Node {
                     let _ = sock.try_send_to(&stun_request(&txid), *server);
                 }
             }
-            let alone = self.state.lock().unwrap().links.is_empty();
-            tokio::time::sleep(if alone { STUN_ALONE } else { STUN_EVERY }).await;
+            tokio::time::sleep(STUN_EVERY).await;
         }
     }
 

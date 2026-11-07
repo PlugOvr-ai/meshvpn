@@ -282,6 +282,8 @@ pub struct Node {
     ssh_listening: std::sync::atomic::AtomicBool,
     /// The DHT client for the rendezvous (started when first needed).
     dht: Mutex<Option<mainline::async_dht::AsyncDht>>,
+    /// `meshvpn leave`: the network was told; no new links or records until meshvpn stops.
+    leaving: std::sync::atomic::AtomicBool,
 }
 
 /// Throughput tests over the data path: IP protocol 253 ("for experimentation", RFC 3692).
@@ -369,6 +371,12 @@ pub struct Status {
     /// Internet traffic goes through this node.
     #[serde(default)]
     pub exit_via: Option<String>,
+    /// Managed network: the admins' names ("" for none: an open network, everybody may).
+    #[serde(default)]
+    pub admins: Vec<String>,
+    /// This node is an admin of the managed network.
+    #[serde(default)]
+    pub is_admin: bool,
     /// Ports opened on the home router (UPnP/PCP/NAT-PMP), or why that failed.
     #[serde(default)]
     pub port_mapping: Option<String>,
@@ -414,6 +422,9 @@ pub struct SshOverview {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PeerStatus {
     pub name: String,
+    /// An admin of the managed network.
+    #[serde(default)]
+    pub admin: bool,
     /// A client (a user's computer, a member for a time): whose.
     #[serde(default)]
     pub client: Option<String>,
@@ -508,6 +519,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         ssh_cfg: crate::sshserver::config(&ident_for_ssh),
         ssh_listening: std::sync::atomic::AtomicBool::new(false),
         dht: Mutex::new(None),
+        leaving: std::sync::atomic::AtomicBool::new(false),
         cfg,
     });
 
@@ -682,6 +694,11 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         }
     }
     info!("shutting down");
+    // Ports opened on the router are closed again (they would stay open for up to an hour).
+    let mapping = node.state.lock().unwrap().port_mapping.take();
+    if let Some(m) = mapping {
+        let _ = tokio::time::timeout(Duration::from_secs(3), crate::portmap::unmap(&m)).await;
+    }
     node.exit_stop();
     node.save_state();
     if node.cfg.manage_hosts
@@ -833,6 +850,10 @@ impl Node {
 
     /// Re-sign our record and push it to all neighbors.
     fn announce(&self, st: &mut State) {
+        // A newer record would bring this node back where it was just forgotten.
+        if self.leaving.load(Ordering::Relaxed) {
+            return;
+        }
         self.resign(st);
         let signed = st.my_signed.clone().unwrap();
         let f = frame(T_GOSSIP, &serde_json::to_vec(&vec![signed]).unwrap());
@@ -1699,15 +1720,26 @@ impl Node {
         if f.id == self.ident.id || st.forgotten.get(&f.id).is_some_and(|old| old.seq >= f.seq) {
             return false;
         }
+        // A node that leaves the network forgets itself (`meshvpn leave`): any member may.
+        let mut leaving = false;
         if remote {
             let now = now_ms();
             let Some(by) = f.signer() else { return false };
+            leaving = by == f.id;
             let known = by == self.ident.id || st.records.contains_key(&by);
-            if !known || !Self::admitted(st, &by) || !Self::is_admin(st, &by) || f.seq > f.at || f.at > now + 300_000 {
+            if !known
+                || !Self::admitted(st, &by)
+                || (!leaving && !Self::is_admin(st, &by))
+                || f.seq > f.at
+                || f.at > now + 300_000
+            {
                 return false;
             }
         }
         st.forgotten.insert(f.id, f.clone());
+        if leaving && let Some(l) = st.links.remove(&f.id) {
+            l.kill.notify_one();
+        }
         if st.records.get(&f.id).is_some_and(|r| r.info.seq <= f.seq) && !st.links.contains_key(&f.id) {
             let r = st.records.remove(&f.id).unwrap();
             st.ciphers.remove(&f.id);
@@ -1755,6 +1787,47 @@ impl Node {
             self.broadcast(st, &frame(T_FORGET, &serde_json::to_vec(&sent).unwrap()), None);
         }
         names
+    }
+
+    /// `meshvpn leave`: this node leaves the network. Admins hand over first: the last one can't
+    /// leave (make another node admin first). The others forget this node; the CLI then stops
+    /// meshvpn here and removes the configuration.
+    pub fn leave(&self) -> Result<String> {
+        let mut st = self.state.lock().unwrap();
+        let me = self.ident.id;
+        let mut note = String::new();
+        if let Some((_, r)) = st.roster.clone()
+            && r.admins.contains(&me)
+        {
+            let others: Vec<NodeId> = r
+                .admins
+                .iter()
+                .copied()
+                .filter(|a| *a != me && !st.banned.contains_key(a))
+                .collect();
+            if others.is_empty() {
+                bail!(
+                    "this node is the only admin of the network - make another node admin first \
+                     (sudo meshvpn admin add <node>), then leave"
+                );
+            }
+            // Still a member until the forget arrives, so the others keep the link to hear it.
+            let members = self.current_members(&st);
+            self.publish_roster(&mut st, others.clone(), members)?;
+            let names: Vec<String> = others
+                .iter()
+                .map(|id| st.records.get(id).map_or_else(|| id.short(), |r| r.info.name.clone()))
+                .collect();
+            note = format!(" (admins now: {})", names.join(", "));
+        }
+        self.leaving.store(true, Ordering::Relaxed);
+        let f = Forget::sign(me, st.my_seq, now_ms().max(st.my_seq), &self.ident);
+        self.broadcast(&st, &frame(T_FORGET, &serde_json::to_vec(&vec![f]).unwrap()), None);
+        let told = st.links.len();
+        Ok(match told {
+            0 => format!("no node is connected: the others still list this node until one of them forgets it{note}"),
+            _ => format!("told the network that this node leaves{note}"),
+        })
     }
 
     /// How long a node has been offline (None = online).
@@ -2183,6 +2256,9 @@ impl Node {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    if self.leaving.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let Ok(permit) = handshakes.clone().try_acquire_owned() else {
                         continue;
                     };
@@ -2568,16 +2644,12 @@ impl Node {
             .and_then(|l| l.parse::<SocketAddr>().ok())
             .filter(|a| !a.ip().is_loopback())
             .map(|a| a.port());
-        let udp = self.udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port());
-        let mut ports = vec![];
-        if let Some(p) = tcp {
-            ports.push((crate::portmap::TCP, p));
-        }
-        if let Some(p) = udp {
+        // Only a node that accepts connections opens anything: one that only dials out (and its
+        // UDP port) has no use for an open port on the router.
+        let Some(tcp) = tcp else { return };
+        let mut ports = vec![(crate::portmap::TCP, tcp)];
+        if let Some(p) = self.udp.as_ref().and_then(|s| s.local_addr().ok()).map(|a| a.port()) {
             ports.push((crate::portmap::UDP, p));
-        }
-        if ports.is_empty() {
-            return;
         }
         let mut last: Option<String> = None;
         loop {
@@ -2602,7 +2674,11 @@ impl Node {
                     (None, None, 600)
                 }
                 Err(crate::portmap::NoMapping::Failed(e)) => {
-                    (None, Some(format!("could not open the port on the router: {e}")), 600)
+                    let note = format!(
+                        "could not open the port on the router: {e} - tried again every 10 minutes; allowed it \
+                         on the router just now? restart meshvpn"
+                    );
+                    (None, Some(note), 600)
                 }
             };
             let summary = match (&mapping, &note) {
@@ -2629,7 +2705,7 @@ impl Node {
 
     fn dial_candidates(&self, st: &mut State) -> Vec<(String, Vec<String>, Option<String>)> {
         let mut out = vec![];
-        if self.cfg.no_outbound {
+        if self.cfg.no_outbound || self.leaving.load(Ordering::Relaxed) {
             return out;
         }
         let now = Instant::now();
@@ -3036,6 +3112,8 @@ impl Node {
                 };
                 PeerStatus {
                     name: r.info.name.clone(),
+                    admin: st.roster.as_ref().is_some_and(|(_, ro)| ro.admins.contains(&id))
+                        && !st.banned.contains_key(&id),
                     client: Self::client_of(&st, &id).map(|c| c.user.clone()),
                     login_user: r.info.login_user.clone(),
                     version: r.info.version.clone(),
@@ -3118,6 +3196,27 @@ impl Node {
             },
             exit_offer: st.exit_offer,
             exit_via: self.exit_status(&st).0,
+            admins: st
+                .roster
+                .as_ref()
+                .map(|(_, r)| {
+                    r.admins
+                        .iter()
+                        .filter(|id| !st.banned.contains_key(id))
+                        .map(|id| {
+                            if *id == self.ident.id {
+                                st.my_name.clone()
+                            } else {
+                                st.records.get(id).map_or_else(|| id.short(), |r| r.info.name.clone())
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            is_admin: st
+                .roster
+                .as_ref()
+                .is_some_and(|(_, r)| r.admins.contains(&self.ident.id)),
             port_mapping: match (&st.port_mapping, &st.port_mapping_note) {
                 (_, Some(n)) => Some(n.clone()),
                 (Some(m), None) => Some(format!("{}, public {}", m.describe(), m.external)),

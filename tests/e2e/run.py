@@ -294,8 +294,6 @@ def test_two_networks(lab):
     check("hubb" not in hosts and "huba.mesh" in hosts, f"/etc/hosts: {hosts}")
     check(laptop.sh("ip link show mesh1", ok=False).returncode != 0, "mesh1 is gone")
     check(ping(laptop, "huba.mesh"), "the first network still works")
-    p = laptop.mv("networks leave mesh", ok=False)
-    check(p.returncode != 0 and "first network" in p.stdout + p.stderr, "the first network can't be left like that")
 
 
 @test
@@ -424,6 +422,49 @@ def test_admin_invites(lab):
     wait(lambda: a.mv("invite", ok=False).returncode == 0, "a can invite once it is admin", timeout=20)
     a.mv("admin rm hub")
     wait(lambda: hub.mv("invite", ok=False).returncode != 0, "hub can't invite after removal", timeout=20)
+
+
+@test
+def test_leave(lab):
+    """Leaving a network: the others forget the node; leaving the first network makes the next
+    one the first; the last admin has to make another node admin first; status names the admins."""
+    net, (hub, a, b) = mesh(lab, ["hub", "a", "b"])
+    st = hub.status()
+    check(st["admins"] == ["hub"] and st["is_admin"], f"admins at the hub: {st['admins']}")
+    check("admins:       hub (this node)" in hub.mv("status"), "status shows the admin")
+    st = a.status()
+    check(st["admins"] == ["hub"] and not st["is_admin"], f"admins at a: {st['admins']}")
+    check((a.peer("hub") or {}).get("admin") and not (a.peer("b") or {}).get("admin"), "admin flag per node")
+    wait(lambda: a.online("b") and b.online("a"), "a and b see each other")
+    # a is also in a second network; it leaves its first one, which the others forget.
+    net2 = lab.network("two")
+    hub2 = lab.node("hub2", [net2])
+    hub2.mv(f"init --name hub2 --network lab --endpoint {hub2.c}:7870")
+    hub2.up()
+    run(["docker", "network", "connect", net2, a.c])
+    a.mv(f"join {invite(hub2)} --name a")
+    run(["docker", "exec", "-d", a.c, "sh", "-c", "meshvpn --net lab up >> /var/log/meshvpn-lab.log 2>&1"])
+    wait(lambda: hub2.online("a"), "a online in the second network", 60)
+    out = a.mv("leave --yes", timeout=90)
+    check("told the network" in out and "left network mesh" in out and "lab is now this machine's first" in out, out)
+    wait(lambda: hub.peer("a") is None and b.peer("a") is None, "a forgotten in the first network", 30)
+    check([n["name"] for n in a.mvj("networks")] == ["lab"], f"networks: {a.mvj('networks')}")
+    wait(lambda: a.sh("meshvpn status >/dev/null 2>&1 && echo ok", ok=False).stdout.strip() == "ok", "lab runs as the first network", 30)
+    check(a.status()["network"] == "lab", f"a's network: {a.status()['network']}")
+    wait(lambda: a.online("hub2") and hub2.online("a"), "a back in lab", 60)
+    wait(lambda: ping(a, "hub2.mesh"), "names of lab are <node>.mesh now", 30)
+    check("hub.mesh" not in a.sh("cat /etc/hosts"), "the first network's names are gone")
+    # The only admin can't leave; once there is another one, it can.
+    p = hub.mv("leave --yes", ok=False)
+    check(p.returncode != 0 and "only admin" in p.stdout + p.stderr, f"last admin: {p.stdout}{p.stderr}")
+    check(hub.status()["admins"] == ["hub"] and hub.online("b"), "still in after the refusal")
+    hub.mv("admin add b")
+    wait(lambda: set(b.status()["admins"]) == {"hub", "b"}, "b is an admin too", 30)
+    out = hub.mv("leave --yes", timeout=90)
+    check("admins now: b" in out, out)
+    wait(lambda: b.status()["admins"] == ["b"] and b.peer("hub") is None, "b the only admin, hub forgotten", 30)
+    check(hub.sh("test -e /etc/meshvpn/config.toml", ok=False).returncode != 0, "hub's configuration is gone")
+    check(b.status()["is_admin"], "b is admin")
 
 
 @test
@@ -592,9 +633,10 @@ def test_rendezvous(lab):
     hub.up()
     wait(lambda: "published 198.51.103.20:7870" in (hub.status().get("rendezvous") or ""),
          "hub's new entry", timeout=180, interval=3)
-    wait(lambda: b.online("hub"), "b finds the hub at its new address", timeout=300, interval=3)
+    # Not just "online": b still counts the hub as online for a while after its last record.
+    wait(lambda: "198.51.103.20" in (b.peer("hub") or {}).get("path", ""),
+         "b connected to the hub at its new address", timeout=300, interval=3)
     check("rendezvous: hub" in b.log(), "found through the rendezvous")
-    check("198.51.103.20" in (b.peer("hub") or {}).get("path", ""), f"path: {b.peer('hub')}")
 
 
 @test

@@ -37,10 +37,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum NetworksCmd {
-    /// Leave a further network: stops it here and removes its configuration.
+    /// Leave a network (also the first one): the others forget this node, meshvpn stops for it
+    /// here and its configuration is removed.
     Leave {
         /// The network (as `meshvpn networks` lists it).
         name: String,
+        /// Don't ask.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -328,6 +332,14 @@ enum Cmd {
     Install,
     /// Stop and remove the systemd service (of all networks, or the one of --net).
     Uninstall,
+    /// Leave this network (or the one of --net): the other nodes forget this one, meshvpn stops
+    /// for it here and its configuration and keys are removed. An admin makes another node
+    /// admin first (meshvpn admin add <node>), unless there is one already.
+    Leave {
+        /// Don't ask.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Tab completion for bash (`meshvpn install` sets it up; zsh: `autoload bashcompinit;
     /// bashcompinit; source <(meshvpn completion bash)`).
     Completion {
@@ -1997,8 +2009,9 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Networks { cmd: None } => print_networks(&base, json)?,
         Cmd::Networks {
-            cmd: Some(NetworksCmd::Leave { name }),
-        } => leave_network(&base, &name, json)?,
+            cmd: Some(NetworksCmd::Leave { name, yes }),
+        } => leave_network(&base, &name, json, yes)?,
+        Cmd::Leave { yes } => leave(&base, &dir, json, yes)?,
     }
     Ok(0)
 }
@@ -2105,38 +2118,184 @@ fn print_networks(base: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `meshvpn networks leave NAME`: a further network goes, the others stay as they are.
-fn leave_network(base: &Path, name: &str, json: bool) -> Result<()> {
+/// `meshvpn networks leave NAME`: that network goes, the others stay as they are.
+fn leave_network(base: &Path, name: &str, json: bool, yes: bool) -> Result<()> {
     let dir = networks::dir_of(base, name);
-    if !Config::path(&dir).exists() {
-        if Config::load(base).is_ok_and(|c| c.network == name) {
-            bail!(
-                "{name} is this machine's first network, which stays (the others are set up next to it) - \
-                 to stop it: meshvpn uninstall"
-            );
-        }
-        bail!("this machine isn't in a network called {name} (not found): see meshvpn networks");
+    if Config::path(&dir).exists() {
+        return leave(base, &dir, json, yes);
     }
-    require_owner()?;
-    config::set_rootless(&dir);
-    if config::rootless() {
-        uninstall_user(&dir)?
-    } else {
-        uninstall(&dir)?
+    if Config::load(base).is_ok_and(|c| c.network == name) {
+        return leave(base, base, json, yes);
+    }
+    bail!("this machine isn't in a network called {name} (not found): see meshvpn networks")
+}
+
+/// What a network keeps in its directory (removed when it is left; nothing else is touched:
+/// the directory may be one given with --dir).
+const NETWORK_FILES: &[&str] = &[
+    "config.toml",
+    "state.json",
+    "nonce-session",
+    "proxy.env",
+    "objects",
+    "meshvpn.log",
+    "known_hosts",
+    "meshvpn.sock",
+];
+
+/// From the saved state: is this node the network's only admin? (meshvpn isn't running.)
+fn only_admin_offline(dir: &Path, cfg: &Config) -> bool {
+    let Ok(me) = crate::keys::Identity::from_config(cfg).map(|i| i.id.hex()) else {
+        return false;
     };
+    let Ok(text) = std::fs::read_to_string(dir.join("state.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(data) = v["roster"]["data"].as_str() else {
+        return false; // an open network
+    };
+    let Ok(r) = serde_json::from_str::<serde_json::Value>(data) else {
+        return false;
+    };
+    let admins: Vec<&str> = r["admins"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    admins.contains(&me.as_str()) && admins.len() == 1
+}
+
+/// `meshvpn leave`: the network forgets this node, meshvpn stops for it and its configuration
+/// goes. If it was the machine's first network and there are others, the next one becomes the
+/// first (its names are then `<node>.mesh`).
+fn leave(base: &Path, dir: &Path, json: bool, yes: bool) -> Result<()> {
+    use std::io::{IsTerminal as _, Write as _};
+    let cfg = Config::load(dir)?;
+    require_owner()?;
+    config::set_rootless(dir);
+    let label = networks::display_name(dir);
+    if !yes && !json && std::io::stdin().is_terminal() {
+        print!(
+            "Leave network {label}? meshvpn stops for it here and its configuration and keys are removed \
+             (to come back you need a new invite). [y/N] "
+        );
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            bail!("not left");
+        }
+    }
+    // Tell the network (and hand over the admin role); the last admin can't go.
+    let rt = tokio::runtime::Runtime::new()?;
+    match rt.block_on(control::request(dir, &control::Request::Leave)) {
+        Ok(control::Response::Message { text }) => {
+            if !json {
+                println!("{text}");
+            }
+            // Let it go out before meshvpn stops.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+        Ok(_) => {}
+        // Only "not running" goes on without telling the network; anything else stops here.
+        Err(e) if !e.to_string().contains("meshvpn is not running") => return Err(e),
+        Err(_) => {
+            if only_admin_offline(dir, &cfg) {
+                bail!(
+                    "this node is the only admin of the network - start meshvpn, make another node admin \
+                     (sudo meshvpn admin add <node>), then leave"
+                );
+            }
+            if !json {
+                println!(
+                    "meshvpn isn't running, so the other nodes can't be told: they list {} as offline until one \
+                     of them forgets it (meshvpn forget {})",
+                    cfg.name, cfg.name
+                );
+            }
+        }
+    }
+    let extra = networks::name(dir);
+    if config::rootless() {
+        uninstall_user(dir)?
+    } else {
+        uninstall(dir)?
+    };
+    #[cfg(unix)]
+    for (pid, cmd) in stop_other_daemons(dir) {
+        if !json {
+            println!("Stopped meshvpn (pid {pid}: {cmd}).");
+        }
+    }
     // Its daemon removes its names from /etc/hosts as it stops; this is for one that didn't run.
     if !config::rootless() {
-        let _ = hosts::write(Some(name), None);
-        let _ = std::fs::remove_dir_all(format!("/var/lib/meshvpn/networks/{name}"));
+        let _ = hosts::write(extra.as_deref(), None);
+        match &extra {
+            Some(n) => {
+                let _ = std::fs::remove_dir_all(format!("/var/lib/meshvpn/networks/{n}"));
+            }
+            None => {
+                let _ = std::fs::remove_file("/var/lib/meshvpn/known_hosts");
+            }
+        }
     } else {
-        node::user_ssh_config(&dir, false);
+        node::user_ssh_config(dir, false);
     }
-    std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    match &extra {
+        Some(_) => std::fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?,
+        None => {
+            for f in NETWORK_FILES {
+                let p = dir.join(f);
+                if p.is_dir() {
+                    std::fs::remove_dir_all(&p).ok();
+                } else {
+                    std::fs::remove_file(&p).ok();
+                }
+            }
+        }
+    }
     say(
         json,
-        &format!("left network {name}: its configuration is gone from this machine"),
+        &format!("left network {label}: its configuration is gone from this machine"),
     );
+    if extra.is_none()
+        && let Some((next, _)) = networks::all(base).into_iter().find(|(n, _)| !n.is_empty())
+    {
+        promote(base, &next)?;
+        say(
+            json,
+            &format!("network {next} is now this machine's first network: its nodes are <node>.mesh now"),
+        );
+    }
     Ok(())
+}
+
+/// A further network becomes the machine's first one (after that was left).
+fn promote(base: &Path, name: &str) -> Result<()> {
+    let from = networks::dir_of(base, name);
+    if config::rootless() {
+        uninstall_user(&from)?
+    } else {
+        uninstall(&from)?
+    };
+    #[cfg(unix)]
+    stop_other_daemons(&from);
+    for e in std::fs::read_dir(&from)?.flatten() {
+        std::fs::rename(e.path(), base.join(e.file_name()))
+            .with_context(|| format!("moving {} to {}", e.path().display(), base.display()))?;
+    }
+    std::fs::remove_dir(&from).ok();
+    if !config::rootless() {
+        let _ = hosts::write(Some(name), None);
+        let old = format!("/var/lib/meshvpn/networks/{name}");
+        let _ = std::fs::rename(format!("{old}/known_hosts"), "/var/lib/meshvpn/known_hosts");
+        let _ = std::fs::remove_dir_all(old);
+        install(base)
+    } else {
+        install_user(base)
+    }
 }
 
 /// systemd and sudo start meshvpn without the user's proxy variables, so install.sh saves the
@@ -2884,6 +3043,22 @@ fn print_status(st: &node::Status) {
     for w in &st.warnings {
         println!("  \x1b[1;33mwarning:\x1b[0m {w}");
     }
+    if st.admins.is_empty() {
+        println!("  admins:       none (open network: every member may invite and ban)");
+    } else {
+        let names: Vec<String> = st
+            .admins
+            .iter()
+            .map(|a| {
+                if st.is_admin && *a == st.name {
+                    format!("{a} (this node)")
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        println!("  admins:       {}", names.join(", "));
+    }
     if !st.endpoints.is_empty() {
         println!("  reachable at: {}", st.endpoints.join(", "));
     }
@@ -3293,6 +3468,20 @@ fn daemon_dir(args: &[String]) -> Option<PathBuf> {
 /// Is that daemon the one of network `dir`? One without --dir runs a machine's first network.
 fn runs_network(args: &[String], dir: &Path) -> bool {
     let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    // `meshvpn --net lab up`: a further network by its name.
+    let net = args
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| match a.strip_prefix("--net=") {
+            Some(v) => Some(v.to_string()),
+            None if a == "--net" => args.get(i + 1).cloned(),
+            None => None,
+        });
+    if let Some(n) = net
+        && daemon_dir(args).is_none()
+    {
+        return networks::name(&dir).as_deref() == Some(n.as_str());
+    }
     match daemon_dir(args) {
         Some(d) => d == dir,
         None => !networks::is_extra(&dir),

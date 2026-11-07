@@ -322,7 +322,7 @@ impl Node {
 
     // ----------------------------------------------------------------------------- commands
 
-    fn publish_roster(&self, st: &mut State, admins: Vec<NodeId>, members: Vec<NodeId>) -> Result<()> {
+    pub(super) fn publish_roster(&self, st: &mut State, admins: Vec<NodeId>, members: Vec<NodeId>) -> Result<()> {
         let version = st.roster.as_ref().map_or(1, |(_, r)| r.version + 1);
         let roster = Roster {
             net: self.net.clone(),
@@ -341,7 +341,7 @@ impl Node {
     }
 
     /// Everybody admitted now (to keep them when the roster changes).
-    fn current_members(&self, st: &State) -> Vec<NodeId> {
+    pub(super) fn current_members(&self, st: &State) -> Vec<NodeId> {
         let mut m: Vec<NodeId> = st.records.keys().copied().filter(|id| Self::admitted(st, id)).collect();
         if let Some((_, r)) = &st.roster {
             m.extend(r.members.iter().copied());

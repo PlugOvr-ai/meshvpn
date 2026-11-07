@@ -471,6 +471,10 @@ mod tests {
                 .as_async()
         };
         let (a, b) = (client(()), client(()));
+        // Joined the test network before asking (a race on slower machines otherwise).
+        for d in [&a, &b] {
+            assert!(d.bootstrapped().await, "joined the local DHT");
+        }
         let me = ident();
         let key = [5u8; 32];
         let now = now_ms();

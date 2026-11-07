@@ -395,6 +395,11 @@ sudo meshvpn ban stolen-laptop      # for good: every node drops it and the netw
 After a ban, invites from before the ban stop working; members that were offline get the new key when they come
 back.
 
+**Leaving:** `sudo meshvpn leave` on the node: the others forget it, and its configuration and keys are removed.
+`meshvpn status` shows the admins (`admins: …`); the only admin makes another node admin first
+(`sudo meshvpn admin add <node>`). For a lost or stolen machine use `sudo meshvpn ban <name>` instead: a copy of the
+configuration would still have the network key.
+
 **On a single node:** `sudo meshvpn rename <name>`, `sudo meshvpn doctor`, `sudo meshvpn uninstall` (stops the service,
 keeps the configuration).
 

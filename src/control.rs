@@ -52,6 +52,8 @@ pub enum Request {
     Ban {
         who: String,
     },
+    /// `meshvpn leave`: tell the network that this node leaves.
+    Leave,
     Rename {
         name: String,
     },
@@ -462,6 +464,12 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
             },
         },
         Ok(Request::Rename { name }) => match node.rename(&name) {
+            Ok(text) => Response::Message { text },
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
+        Ok(Request::Leave) => match node.leave() {
             Ok(text) => Response::Message { text },
             Err(e) => Response::Error {
                 message: format!("{e:#}"),

@@ -9,9 +9,14 @@
 //!   calls to its WANIPConnection (or WANPPPConnection) service. FRITZ!Boxes answer this once
 //!   "Selbstständige Portfreigaben" (automatic port sharing) is allowed for the device.
 //!
-//! Mappings are leased (an hour) and renewed at half time. A mapping only helps if the router
-//! has a public IPv4 address itself: behind DS-Lite or carrier-grade NAT it gets a private
-//! one, and the mapping is not advertised.
+//! Mappings are leased (an hour), renewed at half time and removed when meshvpn stops. Routers
+//! that only allow permanent forwards are not used: such a forward would stay after meshvpn is
+//! gone. A mapping only helps if the router has a public IPv4 address itself: behind DS-Lite or
+//! carrier-grade NAT it gets a private one, and the mapping is not advertised.
+//!
+//! Everything a router (or a device on the LAN pretending to be one) sends is untrusted: sizes
+//! are capped, the control URL must point at the gateway, and texts are cleaned before they are
+//! shown or logged.
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -34,8 +39,14 @@ pub struct Mapping {
     pub external: Ipv4Addr,
     /// (protocol, internal port, external port)
     pub ports: Vec<(u8, u16, u16)>,
-    /// How long the router keeps them (0: until it restarts).
+    /// How long the router keeps them (seconds, never 0: no permanent forwards).
     pub lifetime: u32,
+    /// UPnP: the connection service and its control URL (to remove the mappings).
+    pub upnp: Option<(String, String)>,
+    /// Our address on the LAN (PCP and NAT-PMP need it to remove the mappings).
+    pub local: Ipv4Addr,
+    /// The gateway's PCP/NAT-PMP port (5351).
+    pub pcp_port: u16,
 }
 
 impl Mapping {
@@ -137,6 +148,16 @@ fn local_ip(gw: Ipv4Addr) -> Option<Ipv4Addr> {
     }
 }
 
+/// Printable text from a router: no control characters (terminal escapes), bounded length.
+pub fn clean(s: &str) -> String {
+    let t: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect();
+    t.trim().to_string()
+}
+
 /// Why nothing is mapped.
 #[derive(Debug)]
 pub enum NoMapping {
@@ -163,7 +184,48 @@ pub async fn map(ports: &[(u8, u16)], skip_iface: &str) -> Result<Mapping, NoMap
     };
     match upnp_map_all(gw, local, ports, LIFETIME).await {
         Ok(m) => Ok(m),
-        Err(e) => Err(NoMapping::Failed(format!("UPnP: {e:#}; PCP/NAT-PMP: {pcp_err:#}"))),
+        Err(e) => Err(NoMapping::Failed(clean(&format!(
+            "UPnP: {e:#}; PCP/NAT-PMP: {pcp_err:#}"
+        )))),
+    }
+}
+
+/// Removes the mappings (best effort: when meshvpn stops).
+pub async fn unmap(m: &Mapping) {
+    let res: Result<()> = async {
+        match &m.upnp {
+            Some((service, url)) => {
+                let client = http()?;
+                for (proto, _, ext) in &m.ports {
+                    let args = vec![
+                        ("NewRemoteHost", String::new()),
+                        ("NewExternalPort", ext.to_string()),
+                        ("NewProtocol", if *proto == TCP { "TCP" } else { "UDP" }.to_string()),
+                    ];
+                    let _ = soap(&client, url, service, "DeletePortMapping", &args).await;
+                }
+            }
+            None => {
+                let sock = UdpSocket::bind((m.local, 0)).await?;
+                sock.connect((m.gateway, m.pcp_port)).await?;
+                for (proto, internal, _) in &m.ports {
+                    // Lifetime 0 deletes; one try each, no need to wait for the answer.
+                    let req: Vec<u8> = if m.method == "PCP" {
+                        let nonce: [u8; 12] = crate::keys::random32()[..12].try_into().unwrap();
+                        pcp_request(m.local, &nonce, *proto, *internal, 0).to_vec()
+                    } else {
+                        natpmp_request(*proto, *internal, 0).to_vec()
+                    };
+                    let _ = sock.send(&req).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if res.is_ok() {
+        tracing::info!("port mapping: removed from the router ({})", m.gateway);
     }
 }
 
@@ -178,6 +240,9 @@ async fn pcp_map_all(gw: SocketAddrV4, local: Ipv4Addr, ports: &[(u8, u16)], lif
         external: Ipv4Addr::UNSPECIFIED,
         ports: vec![],
         lifetime,
+        upnp: None,
+        local,
+        pcp_port: gw.port(),
     };
     let mut natpmp = false;
     for &(proto, port) in ports {
@@ -203,6 +268,9 @@ async fn pcp_map_all(gw: SocketAddrV4, local: Ipv4Addr, ports: &[(u8, u16)], lif
     }
     if natpmp {
         out.external = natpmp_external(&sock).await?;
+    }
+    if out.lifetime == 0 {
+        bail!("the gateway granted no lease");
     }
     Ok(out)
 }
@@ -362,6 +430,34 @@ const SERVICES: [&str; 3] = [
     "urn:schemas-upnp-org:service:WANPPPConnection:1",
 ];
 
+/// The most a router may send us (device descriptions are a few KB).
+const MAX_BODY: usize = 256 * 1024;
+
+/// A response body, at most MAX_BODY bytes.
+async fn read_body(mut resp: reqwest::Response) -> Result<String> {
+    let mut out: Vec<u8> = vec![];
+    while let Some(chunk) = resp.chunk().await? {
+        if out.len() + chunk.len() > MAX_BODY {
+            bail!("the router's answer is too large");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Whether `url` is plain HTTP to the gateway itself (any port).
+fn at_gateway(url: &str, gw: Ipv4Addr) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    host.parse::<Ipv4Addr>().ok() == Some(gw)
+}
+
 /// LAN requests never go through a proxy from the environment.
 fn http() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
@@ -400,9 +496,7 @@ fn ssdp_location(answer: &str, gw: Ipv4Addr) -> Option<String> {
         let (k, v) = l.split_once(':')?;
         k.trim().eq_ignore_ascii_case("location").then(|| v.trim().to_string())
     })?;
-    let rest = loc.strip_prefix("http://")?;
-    let host = rest.split(['/', ':']).next()?;
-    (host.parse::<Ipv4Addr>().ok()? == gw).then_some(loc)
+    at_gateway(&loc, gw).then_some(loc)
 }
 
 /// Text of the first `<tag>` in `xml` (namespace prefixes ignored).
@@ -481,12 +575,12 @@ async fn soap(
         .await
         .map_err(|e| (0, e.to_string()))?;
     let ok = resp.status().is_success();
-    let text = resp.text().await.map_err(|e| (0, e.to_string()))?;
+    let text = read_body(resp).await.map_err(|e| (0, e.to_string()))?;
     if ok {
         return Ok(text);
     }
     let code = xml_text(&text, "errorCode").and_then(|c| c.parse().ok()).unwrap_or(0);
-    let desc = xml_text(&text, "errorDescription").unwrap_or("refused").to_string();
+    let desc = clean(xml_text(&text, "errorDescription").unwrap_or("refused"));
     Err((code, desc))
 }
 
@@ -496,6 +590,9 @@ fn upnp_error(code: u32, desc: &str) -> String {
                 (Internet > Freigaben > Portfreigaben)"
             .into(),
         718 => "the port is already forwarded to another device".into(),
+        725 => "the router only allows permanent port forwards, which meshvpn doesn't create (they would stay \
+                after meshvpn is gone) - forward the port by hand"
+            .into(),
         0 => desc.to_string(),
         c => format!("{desc} (UPnP error {c})"),
     }
@@ -504,9 +601,9 @@ fn upnp_error(code: u32, desc: &str) -> String {
 async fn upnp_map_all(gw: Ipv4Addr, local: Ipv4Addr, ports: &[(u8, u16)], lifetime: u32) -> Result<Mapping> {
     let location = ssdp_search(gw, local).await?;
     let client = http()?;
-    let xml = client.get(&location).send().await?.text().await?;
+    let xml = read_body(client.get(&location).send().await?).await?;
     let (service, url) = find_service(&xml, &location).context("the router offers no port mapping service")?;
-    if !url.starts_with(&format!("http://{gw}")) {
+    if !at_gateway(&url, gw) {
         bail!("the router's control URL points elsewhere");
     }
     let external = soap(&client, &url, &service, "GetExternalIPAddress", &[])
@@ -523,45 +620,44 @@ async fn upnp_map_all(gw: Ipv4Addr, local: Ipv4Addr, ports: &[(u8, u16)], lifeti
         external,
         ports: vec![],
         lifetime,
+        upnp: Some((service.clone(), url.clone())),
+        local,
+        pcp_port: PCP_PORT,
     };
     for &(proto, port) in ports {
-        let mut lease = lifetime;
         // The same port outside first; another one if a different device has it.
         let mut tries: Vec<u16> = vec![port];
         tries.extend((1..4).map(|i| port.wrapping_add(i * 1000)).filter(|p| *p > 1024));
         let mut last = String::new();
         let mut done = false;
         for ext in tries {
-            let args = |lease: u32| {
-                vec![
-                    ("NewRemoteHost", String::new()),
-                    ("NewExternalPort", ext.to_string()),
-                    ("NewProtocol", if proto == TCP { "TCP" } else { "UDP" }.to_string()),
-                    ("NewInternalPort", port.to_string()),
-                    ("NewInternalClient", local.to_string()),
-                    ("NewEnabled", "1".to_string()),
-                    ("NewPortMappingDescription", "meshvpn".to_string()),
-                    ("NewLeaseDuration", lease.to_string()),
-                ]
-            };
-            let mut res = soap(&client, &url, &service, "AddPortMapping", &args(lease)).await;
-            if let Err((725, _)) = res {
-                // OnlyPermanentLeasesSupported
-                lease = 0;
-                res = soap(&client, &url, &service, "AddPortMapping", &args(0)).await;
-            }
-            match res {
+            let args = vec![
+                ("NewRemoteHost", String::new()),
+                ("NewExternalPort", ext.to_string()),
+                ("NewProtocol", if proto == TCP { "TCP" } else { "UDP" }.to_string()),
+                ("NewInternalPort", port.to_string()),
+                ("NewInternalClient", local.to_string()),
+                ("NewEnabled", "1".to_string()),
+                ("NewPortMappingDescription", "meshvpn".to_string()),
+                // Always a lease: a router that wants permanent forwards (725) is not used.
+                ("NewLeaseDuration", lifetime.to_string()),
+            ];
+            match soap(&client, &url, &service, "AddPortMapping", &args).await {
                 Ok(_) => {
                     out.ports.push((proto, port, ext));
-                    out.lifetime = lease;
                     done = true;
                     break;
                 }
                 Err((718, d)) => last = upnp_error(718, &d),
-                Err((c, d)) => bail!(upnp_error(c, &d)),
+                Err((c, d)) => {
+                    // Don't leave half of it behind (TCP mapped, UDP refused).
+                    unmap(&out).await;
+                    bail!(upnp_error(c, &d))
+                }
             }
         }
         if !done {
+            unmap(&out).await;
             bail!(last);
         }
     }
@@ -655,11 +751,14 @@ mod tests {
             std::net::SocketAddr::V4(a) => a,
             _ => unreachable!(),
         };
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
+        let log = seen.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1100];
             loop {
                 let (n, from) = gw.recv_from(&mut buf).await.unwrap();
                 let d = &buf[..n];
+                log.lock().unwrap().push(d.to_vec());
                 let ans: Vec<u8> = match (d[0], d[1]) {
                     (2, _) => vec![0, 128 + d[1], 0, 1, 0, 0, 0, 0], // unsupported version
                     (0, 0) => vec![0, 128, 0, 0, 0, 0, 0, 9, 2, 243, 3, 46],
@@ -682,6 +781,15 @@ mod tests {
         assert_eq!(m.external, Ipv4Addr::new(2, 243, 3, 46));
         assert_eq!(m.ports, vec![(TCP, 7870, 7870), (UDP, 7870, 7870)]);
         assert!(m.public());
+        // Removing sends a NAT-PMP request with lifetime 0 for each port.
+        seen.lock().unwrap().clear();
+        unmap(&m).await;
+        let deletes: Vec<Vec<u8>> = seen.lock().unwrap().clone();
+        assert_eq!(deletes.len(), 2, "{deletes:?}");
+        for d in &deletes {
+            assert_eq!(d[0], 0);
+            assert_eq!(&d[8..12], &[0, 0, 0, 0], "lifetime 0 deletes");
+        }
     }
 
     #[test]
@@ -692,6 +800,7 @@ mod tests {
         let loc = ssdp_location(answer, gw).unwrap();
         assert_eq!(loc, "http://192.168.178.1:49000/igddesc.xml");
         assert!(ssdp_location(&answer.replace("192.168.178.1:", "10.0.0.9:"), gw).is_none());
+        assert!(ssdp_location(&answer.replace("192.168.178.1:49000", "192.168.178.1:x@10.0.0.9"), gw).is_none());
         let xml = r#"<?xml version="1.0"?><root><device><serviceList>
             <service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
               <controlURL>/igdupnp/control/Layer3Forwarding</controlURL></service>
@@ -714,5 +823,20 @@ mod tests {
         let ip =
             "<u:GetExternalIPAddressResponse xmlns:u=\"x\"><NewExternalIPAddress>2.243.3.46</NewExternalIPAddress>";
         assert_eq!(xml_text(ip, "NewExternalIPAddress"), Some("2.243.3.46"));
+        // The control URL must be the gateway itself, not a host that merely starts like it.
+        assert!(at_gateway("http://192.168.178.1:49000/igdupnp/control/WANIPConn1", gw));
+        assert!(at_gateway("http://192.168.178.1/ctl", gw));
+        for bad in [
+            "http://192.168.178.10:49000/ctl",
+            "http://192.168.178.1.evil.example/ctl",
+            "http://user@192.168.178.1/ctl",
+            "https://192.168.178.1/ctl",
+            "http://10.0.0.1/?http://192.168.178.1",
+            "http://192.168.178.1:x@10.0.0.1/ctl",
+        ] {
+            assert!(!at_gateway(bad, gw), "{bad}");
+        }
+        assert_eq!(clean("Action\x1b[31m not\nauthorized"), "Action [31m not authorized");
+        assert!(upnp_error(725, "OnlyPermanentLeasesSupported").contains("permanent"));
     }
 }

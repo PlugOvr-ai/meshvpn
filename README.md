@@ -153,11 +153,15 @@ this command. Note that a node on the internet can reach every service the other
 
 A network needs one node the others can reach. That can be a node at home, and its address may change every night:
 
-* **Port opened by itself.** Behind a home router, meshvpn opens its port (TCP and UDP 7870) on the router with
-  UPnP, PCP or NAT-PMP, and tells the others the router's public address. On a FRITZ!Box allow it once for that
-  device: *Internet > Freigaben > Portfreigaben > Gerät > Selbstständige Portfreigaben für dieses Gerät erlauben*.
-  `meshvpn status` shows `port mapping: TCP 7870 + UDP 7870 open on the router (UPnP, 192.168.178.1), public …`,
-  or why it failed. Off with `port_mapping = false`.
+* **Port opened by itself.** Behind a home router, a node that accepts connections (the default; not one joined
+  with `--no-listen`) opens its port (TCP and UDP 7870) on the router with UPnP, PCP or NAT-PMP, and tells the
+  others the router's public address. On a FRITZ!Box allow it once for that device: *Internet > Freigaben >
+  Portfreigaben > Gerät > Selbstständige Portfreigaben für dieses Gerät erlauben*. `meshvpn status` shows
+  `port mapping: TCP 7870 + UDP 7870 open on the router (UPnP, 192.168.178.1), public …`, or why it failed.
+  The forward is leased for an hour, renewed while meshvpn runs and removed when it stops; routers that only
+  allow permanent forwards are not used. The port is then reachable from the internet: only nodes with the
+  network key get past the handshake, but if that isn't wanted (servers in a company or university network,
+  notebooks on public Wi-Fi), switch it off with `port_mapping = false`, or join those with `--no-listen`.
 * **Found again after a new address (DHT rendezvous, off by default).** A node others can reach puts its current
   address into BitTorrent's public DHT. Nodes that lost it (a notebook outside the company network, the other home
   after the nightly reconnect) look it up there and connect again. No DynDNS or server needed. The entry is
@@ -177,8 +181,16 @@ A network needs one node the others can reach. That can be a node at home, and i
 
   `meshvpn status` then shows `rendezvous: DHT, published …` on the reachable node, and the others log
   `rendezvous: <node> is at …` when they found it.
-* **Its own public address.** STUN servers (Google's and Cloudflare's by default, `stun = [...]` in the config,
-  `stun = []` for none) tell a node its public address also while no other node is connected.
+
+  Keep in mind: whoever has the network key can read the entries, also nodes that were removed without a ban
+  (`meshvpn forget`) and clients whose access expired. They learn the current public address of every node that
+  publishes, until the key changes with the next ban. And because all members share the key the entries are
+  stored under, one member can block another's entry for a day (it can't change the address in it: that is
+  signed by the node itself).
+* **Its own public address.** While no other node tells it (none connected, or none reachable over UDP), a node
+  asks STUN servers for its public address, at most every 5 minutes: Google's and Cloudflare's by default,
+  `stun = [...]` in the config, `stun = []` for none. Each request tells the server's operator that this address
+  runs meshvpn.
 
 None of this goes through a configured proxy or SSH tunnel: those nodes keep using only them.
 
@@ -506,6 +518,7 @@ root, because the daemon reads and writes the files; fetched files belong to the
 | `sudo meshvpn rename <name>` | Give this node a new name. It becomes `<name>.mesh` on every node within seconds; its IP, SSH permissions and links stay. Names already taken are refused |
 | `sudo meshvpn exit offer` / `exit use <node>` / `exit off` | Internet through another node (exit nodes) |
 | `meshvpn networks` / `sudo meshvpn networks leave <name>` | The networks this machine is in ([several networks](#several-networks-on-one-machine)); `--net <name>` picks one for any command |
+| `sudo meshvpn leave` | Leave the network (or the one of `--net`): the other nodes forget this one, meshvpn stops for it and its configuration and keys are removed. If it was the machine's first network, the next one becomes the first (its names are then `<node>.mesh`). The only admin of a managed network makes another node admin first (`sudo meshvpn admin add <node>`); an admin that leaves hands the role to the others. `meshvpn status` lists the admins. |
 | `sudo meshvpn connect host[:port]` | Connect the network to a node it can reach but that can't reach it (alias: `add-peer`) |
 
 **Tab completion** (bash) comes with `meshvpn install`: commands and options, and the names and tags of the nodes as they
