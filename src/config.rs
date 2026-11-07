@@ -325,6 +325,10 @@ pub struct Config {
     /// in company networks may take the traffic for BitTorrent.
     #[serde(default)]
     pub dht: bool,
+    /// Hole punching over IPv6 towards nodes we have no link to (both sides behind firewalls,
+    /// no port forward): connection attempts to their IPv6 addresses, for up to a day.
+    #[serde(default = "default_true")]
+    pub punch: bool,
     /// Labels other nodes and agents can select this node by (`tag:gpu`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -399,6 +403,7 @@ impl Config {
             port_mapping: true,
             stun: default_stun(),
             dht: false,
+            punch: true,
             tags: vec![],
             socks_listen: default_socks_listen(),
             ssh_allow: vec![],

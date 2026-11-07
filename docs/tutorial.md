@@ -454,6 +454,7 @@ Logs: `journalctl -u meshvpn -f` (service), `/var/log/meshvpn.log` (background d
 | `udp = false` | no direct UDP paths (TCP and relays only) |
 | `port_mapping = false` | don't open the port on the home router (UPnP/PCP/NAT-PMP) |
 | `dht = true` | find nodes whose address changed through the BitTorrent DHT (off by default; see the README, "Without any server") |
+| `punch = false` | no hole punching over IPv6 towards nodes without a link |
 | `stun = []` | don't ask STUN servers for the public address (default: Google's and Cloudflare's) |
 | `mtu = 1200` | smaller packets (only needed for old versions on difficult networks) |
 | `manage_hosts = false` | don't write `<name>.mesh` into `/etc/hosts` |

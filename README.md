@@ -198,9 +198,12 @@ None of this goes through a configured proxy or SSH tunnel: those nodes keep usi
   forward, a mobile network) connect anyway if both have IPv6: each sends to the other's IPv6 address from its own
   port 7870 at the same time, so each one's firewall lets the other's packets in. That gives the direct UDP path
   and, by TCP simultaneous open, the link that carries records and control. The addresses come from the DHT
-  rendezvous (with `dht = true`; nodes put their IPv6 addresses into their entry, also those nobody can connect
-  to) or, while they still hold, from the node's last record. Tried for nodes heard of in the last day. The log
-  says `hole punching: TCP link to <node> via [...]`.
+  rendezvous (with `dht = true`; nodes put their *temporary* IPv6 addresses into their entry, which change every
+  day or so and don't identify the machine, also nodes nobody can connect to) or, while they still hold, from the
+  node's last record. Tried for nodes heard of in the last day: for a quarter of an hour all the time, then only in
+  the first minute of every five by the clock (so both sides try at the same moment). The log says
+  `hole punching: TCP link to <node> via [...]`. Off with `punch = false` (e.g. on a company notebook, where
+  repeated connection attempts to home addresses may stand out).
 
 What these features can't do: if the router has no public IPv4 address itself (DS-Lite, carrier-grade NAT, most
 mobile networks), no port can be opened on it. `meshvpn status` says so. Then IPv6 hole punching usually still

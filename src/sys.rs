@@ -487,6 +487,87 @@ pub fn global_ipv6() -> Vec<std::net::Ipv6Addr> {
     }
 }
 
+/// Temporary ("privacy", RFC 8981) global IPv6 addresses that are still preferred. They
+/// change every day or so, so they don't identify the machine over time: only these go into
+/// the rendezvous entry. None where the system has no such addresses (or isn't Linux/macOS).
+pub fn temporary_ipv6() -> Vec<std::net::Ipv6Addr> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/net/if_inet6")
+            .map(|t| temporary_from_proc(&t))
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("ifconfig")
+            .arg("-a")
+            .output()
+            .map(|o| temporary_from_ifconfig(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        vec![]
+    }
+}
+
+fn global_unicast6(ip: &std::net::Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xe000 == 0x2000
+}
+
+/// /proc/net/if_inet6: address, index, prefix length, scope, flags (IFA_F_*), interface.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn temporary_from_proc(text: &str) -> Vec<std::net::Ipv6Addr> {
+    const TEMPORARY: u32 = 0x01;
+    const UNUSABLE: u32 = 0x08 | 0x20 | 0x40; // DAD failed, deprecated, tentative
+    let mut out = vec![];
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 || f[0].len() != 32 {
+            continue;
+        }
+        let (Ok(bits), Ok(scope), Ok(flags)) = (
+            u128::from_str_radix(f[0], 16),
+            u32::from_str_radix(f[3], 16),
+            u32::from_str_radix(f[4], 16),
+        ) else {
+            continue;
+        };
+        let ip = std::net::Ipv6Addr::from(bits);
+        if scope == 0 && flags & TEMPORARY != 0 && flags & UNUSABLE == 0 && global_unicast6(&ip) && !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// macOS `ifconfig -a`: `inet6 2a02:...:97a prefixlen 64 autoconf temporary`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn temporary_from_ifconfig(text: &str) -> Vec<std::net::Ipv6Addr> {
+    let mut out = vec![];
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"inet6")
+            || !words.contains(&"temporary")
+            || words
+                .iter()
+                .any(|w| matches!(*w, "deprecated" | "tentative" | "detached" | "duplicated"))
+        {
+            continue;
+        }
+        let Some(addr) = words.get(1).map(|a| a.split('%').next().unwrap_or(a)) else {
+            continue;
+        };
+        if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>()
+            && global_unicast6(&ip)
+            && !out.contains(&ip)
+        {
+            out.push(ip);
+        }
+    }
+    out
+}
+
 /// The name of account `uid`.
 #[cfg(unix)]
 pub fn user_name_of(uid: u32) -> Option<String> {
@@ -499,3 +580,39 @@ pub fn user_name_of(uid: u32) -> Option<String> {
 /// Variables the daemon took from root's proxy.env (proxy credentials): not passed on to the
 /// sessions of the built-in SSH server.
 pub static FROM_PROXY_FILE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+mod temp6_tests {
+    use super::*;
+
+    #[test]
+    fn temporary_ipv6_addresses() {
+        let proc = "fe80000000000000f86edffffe202598 2fd 40 20 80 vethffb442f\n\
+                    2a02310038427b0097ed4db8d8a1dd30 02 40 00 00   enp5s0\n\
+                    2a02310038427b00cbda5758194181c9 02 40 00 01   enp5s0\n\
+                    2a02310038427b001111222233334444 02 40 00 21   enp5s0\n\
+                    fddbb39163a90000793232e2a023b220 02 40 00 01   enp5s0\n";
+        assert_eq!(
+            temporary_from_proc(proc),
+            vec![
+                "2a02:3100:3842:7b00:cbda:5758:1941:81c9"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+            ],
+            "temporary and global only: not the stable one, a deprecated one or a unique local one"
+        );
+        let ifconfig = "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+            \tinet6 fe80::1c68:d4c0:7058:55c8%en0 prefixlen 64 secured scopeid 0xe\n\
+            \tinet6 2a02:3035:b1c:74a9:1c68:d4c0:7058:55c8 prefixlen 64 autoconf secured\n\
+            \tinet6 2a02:3035:b1c:74a9:f4bf:5079:be21:97a prefixlen 64 autoconf temporary\n\
+            \tinet6 2a02:3035:b1c:74a9::99 prefixlen 64 autoconf temporary deprecated\n";
+        assert_eq!(
+            temporary_from_ifconfig(ifconfig),
+            vec![
+                "2a02:3035:b1c:74a9:f4bf:5079:be21:97a"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+            ]
+        );
+    }
+}

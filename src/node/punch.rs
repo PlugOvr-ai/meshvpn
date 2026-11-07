@@ -10,9 +10,12 @@
 //!   simultaneous open makes one connection out of them - the link for records and control.
 //!   Both ends get it from connect(), so the Noise roles go by node id (the lower one starts).
 //!
-//! The addresses come from the rendezvous (each node puts its IPv6 addresses into its DHT
-//! entry) and, while they still hold, from the node's saved record. Only for nodes heard of in
-//! the last day, so nobody gets packets for long after a node is gone.
+//! The addresses come from the rendezvous (each node puts its temporary IPv6 addresses into its
+//! DHT entry: they change daily, so they don't identify the machine) and, while they still
+//! hold, from the node's saved record. Only for nodes heard of in the last day, so nobody gets
+//! packets for long after a node is gone; after the first quarter of an hour without success
+//! only in the first minute of every five (by the clock, so both sides try at the same time).
+//! Off with `punch = false`.
 
 use super::*;
 
@@ -26,6 +29,19 @@ const RECORD_FRESH_MS: u64 = 86_400_000;
 const MAX_RUNS: usize = 8;
 /// Addresses from the rendezvous count this long.
 pub(super) const PUNCH_HINT_TTL: Duration = Duration::from_secs(2 * 3600);
+/// Tried all the time for this long, then only in the first minute of every five.
+const EAGER: Duration = Duration::from_secs(15 * 60);
+const SLOT_SECS: u64 = 300;
+const WINDOW_SECS: u64 = 60;
+
+/// Is now a time to try? `tried_for`: how long we have been trying (None: not yet).
+fn in_window(tried_for: Option<Duration>, unix_secs: u64) -> bool {
+    tried_for.is_none_or(|d| d < EAGER) || unix_secs % SLOT_SECS < WINDOW_SECS
+}
+
+fn unix_secs() -> u64 {
+    now_ms() / 1000
+}
 
 fn global(ip: &Ipv6Addr) -> bool {
     ip.segments()[0] & 0xe000 == 0x2000
@@ -38,16 +54,17 @@ impl Node {
     }
 
     pub(super) fn punch_enabled(&self) -> bool {
-        !self.cfg.no_outbound && self.cfg.effective_socks().is_none()
+        self.cfg.punch && !self.cfg.no_outbound && self.cfg.effective_socks().is_none()
     }
 
-    /// Our IPv6 addresses for the rendezvous entry.
+    /// Our IPv6 addresses for the rendezvous entry: the temporary ones only (the stable address
+    /// would let anyone with the network key follow the machine around).
     pub(super) fn punch_candidates(&self) -> Vec<String> {
         if !self.punch_enabled() {
             return vec![];
         }
         let port = self.punch_port();
-        crate::sys::global_ipv6()
+        crate::sys::temporary_ipv6()
             .into_iter()
             .take(4)
             .map(|ip| SocketAddr::new(IpAddr::V6(ip), port).to_string())
@@ -58,6 +75,9 @@ impl Node {
     /// record (if heard of lately).
     pub(super) fn punch_targets(&self, st: &State, id: &NodeId) -> Vec<SocketAddr> {
         if *id == self.ident.id || st.banned.contains_key(id) || !self.punch_enabled() {
+            return vec![];
+        }
+        if !in_window(st.punch_since.get(id).map(|t| t.elapsed()), unix_secs()) {
             return vec![];
         }
         let mut out: Vec<SocketAddr> = st
@@ -96,15 +116,23 @@ impl Node {
                 continue;
             }
             let due: Vec<(NodeId, Vec<SocketAddr>)> = {
-                let st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap();
+                // Since when we try each node: reset once there is a link.
+                let linked: Vec<NodeId> = st.links.keys().copied().collect();
+                st.punch_since.retain(|id, _| !linked.contains(id));
                 let busy = running.lock().unwrap();
-                st.records
+                let due: Vec<(NodeId, Vec<SocketAddr>)> = st
+                    .records
                     .keys()
                     .filter(|id| !st.links.contains_key(*id) && !busy.contains(*id))
                     .map(|id| (*id, self.punch_targets(&st, id)))
                     .filter(|(_, t)| !t.is_empty())
                     .take(MAX_RUNS.saturating_sub(busy.len()))
-                    .collect()
+                    .collect();
+                for (id, _) in &due {
+                    st.punch_since.entry(*id).or_insert_with(Instant::now);
+                }
+                due
             };
             for (id, targets) in due {
                 running.lock().unwrap().insert(id);
@@ -188,6 +216,20 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tries_eagerly_then_in_shared_windows() {
+        let min = |m: u64| Some(Duration::from_secs(m * 60));
+        let slot = 300 * 3334; // the start of a five-minute slot (unix seconds)
+        assert!(in_window(None, slot + 123), "not tried yet: now");
+        assert!(in_window(min(14), slot + 123), "the first quarter of an hour: always");
+        // Then by the clock: the first minute of every five, the same on both sides.
+        assert!(in_window(min(20), slot));
+        assert!(in_window(min(20), slot + 59));
+        assert!(!in_window(min(20), slot + 60));
+        assert!(!in_window(min(20), slot + 299));
+        assert!(in_window(min(20), slot + 300));
+    }
 
     #[test]
     fn only_global_ipv6() {
