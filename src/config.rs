@@ -329,6 +329,9 @@ pub struct Config {
     /// no port forward): connection attempts to their IPv6 addresses, for up to a day.
     #[serde(default = "default_true")]
     pub punch: bool,
+    /// From the invite: where to meet the inviting node (until the first link).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<JoinHint>,
     /// Labels other nodes and agents can select this node by (`tag:gpu`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -404,6 +407,7 @@ impl Config {
             stun: default_stun(),
             dht: false,
             punch: true,
+            join: None,
             tags: vec![],
             socks_listen: default_socks_listen(),
             ssh_allow: vec![],
@@ -570,6 +574,9 @@ pub struct SavedState {
     /// Admin-signed documents for extensions.
     #[serde(default)]
     pub docs: Vec<crate::proto::SignedDoc>,
+    /// Open invites that may be joined through hole punching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub join_slots: Vec<JoinSlot>,
 }
 
 impl SavedState {
@@ -602,6 +609,28 @@ pub struct Invite {
     pub ticket: Option<crate::proto::SignedDoc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admins: Vec<crate::keys::NodeId>,
+    /// Where to meet the inviting node if neither can reach the other (hole punching).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<JoinHint>,
+}
+
+/// A join through hole punching: the new node puts its IPv6 addresses into the DHT at a place
+/// derived from `slot` (a secret of the invite) and tries the inviting node's addresses; the
+/// inviting node looks there while the invite is open and tries back.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct JoinHint {
+    pub slot: String,
+    pub node: crate::keys::NodeId,
+    pub v6: Vec<String>,
+    pub until: u64,
+}
+
+/// An open invite's place, kept by the inviting node.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct JoinSlot {
+    pub slot: String,
+    pub from: u64,
+    pub until: u64,
 }
 
 impl Invite {
@@ -654,6 +683,7 @@ mod tests {
             v: 3,
             ticket: None,
             admins: vec![],
+            join: None,
         };
         let back = Invite::decode(&format!("  {}\n", inv.encode())).unwrap();
         assert_eq!(back.key, inv.key);

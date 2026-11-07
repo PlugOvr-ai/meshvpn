@@ -997,6 +997,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             cfg.key_version = inv.v;
             cfg.trusted_admins = inv.admins;
             cfg.ticket = inv.ticket;
+            cfg.join = inv.join;
             cfg.save(&dir)?;
             println!("Joined network \"{}\".\n", cfg.network);
             if let (Some(n), Some(first)) = (networks::name(&dir), first.filter(|_| !net_given)) {
@@ -2559,6 +2560,18 @@ fn make_invite(
     boot.truncate(12);
 
     let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms, client)?;
+    // Where to meet if neither side can reach the other (only with the DHT on, see node/join.rs).
+    let join = if cfg.dht && control::is_running(dir) {
+        let req = control::Request::RegisterJoin {
+            until: now_ms() + valid_ms,
+        };
+        match tokio::runtime::Runtime::new()?.block_on(control::request(dir, &req)) {
+            Ok(control::Response::Message { text }) => serde_json::from_str(&text).ok(),
+            _ => None,
+        }
+    } else {
+        None
+    };
     Ok(Invite {
         network: cfg.network.clone(),
         key: cfg.network_key.clone(),
@@ -2567,6 +2580,7 @@ fn make_invite(
         v: cfg.key_version,
         ticket,
         admins,
+        join,
     })
 }
 

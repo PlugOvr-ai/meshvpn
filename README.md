@@ -205,6 +205,14 @@ None of this goes through a configured proxy or SSH tunnel: those nodes keep usi
   `hole punching: TCP link to <node> via [...]`. Off with `punch = false` (e.g. on a company notebook, where
   repeated connection attempts to home addresses may stand out).
 
+* **Joining that way too.** An invite made on a node with `dht = true` carries a join hint: a secret slot, the
+  node's id and its IPv6 addresses. A new node that can't reach the inviting node puts its own IPv6 addresses into
+  the DHT at the slot (sealed and signed like a rendezvous entry; it uses the DHT for this one meeting whatever its
+  own setting) and tries the inviting node's addresses; the inviting node looks there while the invite is open
+  (every 30 seconds for the first half hour, then every two minutes) and tries back. The join then runs over the
+  punched link as usual. The new node logs `joining: waiting for the inviting node at ...`, the inviting one
+  `joining: a new node (...) waits at ...`.
+
 What these features can't do: if the router has no public IPv4 address itself (DS-Lite, carrier-grade NAT, most
 mobile networks), no port can be opened on it. `meshvpn status` says so. Then IPv6 hole punching usually still
 connects; two nodes that both have only IPv4 behind carrier-grade NAT need a third node with a public address,

@@ -70,7 +70,7 @@ fn day(now_ms: u64) -> u64 {
     now_ms / 86_400_000
 }
 
-fn derive(context: &str, parts: &[&[u8]]) -> [u8; 32] {
+pub(super) fn derive(context: &str, parts: &[&[u8]]) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key(context);
     for p in parts {
         h.update(&(p.len() as u32).to_be_bytes());
@@ -91,12 +91,12 @@ fn salt(net_key: &[u8; 32], day: u64, id: &NodeId) -> [u8; 20] {
         .unwrap()
 }
 
-fn cipher(net_key: &[u8; 32]) -> XChaCha20Poly1305 {
+pub(super) fn cipher(net_key: &[u8; 32]) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new(&derive("meshvpn rendezvous v1 seal", &[net_key]).into())
 }
 
 /// The DHT value for our endpoints: nonce | sealed(signed entry). None if it doesn't fit.
-fn seal(
+pub(super) fn seal(
     net_key: &[u8; 32],
     ident: &Identity,
     net: &str,
@@ -125,8 +125,8 @@ fn seal(
     }
 }
 
-/// What a DHT value says, if it is `id`'s entry for network `net` and recent.
-fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -> Option<Found> {
+/// A DHT value's entry, if it is for network `net`, signed by the node it names and recent.
+pub(super) fn open_entry(net_key: &[u8; 32], value: &[u8], net: &str, now_ms: u64) -> Option<(NodeId, Found)> {
     if value.len() < 24 + 16 {
         return None;
     }
@@ -135,6 +135,16 @@ fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -
     let doc = cipher(net_key).decrypt(&XNonce::from(nonce), sealed).ok()?;
     let doc: SignedDoc = serde_json::from_slice(&doc).ok()?;
     let entry: Entry = doc.open(|e: &Entry| e.id).ok()?;
+    let id = entry.id;
+    open_checked(entry, &id, net, now_ms).map(|f| (id, f))
+}
+
+/// What a DHT value says, if it is `id`'s entry for network `net` and recent.
+fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -> Option<Found> {
+    open_entry(net_key, value, net, now_ms).and_then(|(by, f)| (by == *id).then_some(f))
+}
+
+fn open_checked(entry: Entry, id: &NodeId, net: &str, now_ms: u64) -> Option<Found> {
     if entry.id != *id || entry.net != net {
         return None;
     }
@@ -202,15 +212,15 @@ pub(super) struct RendezvousState {
 }
 
 impl Node {
-    fn rendezvous_enabled(&self) -> bool {
+    pub(super) fn rendezvous_enabled(&self) -> bool {
         self.cfg.dht && !self.cfg.no_outbound && self.cfg.effective_socks().is_none()
     }
 
-    fn current_key(st: &State) -> Option<[u8; 32]> {
+    pub(super) fn current_key(st: &State) -> Option<[u8; 32]> {
         st.keys.get(&st.key_version).copied()
     }
 
-    async fn dht(&self) -> Option<AsyncDht> {
+    pub(super) async fn dht(&self) -> Option<AsyncDht> {
         if let Some(d) = self.dht.lock().unwrap().clone() {
             return Some(d);
         }

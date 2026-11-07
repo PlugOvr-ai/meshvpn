@@ -25,6 +25,7 @@ mod admin;
 mod exit;
 mod ext;
 mod gpu;
+mod join;
 mod punch;
 mod rendezvous;
 mod replay;
@@ -256,6 +257,8 @@ struct State {
     punch_hints: HashMap<NodeId, (Vec<SocketAddr>, Instant, u64)>,
     /// Since when we try to punch towards a node (no link yet).
     punch_since: HashMap<NodeId, Instant>,
+    /// Open invites that may be joined through hole punching (see `join`).
+    join_slots: Vec<crate::config::JoinSlot>,
     rendezvous: rendezvous::RendezvousState,
 }
 
@@ -550,6 +553,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         st.exit_via = node.cfg.exit_node.as_deref().and_then(|h| NodeId::from_hex(h).ok());
         st.trusted_admins = node.cfg.trusted_admins.clone();
         st.leases = saved.leases.clone();
+        st.join_slots = saved.join_slots.clone();
         st.my_claim = node.own_claim();
         if let Some(r) = saved.roster.clone() {
             node.apply_roster(&mut st, r);
@@ -678,6 +682,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     tokio::spawn(node.clone().portmap_loop());
     tokio::spawn(node.clone().rendezvous_loop());
     tokio::spawn(node.clone().punch_loop());
+    tokio::spawn(node.clone().join_loop());
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
     node.exit_start();
     node.ext_run();
@@ -2880,6 +2885,7 @@ impl Node {
             claims: st.claims.values().map(|a| a.msg.clone()).collect(),
             leases: st.leases.clone(),
             docs: st.docs.values().map(|(_, s)| s.clone()).collect(),
+            join_slots: st.join_slots.clone(),
         };
         drop(st);
         if let Err(e) = saved.save(&self.dir) {

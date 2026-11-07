@@ -677,6 +677,40 @@ def test_punch_ipv6(lab):
 
 
 @test
+def test_join_punch(lab):
+    """A new node joins although neither it nor the inviting node can be reached: they meet
+    through the DHT (the invite's join slot) and hole punching over IPv6."""
+    if not os.environ.get("MESHVPN_E2E_INTERNET"):
+        print("  (skipped: uses the public BitTorrent DHT - set MESHVPN_E2E_INTERNET=1)")
+        return
+    # Separate IPv4 networks (Docker keeps them apart; each has internet for the DHT) and one
+    # IPv6 network behind firewalls that only let answers in.
+    na, nb = lab.network("a4"), lab.network("b4")
+    v6 = lab.network("v6", ipv6_only=True, subnet="2001:db8:79::/64")
+    a, b = lab.node("a", [na, v6]), lab.node("b", [nb, v6])
+    for n in (a, b):
+        n.sh("""
+            ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+            ip6tables -A INPUT -i lo -j ACCEPT
+            ip6tables -A INPUT -j DROP
+        """)
+    a.mv("init --name a")
+    a.sh("sed -i 's/^dht = false$/dht = true/' /etc/meshvpn/config.toml")
+    a.up()
+    inv = invite(a)
+    body = inv.strip().removeprefix("mesh1-")
+    data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    check(data.get("join") and data["join"]["v6"], f"the invite carries a join hint: {data.get('join')}")
+    b.mv(f"join {inv} --name b")
+    b.up()
+    wait(lambda: a.online("b") and b.online("a"), "b joined", timeout=300, interval=3)
+    check("joining: waiting for the inviting node" in b.log(), "b waited at the join slot")
+    check("hole punching: TCP link" in a.log() + b.log(), "the link came from hole punching")
+    check(ping(b, "a.mesh", 3), "traffic between them")
+
+
+@test
 def test_userspace(lab):
     """A container without NET_ADMIN/TUN: userspace mode, incoming TCP to local services, SOCKS and ssh out."""
     net = lab.network("net")

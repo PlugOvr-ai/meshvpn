@@ -150,7 +150,7 @@ impl Node {
     }
 
     /// Connect attempts towards `id` from our port, until a link is up or the run is over.
-    async fn punch_run(self: &Arc<Self>, id: NodeId, targets: Vec<SocketAddr>) {
+    pub(super) async fn punch_run(self: &Arc<Self>, id: NodeId, targets: Vec<SocketAddr>) {
         let started = Instant::now();
         let port = self.punch_port();
         while started.elapsed() < RUN && !self.linked(&id) && !self.leaving.load(Ordering::Relaxed) {

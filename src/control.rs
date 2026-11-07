@@ -54,6 +54,11 @@ pub enum Request {
     },
     /// `meshvpn leave`: tell the network that this node leaves.
     Leave,
+    /// `meshvpn invite`: a place where the new node and this one meet if neither can reach the
+    /// other (hole punching). Answers the join hint for the invite, or an error if not possible.
+    RegisterJoin {
+        until: u64,
+    },
     Rename {
         name: String,
     },
@@ -465,6 +470,14 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
         },
         Ok(Request::Rename { name }) => match node.rename(&name) {
             Ok(text) => Response::Message { text },
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
+        Ok(Request::RegisterJoin { until }) => match node.register_join(until) {
+            Ok(hint) => Response::Message {
+                text: serde_json::to_string(&hint).unwrap_or_default(),
+            },
             Err(e) => Response::Error {
                 message: format!("{e:#}"),
             },
