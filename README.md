@@ -194,9 +194,18 @@ A network needs one node the others can reach. That can be a node at home, and i
 
 None of this goes through a configured proxy or SSH tunnel: those nodes keep using only them.
 
+* **Hole punching over IPv6.** Two nodes that both can't accept connections (a home router without a port
+  forward, a mobile network) connect anyway if both have IPv6: each sends to the other's IPv6 address from its own
+  port 7870 at the same time, so each one's firewall lets the other's packets in. That gives the direct UDP path
+  and, by TCP simultaneous open, the link that carries records and control. The addresses come from the DHT
+  rendezvous (with `dht = true`; nodes put their IPv6 addresses into their entry, also those nobody can connect
+  to) or, while they still hold, from the node's last record. Tried for nodes heard of in the last day. The log
+  says `hole punching: TCP link to <node> via [...]`.
+
 What these features can't do: if the router has no public IPv4 address itself (DS-Lite, carrier-grade NAT, most
-mobile networks), no port can be opened on it. `meshvpn status` says so. Then IPv6 often still gives direct paths;
-otherwise one node with a public address is needed, e.g. a small VPS or a free cloud VM.
+mobile networks), no port can be opened on it. `meshvpn status` says so. Then IPv6 hole punching usually still
+connects; two nodes that both have only IPv4 behind carrier-grade NAT need a third node with a public address,
+e.g. a small VPS or a free cloud VM.
 
 ## Internet through another node (exit nodes)
 
@@ -561,7 +570,8 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 | Transport | TCP links (the only thing an SSH tunnel or proxy can carry) for control traffic, and **direct UDP paths** for data wherever possible. Nodes publish their address candidates (LAN, public address as other nodes see it) and keep sending authenticated probes to each other, which opens a path through both NATs (hole punching). Data then goes directly over UDP; if a path stops answering it falls back to TCP or a relay within seconds. IPv6 addresses are candidates too: without NAT on the way, probes from both sides get through stateful firewalls, also where IPv4 hole punching can't (NATs that change the port per destination, typical for mobile networks - `meshvpn status` and `doctor` say which kind of NAT a node is behind). |
 | Discovery | Nodes sign a record (name, endpoints, neighbors, sequence number) and gossip all records they know. A new link gets the full table; changes are flooded. The state is saved to disk, so the mesh survives losing the bootstrap node. |
 | Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers or STUN servers, the port opened on the home router with UPnP/PCP/NAT-PMP) or the SSH tunnel's public port. |
-| Rendezvous | Nodes with endpoints put them into BitTorrent's Mainline DHT (BEP 44 mutable item, every 30 minutes and when they change): under a key and salt derived from the network key, the node id and the day; XChaCha20-Poly1305 with a key from the network key; signed by the node and dated (older than 3 hours is ignored). Nodes look up those they lost (every 2 minutes while they have no link, 10 minutes otherwise, hourly for nodes gone for a day) and dial the addresses found first. The DHT client never answers or stores anything for others. |
+| Hole punching (IPv6) | Towards nodes without a link: UDP probes and TCP connects from the fixed port (`listen` port) to their global IPv6 addresses, from the rendezvous or the node's record (heard of within a day); stateful firewalls let the crossing packets in. Both ends get the TCP connection from connect() (simultaneous open), so the lower node id starts the Noise handshake. |
+| Rendezvous | Nodes with endpoints (and every node with global IPv6 addresses, for hole punching) put them into BitTorrent's Mainline DHT (BEP 44 mutable item, every 30 minutes and when they change): under a key and salt derived from the network key, the node id and the day; XChaCha20-Poly1305 with a key from the network key; signed by the node and dated (older than 3 hours is ignored). Nodes look up those they lost (every 2 minutes while they have no link, 10 minutes otherwise, hourly for nodes gone for a day) and dial the addresses found first. The DHT client never answers or stores anything for others. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
 | Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key bound to the network id). Relays can't read or forge traffic, and the inner source IP must match the sender. |
 | Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable); `<name>.<network>.mesh` for a further network of the machine. |

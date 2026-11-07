@@ -25,6 +25,7 @@ mod admin;
 mod exit;
 mod ext;
 mod gpu;
+mod punch;
 mod rendezvous;
 mod replay;
 mod udp;
@@ -250,6 +251,8 @@ struct State {
     port_mapping_note: Option<String>,
     /// Addresses of nodes found through the rendezvous (newer than their records).
     dht_hints: HashMap<NodeId, (Vec<String>, Instant)>,
+    /// IPv6 addresses of nodes for hole punching, found through the rendezvous.
+    punch_hints: HashMap<NodeId, (Vec<SocketAddr>, Instant)>,
     rendezvous: rendezvous::RendezvousState,
 }
 
@@ -671,6 +674,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     }
     tokio::spawn(node.clone().portmap_loop());
     tokio::spawn(node.clone().rendezvous_loop());
+    tokio::spawn(node.clone().punch_loop());
     tokio::spawn(crate::control::serve(node.clone(), crate::control::socket_path(&dir)));
     node.exit_start();
     node.ext_run();

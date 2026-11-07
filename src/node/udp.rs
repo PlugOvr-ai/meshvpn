@@ -285,11 +285,19 @@ impl Node {
         let mut st = self.state.lock().unwrap();
         let now = Instant::now();
         st.udp_paths.retain(|_, p| p.last_rx.elapsed() < PATH_TIMEOUT);
+        // Online nodes at all their candidates; offline ones at their IPv6 addresses (hole
+        // punching: they may be doing the same towards us, see `punch`).
         let peers: Vec<(NodeId, Vec<SocketAddr>)> = st
             .records
             .values()
-            .filter(|r| self.is_online(&st, &r.info.id))
-            .map(|r| (r.info.id, Self::peer_candidates(&r.info)))
+            .map(|r| {
+                let id = r.info.id;
+                if self.is_online(&st, &id) {
+                    (id, Self::peer_candidates(&r.info))
+                } else {
+                    (id, self.punch_targets(&st, &id))
+                }
+            })
             .filter(|(_, c)| !c.is_empty())
             .collect();
         for (peer, candidates) in peers {

@@ -47,7 +47,18 @@ struct Entry {
     id: NodeId,
     net: String,
     at: u64,
+    /// Where the node accepts connections.
     ep: Vec<String>,
+    /// Its IPv6 addresses for hole punching (also of nodes nobody can connect to).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    v6: Vec<String>,
+}
+
+/// What an entry says.
+#[derive(Debug, PartialEq, Default, Clone)]
+pub(super) struct Found {
+    pub ep: Vec<String>,
+    pub v6: Vec<SocketAddr>,
 }
 
 fn day(now_ms: u64) -> u64 {
@@ -80,14 +91,23 @@ fn cipher(net_key: &[u8; 32]) -> XChaCha20Poly1305 {
 }
 
 /// The DHT value for our endpoints: nonce | sealed(signed entry). None if it doesn't fit.
-fn seal(net_key: &[u8; 32], ident: &Identity, net: &str, at: u64, endpoints: &[String]) -> Option<Vec<u8>> {
+fn seal(
+    net_key: &[u8; 32],
+    ident: &Identity,
+    net: &str,
+    at: u64,
+    endpoints: &[String],
+    v6: &[String],
+) -> Option<Vec<u8>> {
     let mut ep: Vec<String> = endpoints.iter().take(MAX_ENDPOINTS).cloned().collect();
+    let v6: Vec<String> = v6.iter().take(4).cloned().collect();
     loop {
         let entry = Entry {
             id: ident.id,
             net: net.to_string(),
             at,
             ep: ep.clone(),
+            v6: v6.clone(),
         };
         let doc = serde_json::to_vec(&SignedDoc::sign(&entry, ident)).ok()?;
         let nonce: [u8; 24] = crate::keys::random32()[..24].try_into().unwrap();
@@ -100,8 +120,8 @@ fn seal(net_key: &[u8; 32], ident: &Identity, net: &str, at: u64, endpoints: &[S
     }
 }
 
-/// The endpoints in a DHT value, if it is `id`'s entry for network `net` and recent.
-fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -> Option<Vec<String>> {
+/// What a DHT value says, if it is `id`'s entry for network `net` and recent.
+fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -> Option<Found> {
     if value.len() < 24 + 16 {
         return None;
     }
@@ -118,7 +138,14 @@ fn open(net_key: &[u8; 32], value: &[u8], id: &NodeId, net: &str, now_ms: u64) -
     }
     let mut ep: Vec<String> = entry.ep.into_iter().filter(|e| dialable(e)).collect();
     ep.truncate(MAX_ENDPOINTS);
-    (!ep.is_empty()).then_some(ep)
+    let mut v6: Vec<SocketAddr> = entry
+        .v6
+        .iter()
+        .filter_map(|a| a.parse::<SocketAddr>().ok())
+        .filter(|a| matches!(a.ip(), IpAddr::V6(ip) if ip.segments()[0] & 0xe000 == 0x2000))
+        .collect();
+    v6.truncate(4);
+    (!ep.is_empty() || !v6.is_empty()).then_some(Found { ep, v6 })
 }
 
 /// Never answer other people's DHT queries: this node only asks and stores its own entries.
@@ -213,13 +240,23 @@ impl Node {
         let (publish, lookups) = {
             let mut st = self.state.lock().unwrap();
             let Some(key) = Self::current_key(&st) else { return };
-            let publish = self.cfg.listen.is_some()
-                && !st.my_endpoints.is_empty()
+            // Endpoints if others can connect to us; IPv6 addresses for hole punching in any case.
+            let endpoints = if self.cfg.listen.is_some() {
+                st.my_endpoints.clone()
+            } else {
+                vec![]
+            };
+            let v6 = self.punch_candidates();
+            let mut all = endpoints.clone();
+            all.extend(v6.iter().cloned());
+            let publish = !all.is_empty()
                 && !st.rendezvous.publishing
-                && st.rendezvous.published.as_ref().is_none_or(|(ep, at, d)| {
-                    *ep != st.my_endpoints || at.elapsed() >= PUBLISH_EVERY || *d != day(now)
-                });
-            let publish = publish.then(|| (key, st.my_endpoints.clone()));
+                && st
+                    .rendezvous
+                    .published
+                    .as_ref()
+                    .is_none_or(|(ep, at, d)| *ep != all || at.elapsed() >= PUBLISH_EVERY || *d != day(now));
+            let publish = publish.then_some((key, endpoints, v6, all));
             if publish.is_some() {
                 st.rendezvous.publishing = true;
             }
@@ -262,11 +299,11 @@ impl Node {
             st.rendezvous.running = st.rendezvous.running.saturating_sub(lookups.len());
             return;
         };
-        if let Some((key, endpoints)) = publish {
+        if let Some((key, endpoints, v6, all)) = publish {
             let node = self.clone();
             let dht = dht.clone();
             tokio::spawn(async move {
-                let ok = node.rendezvous_publish(&dht, &key, &endpoints, now).await;
+                let ok = node.rendezvous_publish(&dht, &key, &endpoints, &v6, now).await;
                 let mut st = node.state.lock().unwrap();
                 st.rendezvous.publishing = false;
                 match ok {
@@ -277,7 +314,7 @@ impl Node {
                         } else {
                             None
                         };
-                        st.rendezvous.published = Some((endpoints, at.unwrap_or_else(Instant::now), day(now)));
+                        st.rendezvous.published = Some((all, at.unwrap_or_else(Instant::now), day(now)));
                         st.rendezvous.error = None;
                     }
                     Err(e) => {
@@ -294,13 +331,21 @@ impl Node {
                 let found = node.rendezvous_lookup(&dht, &key, &id).await;
                 let mut st = node.state.lock().unwrap();
                 st.rendezvous.running = st.rendezvous.running.saturating_sub(1);
-                if let Some(eps) = found {
+                if let Some(found) = found {
                     let name = st.records.get(&id).map(|r| r.info.name.clone()).unwrap_or_default();
-                    let known = st.dht_hints.get(&id).is_some_and(|(e, _)| *e == eps);
+                    let known = st.dht_hints.get(&id).is_some_and(|(e, _)| *e == found.ep)
+                        && st.punch_hints.get(&id).is_some_and(|(v, _)| *v == found.v6);
                     if !known {
-                        info!("rendezvous: {name} ({id}) is at {}", eps.join(", "));
+                        let mut all = found.ep.clone();
+                        all.extend(found.v6.iter().map(|a| a.to_string()));
+                        info!("rendezvous: {name} ({id}) is at {}", all.join(", "));
                     }
-                    st.dht_hints.insert(id, (eps, Instant::now()));
+                    if !found.ep.is_empty() {
+                        st.dht_hints.insert(id, (found.ep, Instant::now()));
+                    }
+                    if !found.v6.is_empty() {
+                        st.punch_hints.insert(id, (found.v6, Instant::now()));
+                    }
                     // Try the new address now, not at the next backoff step.
                     st.backoff.remove(&id.hex());
                     drop(st);
@@ -311,22 +356,30 @@ impl Node {
     }
 
     /// Puts our entry; how many DHT nodes stored it.
-    async fn rendezvous_publish(&self, dht: &AsyncDht, key: &[u8; 32], endpoints: &[String], now: u64) -> Result<u32> {
-        let value = seal(key, &self.ident, &self.net, now, endpoints).context("entry too large")?;
+    async fn rendezvous_publish(
+        &self,
+        dht: &AsyncDht,
+        key: &[u8; 32],
+        endpoints: &[String],
+        v6: &[String],
+        now: u64,
+    ) -> Result<u32> {
+        let value = seal(key, &self.ident, &self.net, now, endpoints, v6).context("entry too large")?;
         let d = day(now);
         let salt = salt(key, d, &self.ident.id);
         let item = MutableItem::new(signing_key(key, d), &value, (now / 1000) as i64, Some(&salt));
         let out = dht.put_mutable(item, None).await.map_err(|e| anyhow!("{e}"))?;
         debug!(
-            "rendezvous: published {} (stored at {} nodes)",
+            "rendezvous: published {} {} (stored at {} nodes)",
             endpoints.join(", "),
+            v6.join(", "),
             out.stored_at
         );
         Ok(out.stored_at)
     }
 
     /// `id`'s endpoints from today's entry, or yesterday's (just after midnight).
-    async fn rendezvous_lookup(&self, dht: &AsyncDht, key: &[u8; 32], id: &NodeId) -> Option<Vec<String>> {
+    async fn rendezvous_lookup(&self, dht: &AsyncDht, key: &[u8; 32], id: &NodeId) -> Option<Found> {
         let now = now_ms();
         for d in [day(now), day(now).saturating_sub(1)] {
             let public = signing_key(key, d).verifying_key().to_bytes();
@@ -386,12 +439,15 @@ mod tests {
         let key = [9u8; 32];
         let now = 1_800_000_000_000;
         let eps = vec!["2.243.3.46:7870".to_string(), "127.0.0.1:7870".to_string()];
-        let v = seal(&key, &me, "net1", now, &eps).unwrap();
+        let v = seal(&key, &me, "net1", now, &eps, &[]).unwrap();
         assert!(v.len() <= MAX_VALUE);
         // Loopback is never dialed.
         assert_eq!(
             open(&key, &v, &me.id, "net1", now),
-            Some(vec!["2.243.3.46:7870".to_string()])
+            Some(Found {
+                ep: vec!["2.243.3.46:7870".to_string()],
+                v6: vec![]
+            })
         );
         assert_eq!(open(&[8u8; 32], &v, &me.id, "net1", now), None, "another network's key");
         assert_eq!(
@@ -412,6 +468,30 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_addresses_for_hole_punching() {
+        let me = ident();
+        let key = [9u8; 32];
+        let now = 1_800_000_000_000;
+        // A node nobody can connect to: no endpoints, only its IPv6 addresses.
+        let v6 = vec![
+            "[2a02:3035:b1c:74a9::5]:7870".to_string(),
+            "[fd0c::1]:7870".to_string(),
+            "[fe80::1]:7870".to_string(),
+        ];
+        let v = seal(&key, &me, "net1", now, &[], &v6).unwrap();
+        let found = open(&key, &v, &me.id, "net1", now).unwrap();
+        assert!(found.ep.is_empty());
+        assert_eq!(
+            found.v6,
+            vec!["[2a02:3035:b1c:74a9::5]:7870".parse().unwrap()],
+            "global addresses only"
+        );
+        // An entry without the field (older versions) still opens.
+        let old = seal(&key, &me, "net1", now, &["2.243.3.46:7870".to_string()], &[]).unwrap();
+        assert!(open(&key, &old, &me.id, "net1", now).unwrap().v6.is_empty());
+    }
+
+    #[test]
     fn a_member_cannot_sign_for_another() {
         let me = ident();
         let other = ident();
@@ -423,6 +503,7 @@ mod tests {
             net: "net1".into(),
             at: now,
             ep: vec!["6.6.6.6:7870".into()],
+            v6: vec![],
         };
         let doc = serde_json::to_vec(&SignedDoc::sign(&entry, &other)).unwrap();
         let nonce = [0u8; 24];
@@ -454,7 +535,7 @@ mod tests {
         let eps: Vec<String> = (0..40)
             .map(|i| format!("very-long-host-name-number-{i}.example.org:7870"))
             .collect();
-        let v = seal(&[9u8; 32], &me, "net1", 1, &eps).unwrap();
+        let v = seal(&[9u8; 32], &me, "net1", 1, &eps, &[]).unwrap();
         assert!(v.len() <= MAX_VALUE);
     }
 
@@ -478,7 +559,7 @@ mod tests {
         let me = ident();
         let key = [5u8; 32];
         let now = now_ms();
-        let value = seal(&key, &me, "net1", now, &["2.243.3.46:7870".to_string()]).unwrap();
+        let value = seal(&key, &me, "net1", now, &["2.243.3.46:7870".to_string()], &[]).unwrap();
         let d = day(now);
         let s = salt(&key, d, &me.id);
         a.put_mutable(
@@ -491,7 +572,10 @@ mod tests {
         let item = b.get_mutable_most_recent(&public, Some(&s)).await.unwrap();
         assert_eq!(
             open(&key, item.value(), &me.id, "net1", now),
-            Some(vec!["2.243.3.46:7870".to_string()])
+            Some(Found {
+                ep: vec!["2.243.3.46:7870".to_string()],
+                v6: vec![]
+            })
         );
     }
 }

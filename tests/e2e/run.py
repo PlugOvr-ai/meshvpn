@@ -640,6 +640,43 @@ def test_rendezvous(lab):
 
 
 @test
+def test_punch_ipv6(lab):
+    """Two nodes behind stateful IPv6 firewalls (home router, mobile network), no node anyone can
+    connect to, no port forward: they connect by hole punching over IPv6 (UDP and TCP)."""
+    v4 = lab.network("v4")
+    v6 = lab.network("v6", ipv6_only=True, subnet="2001:db8:78::/64")
+    a, b = lab.node("a", [v4, v6]), lab.node("b", [v4, v6])
+    for n in (a, b):
+        # Like a home router's IPv6 firewall: only answers get in.
+        n.sh("""
+            ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+            ip6tables -A INPUT -i lo -j ACCEPT
+            ip6tables -A INPUT -j DROP
+        """)
+    a.mv(f"init --name a --endpoint {a.c}:7870")
+    a.up()
+    b.mv(f"join {invite(a)} --name b")
+    b.up()
+    wait(lambda: a.online("b") and b.online("a"), "a and b connected over IPv4")
+    # Their records name their IPv6 addresses; then IPv4 goes away for good.
+    wait(lambda: "2001:db8:78:" in json.dumps((b.peer("a") or {})) or "2001:db8:78:" in b.mv("status"), "IPv6 known", 30)
+    for n in (a, b):
+        n.stop()
+        run(["docker", "network", "disconnect", v4, n.c])
+    a.up()
+    b.up()
+    wait(lambda: a.online("b") and b.online("a"), "a and b find each other again over IPv6", timeout=120, interval=2)
+    wait(lambda: "hole punching: TCP link" in a.log() + b.log(), "a TCP link by hole punching", timeout=120, interval=2)
+    path = (a.peer("b") or {}).get("path", "")
+    check("2001:db8:78:" in path, f"path over IPv6: {path}")
+    check(ping(a, b.ip(), 3) and ping(b, "a.mesh", 3), "traffic between them")
+    # The link carries records: a rename on one side arrives on the other.
+    a.mv("rename alpha")
+    wait(lambda: b.peer("alpha") is not None, "the rename arrives over the punched link", 30)
+
+
+@test
 def test_userspace(lab):
     """A container without NET_ADMIN/TUN: userspace mode, incoming TCP to local services, SOCKS and ssh out."""
     net = lab.network("net")
@@ -1165,7 +1202,8 @@ def test_nat_ipv6(lab):
     nat = [x for x in d if x["name"] == "nat"]
     check(nat and nat[0]["level"] == "info", f"doctor's NAT check with IPv6 around: {nat}")
     # Without IPv6 the port-changing NAT leaves only the relay: IPv4 hole punching can't get through.
-    a.sh("ip6tables -I OUTPUT -p udp -j DROP")
+    # (TCP too: the two also punch a TCP link over IPv6.)
+    a.sh("ip6tables -I OUTPUT -p udp -j DROP; ip6tables -I OUTPUT -p tcp -j DROP")
     a.sh(f"ping -c 300 -i 0.2 {b.ip()} >/dev/null 2>&1 &")
     wait(lambda: "relay" in (a.peer("clientb") or {}).get("path", ""), "falls back to the relay", timeout=60)
     time.sleep(20)
