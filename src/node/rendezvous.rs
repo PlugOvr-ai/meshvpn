@@ -185,11 +185,7 @@ fn start_dht() -> std::io::Result<AsyncDht> {
 }
 
 fn ago(secs: u64) -> String {
-    match secs {
-        0..60 => format!("{secs}s"),
-        60..3600 => format!("{}m", secs / 60),
-        _ => format!("{}h", secs / 3600),
-    }
+    crate::agent::age(secs)
 }
 
 /// What `status` shows.

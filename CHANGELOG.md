@@ -10,6 +10,10 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+### Changed
+- `net matrix`: the age of a measurement in the largest unit that fits (`17m`, `5h`, `2d`), not in
+  seconds. `--json` still gives seconds.
+
 ## [0.27.1] - 2026-11-08
 
 The first release with the changes of 0.27.0: that tag's build failed on macOS and was not

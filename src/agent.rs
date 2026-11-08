@@ -783,8 +783,8 @@ pub fn print_matrix(edges: &[Edge]) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<w$}  {:<w$}  {:>9}  {:>12}  {:<15}  {:>12}  AGE",
-        "FROM", "TO", "RTT", "MESH", "LAN PATH", "LAN"
+        "{:<w$}  {:<w$}  {:>9}  {:>12}  {:<15}  {:>12}  {:>5}",
+        "FROM", "TO", "RTT", "MESH", "LAN PATH", "LAN", "AGE"
     );
     for e in edges {
         let rtt = e.rtt_ms.map(|r| format!("{r:.1} ms")).unwrap_or("-".into());
@@ -795,9 +795,21 @@ pub fn print_matrix(edges: &[Edge]) {
             _ => "-".into(),
         };
         println!(
-            "{:<w$}  {:<w$}  {rtt:>9}  {mbps:>12}  {lan:<15}  {lan_rate:>12}  {}s",
-            e.from, e.to, e.age_s
+            "{:<w$}  {:<w$}  {rtt:>9}  {mbps:>12}  {lan:<15}  {lan_rate:>12}  {:>5}",
+            e.from,
+            e.to,
+            age(e.age_s)
         );
+    }
+}
+
+/// How old a measurement is: `42s`, `17m`, `5h`, `3d` (the largest unit that fits).
+pub(crate) fn age(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
     }
 }
 
@@ -912,4 +924,17 @@ pub fn training_env(me: &NodeView, group: &[NodeView], master: &NodeView, port: 
             },
         ),
     ])
+}
+
+#[cfg(test)]
+mod age_tests {
+    #[test]
+    fn ages_in_the_largest_unit() {
+        assert_eq!(super::age(0), "0s");
+        assert_eq!(super::age(59), "59s");
+        assert_eq!(super::age(61), "1m");
+        assert_eq!(super::age(7200), "2h");
+        assert_eq!(super::age(164_493), "1d");
+        assert_eq!(super::age(1_000_000), "11d");
+    }
 }
