@@ -29,6 +29,9 @@ const PUBLISH_EVERY: Duration = Duration::from_secs(30 * 60);
 /// gone only lately.
 const LOOKUP_EVERY: Duration = Duration::from_secs(10 * 60);
 const LOOKUP_ALONE: Duration = Duration::from_secs(2 * 60);
+/// A node gone only lately (it moved, most likely): every half minute, so its new address is
+/// found soon.
+const LOOKUP_FRESH: Duration = Duration::from_secs(30);
 /// Nodes not heard of for a day are looked up rarely.
 const LOOKUP_STALE: Duration = Duration::from_secs(60 * 60);
 /// Lookups at a time.
@@ -291,7 +294,9 @@ impl Node {
                         .is_some_and(|d| d < super::punch::EAGER);
                     let every = if stale {
                         LOOKUP_STALE
-                    } else if alone || fresh {
+                    } else if fresh {
+                        LOOKUP_FRESH
+                    } else if alone {
                         LOOKUP_ALONE
                     } else {
                         LOOKUP_EVERY
@@ -439,11 +444,55 @@ impl Node {
 
     /// For `status`.
     pub(super) fn rendezvous_status(&self, st: &State) -> Option<String> {
+        // A new node meeting the one that invited it uses the DHT whatever its own setting.
+        let joining = self.cfg.join.as_ref().filter(|h| {
+            st.links.is_empty() && !st.records.keys().any(|id| *id != self.ident.id) && now_ms() <= h.until
+        });
+        if let Some(h) = joining {
+            return Some(format!(
+                "DHT, joining: waiting for the inviting node at {} (for {}; this usually takes a few minutes)",
+                h.v6.join(", "),
+                ago(self.started.elapsed().as_secs())
+            ));
+        }
         if !self.rendezvous_enabled() {
             return None;
         }
         let r = &st.rendezvous;
         let mut parts = vec![];
+        // Nodes gone lately: what is being done to find them again.
+        let mut gone: Vec<(&Record, Duration)> = st
+            .records
+            .values()
+            .filter(|r| r.info.id != self.ident.id && !st.banned.contains_key(&r.info.id))
+            .filter_map(|r| {
+                let d = self.offline_for(st, &r.info.id)?;
+                (r.last_heard.is_some() && d < super::punch::EAGER).then_some((r, d))
+            })
+            .collect();
+        gone.sort_by_key(|(_, d)| *d);
+        for (rec, d) in gone.iter().take(3) {
+            let id = rec.info.id;
+            let looked = r
+                .looked_up
+                .get(&id)
+                .map(|t| format!(", looked up {} ago", ago(t.elapsed().as_secs())))
+                .unwrap_or_default();
+            let addrs = self.punch_addresses(st, &id);
+            let trying = if addrs.is_empty() {
+                String::new()
+            } else {
+                let list: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+                format!(", trying {}", list.join(", "))
+            };
+            // Since last heard of, as the node list says ("last seen").
+            let seen = rec.last_heard.map_or(*d, |t| t.elapsed());
+            parts.push(format!(
+                "reconnecting to {} (last seen {} ago{looked}{trying})",
+                rec.info.name,
+                ago(seen.as_secs())
+            ));
+        }
         match (&r.published, r.put_at) {
             (Some((ep, _, _)), Some(at)) => {
                 let check = match r.visible {

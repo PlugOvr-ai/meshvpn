@@ -306,12 +306,76 @@ pub fn load1() -> f32 {
 
 #[cfg(windows)]
 mod win {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_BUFFER_OVERFLOW, HANDLE, STILL_ACTIVE};
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
         PROCESS_TERMINATE, TerminateProcess,
     };
+
+    /// Temporary ("privacy") global IPv6 addresses that are still preferred: those whose
+    /// interface identifier Windows made up at random (SuffixOrigin Random), not the stable one.
+    pub fn temporary_ipv6() -> Vec<std::net::Ipv6Addr> {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses,
+            IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+        };
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET6, IpDadStatePreferred, IpSuffixOriginRandom, SOCKADDR_IN6,
+        };
+        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+        // The size it needs can grow between two calls (an adapter coming up): a few tries.
+        let mut size: u32 = 16 * 1024;
+        let mut buf: Vec<u64> = vec![];
+        let mut ok = false;
+        for _ in 0..3 {
+            // u64s: the structures need 8-byte alignment.
+            buf = vec![0u64; (size as usize).div_ceil(8)];
+            let r = unsafe {
+                GetAdaptersAddresses(
+                    AF_INET6 as u32,
+                    flags,
+                    std::ptr::null(),
+                    buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                    &mut size,
+                )
+            };
+            if r == 0 {
+                ok = true;
+                break;
+            }
+            if r != ERROR_BUFFER_OVERFLOW {
+                return vec![];
+            }
+        }
+        if !ok {
+            return vec![];
+        }
+        let mut out = vec![];
+        let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        while !adapter.is_null() {
+            let a = unsafe { &*adapter };
+            let mut uni: *const IP_ADAPTER_UNICAST_ADDRESS_LH = a.FirstUnicastAddress;
+            while !uni.is_null() {
+                let u = unsafe { &*uni };
+                let sa = u.Address.lpSockaddr;
+                if !sa.is_null()
+                    && unsafe { (*sa).sa_family } == AF_INET6
+                    && u.SuffixOrigin == IpSuffixOriginRandom
+                    && u.DadState == IpDadStatePreferred
+                {
+                    let sin6 = unsafe { &*(sa as *const SOCKADDR_IN6) };
+                    let ip = std::net::Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
+                    if super::global_unicast6(&ip) && !out.contains(&ip) {
+                        out.push(ip);
+                    }
+                }
+                uni = u.Next;
+            }
+            adapter = a.Next;
+        }
+        out
+    }
 
     pub fn token_elevated(process: HANDLE) -> bool {
         unsafe {
@@ -563,7 +627,11 @@ pub fn temporary_ipv6() -> Vec<std::net::Ipv6Addr> {
             .map(|o| temporary_from_ifconfig(&String::from_utf8_lossy(&o.stdout)))
             .unwrap_or_default()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        win::temporary_ipv6()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         vec![]
     }

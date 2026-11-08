@@ -228,7 +228,8 @@ pub fn strip_suffix<'a>(dir: &Path, host: &'a str) -> &'a str {
 }
 
 /// Userspace mode: where a further network's share server listens on this machine, as the
-/// first network's has port 7871 of 127.0.0.1 (Linux answers on all of 127.0.0.0/8).
+/// first network's has port 7871 of 127.0.0.1 (Linux answers on all of 127.0.0.0/8; macOS gets
+/// it as an alias of lo0).
 pub fn share_loopback(dir: &Path) -> Option<std::net::Ipv4Addr> {
     let n = name(dir)?;
     let h = blake3::hash(n.as_bytes());

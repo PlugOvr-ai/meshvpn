@@ -51,6 +51,9 @@ x11rb = { version = "0.14.0", features = ["shm", "xtest", "damage", "xfixes", "r
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",

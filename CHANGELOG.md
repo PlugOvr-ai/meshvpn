@@ -10,6 +10,49 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-11-08
+
+The first release that meshvpn update verifies through the release key alone. Machines on 0.27.x
+can't check that and refuse it: reinstall there (`curl -fsSL
+https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sudo sh`, configuration
+kept). 0.28.0 updates as usual; 0.26.0 and older don't check signatures and update as before.
+
+### Added
+- `meshvpn dht on|off`: switches DHT rendezvous on or off and restarts meshvpn, on every system. Before,
+  the README said to add `dht = true` to the configuration, which already holds `dht = false`: the
+  key twice, and meshvpn refused to start ("duplicate key").
+- `meshvpn restart`: restarts meshvpn's service the same way on Linux (systemd, or the background
+  daemon without it), macOS (launch daemon) and Windows (scheduled task); all of the machine's
+  networks, or the one of `--net`.
+- **Several networks on macOS**, as on Linux: `sudo meshvpn --net <name> init` (or `join`) puts a
+  Mac that is in a network already into a further one. Each further network gets its own
+  interface, a route per node of it, its own names (`<node>.<name>.mesh`) and its own launch daemon
+  (`ai.plugovr.meshvpn.<name>`, log `/var/log/meshvpn-<name>.log`).
+
+### Changed
+- **Nodes find each other again faster after one of them moved** (another Wi-Fi, a mobile network):
+  in the first quarter of an hour after a node is gone, the others look it up in the DHT every 30
+  seconds instead of every 2 minutes, and a running hole punching attempt switches to addresses
+  found meanwhile instead of keeping the old ones for a minute. Before, this took 5 to 6 minutes.
+- `meshvpn status` shows what happens meanwhile: `reconnecting to <node> (last seen …, looked up …
+  ago, trying …)`, and on a new node `joining: waiting for the inviting node at …`.
+- Windows: the DHT entry carries the machine's temporary IPv6 addresses (as on Linux and macOS),
+  so a Windows node that moved can be found again over IPv6.
+
+### Fixed
+- **`init --force` and `join --force` now really leave the old network.** Before, the running
+  meshvpn (service, launch daemon or scheduled task) kept going with the old keys, so the machine
+  stayed reachable in the old network, and it kept writing the old network's state over the new
+  one (an `init --force` could lose its admin that way). Now the old meshvpn stops before the new
+  configuration is written, and the service starts again with the new one.
+- `meshvpn leave` no longer hangs when the running meshvpn doesn't answer: after 15 seconds it
+  leaves without telling the network, and stops meshvpn as usual.
+- macOS: password-less SSH logins work again after an update. meshvpn's own sshd entry from before
+  (with `/usr/local/bin/meshvpn`, a link there) was taken for someone else's ("sshd already uses
+  AuthorizedKeysCommand ... meshvpn can't add its own"); it is now brought up to date.
+- The warning about another interface in 100.64.0.0/10 no longer names this machine's own other
+  networks on macOS (whose interfaces macOS names `utunN` itself).
+
 ## [0.28.0] - 2026-11-08
 
 ### Security

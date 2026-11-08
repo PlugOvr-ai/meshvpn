@@ -100,7 +100,12 @@ pub fn enable() -> Result<bool> {
     if effective_command(&sshd).as_deref() == Some(want.as_str()) {
         return Ok(false);
     }
-    if let Some(other) = effective_command(&sshd).filter(|c| c != "none") {
+    // meshvpn's own drop-in from before (e.g. with /usr/local/bin/meshvpn, a link on macOS that
+    // the user may replace): brought up to date. Anybody else's command stays.
+    let ours = std::fs::read_to_string(DROPIN).is_ok_and(|t| t.contains("Managed by meshvpn"));
+    if let Some(other) = effective_command(&sshd).filter(|c| c != "none")
+        && !(ours && is_meshvpn_command(&other))
+    {
         bail!("sshd already uses AuthorizedKeysCommand {other:?}; meshvpn can't add its own");
     }
     let dir = Path::new(DROPIN).parent().unwrap();
@@ -132,8 +137,32 @@ pub fn enable() -> Result<bool> {
     Ok(true)
 }
 
+/// An AuthorizedKeysCommand that runs some meshvpn binary's `ssh-authorized-keys`.
+fn is_meshvpn_command(cmd: &str) -> bool {
+    let mut words = cmd.split_whitespace();
+    let exe = words.next().unwrap_or("").trim_matches('"');
+    Path::new(exe).file_name().is_some_and(|n| n == "meshvpn") && words.next() == Some("ssh-authorized-keys")
+}
+
 pub fn disable() {
     if std::fs::remove_file(DROPIN).is_ok() {
         reload();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_its_own_command() {
+        assert!(is_meshvpn_command("/usr/local/bin/meshvpn ssh-authorized-keys %u"));
+        assert!(is_meshvpn_command(
+            "\"/opt/meshvpn/bin/meshvpn\" ssh-authorized-keys %u"
+        ));
+        assert!(!is_meshvpn_command("/usr/bin/sss_ssh_authorizedkeys %u"));
+        assert!(!is_meshvpn_command(
+            "/usr/local/bin/meshvpn-evil ssh-authorized-keys %u"
+        ));
     }
 }

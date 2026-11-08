@@ -89,12 +89,19 @@ pub(crate) fn fmt_time(ms: u64) -> String {
 pub fn range_conflicts(dir: &std::path::Path, own_iface: &str) -> Vec<String> {
     let mut out = vec![];
     // This machine's other networks: set up to share the range (see networks.rs).
-    let ours: Vec<String> = crate::networks::all(&crate::networks::base(dir))
+    // By name, and by address too: macOS names the interfaces itself (utunN).
+    let cfgs: Vec<Config> = crate::networks::all(&crate::networks::base(dir))
         .iter()
-        .filter_map(|(_, d)| Config::load(d).ok().map(|c| c.interface))
+        .filter_map(|(_, d)| Config::load(d).ok())
+        .collect();
+    let ours: Vec<&str> = cfgs.iter().map(|c| c.interface.as_str()).collect();
+    let our_ips: Vec<Ipv4Addr> = cfgs
+        .iter()
+        .filter_map(|c| Identity::from_config(c).ok())
+        .map(|i| overlay_ip(&i.id))
         .collect();
     for (name, ip, _) in crate::sys::ipv4_interfaces() {
-        if name == own_iface || ours.contains(&name) || !is_overlay(IpAddr::V4(ip)) {
+        if name == own_iface || ours.contains(&name.as_str()) || our_ips.contains(&ip) || !is_overlay(IpAddr::V4(ip)) {
             continue;
         }
         let hint = if name.starts_with("tailscale") {
@@ -500,6 +507,14 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         }
     }
     let userspace = tun_dev.is_none();
+    // macOS answers on 127.0.0.1 only (Linux on all of 127.0.0.0/8): a further network's share
+    // server gets its loopback address as an alias (as root; otherwise sharing stays off there).
+    #[cfg(target_os = "macos")]
+    if userspace && let Some(ip) = crate::networks::share_loopback(&dir) {
+        let _ = std::process::Command::new("ifconfig")
+            .args(["lo0", "alias", &ip.to_string(), "up"])
+            .output();
+    }
     let inventory = tokio::task::spawn_blocking(move || crate::inventory::collect(userspace)).await?;
     let (io, start_stack) = match tun_dev {
         Some(t) => (PacketIo::Tun(Arc::new(t)), None),
@@ -2967,7 +2982,8 @@ impl Node {
     }
 
     /// A further network of this machine: one route per node of it, through its interface (the
-    /// whole range belongs to the machine's first network). Linux only, as are further networks.
+    /// whole range belongs to the machine's first network). The more specific routes win over the
+    /// first network's range, on Linux and macOS alike.
     fn sync_routes(&self, st: &mut State) {
         let PacketIo::Tun(_) = &self.io else { return };
         if !crate::networks::is_extra(&self.dir) {
@@ -3032,31 +3048,62 @@ impl Node {
         st.address_clashes = clashes;
         st.v4_withheld = withheld;
         let want: HashSet<Ipv4Addr> = ips.into_iter().filter(|ip| !st.v4_withheld.contains(ip)).collect();
-        let iface = &self.cfg.interface;
+        let iface = self.cfg.interface.clone();
         let src = self.my_ip.to_string();
-        let ip = |args: &[&str]| {
-            let out = std::process::Command::new("ip").args(args).output();
+        let run = |cmd: &str, args: &[&str]| {
+            let out = std::process::Command::new(cmd).args(args).output();
             match out {
                 Ok(o) if o.status.success() => true,
                 Ok(o) => {
-                    warn!("ip {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
+                    warn!(
+                        "{cmd} {}: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
                     false
                 }
-                Err(e) => {
+                Err(e) if cfg!(target_os = "linux") => {
                     warn!(
-                        "ip {}: {e} (a further network needs the ip command, iproute2)",
+                        "{cmd} {}: {e} (a further network needs the ip command, iproute2)",
                         args.join(" ")
                     );
                     false
                 }
+                Err(e) => {
+                    warn!("{cmd} {}: {e}", args.join(" "));
+                    false
+                }
+            }
+        };
+        let del = |ip: &Ipv4Addr| {
+            let ip = ip.to_string();
+            if cfg!(target_os = "macos") {
+                run("route", &["-q", "-n", "delete", "-host", &ip, "-interface", &iface])
+            } else {
+                run("ip", &["route", "del", &format!("{ip}/32"), "dev", &iface])
+            }
+        };
+        let add = |ip: &Ipv4Addr| {
+            let ip = ip.to_string();
+            if cfg!(target_os = "macos") {
+                // `route add` fails on a route that's there already: this interface's own.
+                let _ = std::process::Command::new("route")
+                    .args(["-q", "-n", "delete", "-host", &ip, "-interface", &iface])
+                    .output();
+                run("route", &["-q", "-n", "add", "-host", &ip, "-interface", &iface])
+            } else {
+                run(
+                    "ip",
+                    &["route", "replace", &format!("{ip}/32"), "dev", &iface, "src", &src],
+                )
             }
         };
         for gone in st.kernel_routes.difference(&want) {
-            ip(&["route", "del", &format!("{gone}/32"), "dev", iface]);
+            del(gone);
         }
         let mut done = HashSet::new();
         for new in want.iter().filter(|w| !st.kernel_routes.contains(*w)) {
-            if ip(&["route", "replace", &format!("{new}/32"), "dev", iface, "src", &src]) {
+            if add(new) {
                 done.insert(*new);
             }
         }
@@ -3985,6 +4032,11 @@ fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr, extra: bool) -> std::result::Re
     {
         use tun::AbstractDevice;
         cfg.interface = dev.tun_name().map_err(|e| e.to_string())?;
+        // A further network routes its nodes one by one (sync_routes): the whole range is the
+        // first network's.
+        if extra {
+            return Ok(dev);
+        }
         // The whole mesh through this interface (a point-to-point link only routes its peer).
         let net = format!("{}/{}", Ipv4Addr::new(100, 64, 0, 0), OVERLAY_PREFIX);
         let _ = std::process::Command::new("route")

@@ -80,6 +80,11 @@ impl Node {
         if !in_window(st.punch_since.get(id).map(|t| t.elapsed()), unix_secs()) {
             return vec![];
         }
+        self.punch_addresses(st, id)
+    }
+
+    /// `id`'s IPv6 addresses for hole punching, as far as we know them now.
+    pub(super) fn punch_addresses(&self, st: &State, id: &NodeId) -> Vec<SocketAddr> {
         // The newer source only: a fresh rendezvous entry beats the record it is newer than (the
         // node moved since), a record that came later (over a link since) beats the entry.
         let hint = st
@@ -153,7 +158,15 @@ impl Node {
     pub(super) async fn punch_run(self: &Arc<Self>, id: NodeId, targets: Vec<SocketAddr>) {
         let started = Instant::now();
         let port = self.punch_port();
+        let mut targets = targets;
         while started.elapsed() < RUN && !self.linked(&id) && !self.leaving.load(Ordering::Relaxed) {
+            // Addresses found meanwhile (the node moved, the rendezvous just told us where to)
+            // count at once, not only in the next run.
+            let now = self.punch_addresses(&self.state.lock().unwrap(), &id);
+            if !now.is_empty() && now != targets {
+                debug!("hole punching: {} is at {now:?} now", id.short());
+                targets = now;
+            }
             // All addresses at once (one of them may be the one the other side tries right now).
             let mut attempts = tokio::task::JoinSet::new();
             for target in &targets {

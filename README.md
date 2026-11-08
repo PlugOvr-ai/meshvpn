@@ -53,6 +53,8 @@ in `C:\ProgramData\meshvpn` and runs as a task that starts at boot. Run meshvpn'
 administrator terminal for the ones that change something. Windows Defender Firewall keeps blocking connections *into*
 the machine from the mesh, as from any new network; to offer a service to the other nodes, allow its port, e.g.
 `New-NetFirewallRule -DisplayName "meshvpn: my app" -Direction Inbound -Protocol TCP -LocalPort 8000 -RemoteAddress 100.64.0.0/10 -Action Allow`.
+Use Windows Terminal or a normal PowerShell window, not PowerShell ISE: ISE can't run interactive console programs, so
+questions (`meshvpn leave`) and `ssh`'s password prompt never show up there, and the command seems to hang.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
@@ -93,6 +95,9 @@ sudo meshvpn install        # runs as a systemd service, also after reboot
 sudo meshvpn join mesh1-eyJuZXR3b3Jr...
 sudo meshvpn install
 ```
+
+`sudo meshvpn restart` restarts the service the same way everywhere (systemd on Linux, the launch
+daemon on macOS, the scheduled task on Windows), e.g. after changing its configuration.
 
 That's it. Every node gets a stable IP in `100.64.0.0/10`, an IPv6 address in its network's own
 private prefix (`fdxx:xxxx:xxxx::/64`), and a `<name>.mesh` host name for both:
@@ -177,13 +182,14 @@ A network needs one node the others can reach. That can be a node at home, and i
 
   It is off by default because firewalls and intrusion detection in company networks may take DHT traffic for
   BitTorrent. Switch it on **on the node that others connect to and on the nodes that should find it** (best: on
-  all nodes outside company networks). Add this line at the top of the configuration, before any `[section]`:
+  all nodes outside company networks):
 
   ```sh
-  sudoedit /etc/meshvpn/config.toml     # rootless: ~/.config/meshvpn/config.toml
-  #   dht = true                        (or change an existing `dht = false`)
-  sudo systemctl restart meshvpn
+  sudo meshvpn dht on      # Windows: meshvpn dht on, in an administrator terminal
   ```
+
+  It sets `dht = true` in the configuration and restarts meshvpn (`meshvpn dht off` switches it off again,
+  `meshvpn dht` shows the setting).
 
   `meshvpn status` then shows `rendezvous: DHT, published …` on the reachable node, and the others log
   `rendezvous: <node> is at …` when they found it.
@@ -275,7 +281,8 @@ sudo meshvpn networks leave lab   # leave it again; the first network doesn't no
   of 100 nodes each, and likely for two of a thousand. Then the first network's node keeps the
   address here, and the further network's node is reached over IPv6: its name points there only.
   (Without IPv6 on the machine, the further network's node wins, and status and the log name both.)
-* Linux only for now, and exit nodes only in the first network. Without root, the networks are
+* Linux and macOS (not Windows yet), and exit nodes only in the first network. On macOS the mesh
+  has no IPv6, so a node whose IPv4 address clashes can't be reached from the Mac. Without root, the networks are
   the user's own, in userspace mode, each with its own SOCKS port (1055, 1056, ...).
 
 ## Devices without internet access
