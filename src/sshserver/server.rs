@@ -128,6 +128,41 @@ fn no_login_shell(shell: &str) -> bool {
     matches!(name.as_str(), "nologin" | "false" | "git-shell" | "scponly" | "rssh")
 }
 
+/// Locked or expired in /etc/shadow, as sshd with PAM sees it: the account expired
+/// (`chage -E`, `usermod -e`), or a password was locked (`passwd -l` on an account that had one:
+/// "!$..."). A bare "!" or "*" means "no password", which is fine for key logins.
+fn shadow_closed(hash: &str, expire_days: i64, today: i64) -> bool {
+    let locked = hash
+        .strip_prefix('!')
+        .is_some_and(|rest| rest.trim_start_matches('!').starts_with('$'));
+    let expired = expire_days >= 0 && today >= expire_days;
+    locked || expired
+}
+
+#[cfg(target_os = "linux")]
+fn account_closed(name: &str) -> bool {
+    let Ok(cname) = CString::new(name) else { return true };
+    let mut sp: libc::spwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::spwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 16384];
+    let rc = unsafe { libc::getspnam_r(cname.as_ptr(), &mut sp, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() {
+        return false; // no shadow entry (or not readable): nothing says it is closed
+    }
+    let hash = if sp.sp_pwdp.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(sp.sp_pwdp) }.to_string_lossy().into_owned()
+    };
+    let today = (crate::node::now_ms() / 86_400_000) as i64;
+    shadow_closed(&hash, sp.sp_expire as i64, today)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn account_closed(_name: &str) -> bool {
+    false
+}
+
 fn lookup(name: &str) -> Option<Account> {
     let cname = CString::new(name).ok()?;
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
@@ -149,6 +184,9 @@ fn lookup(name: &str) -> Option<Account> {
     // An account that may not log in (nologin, false): not here either - no shell, no SFTP, no
     // forwards. Also when that program is missing, which would otherwise make it /bin/sh.
     if no_login_shell(&configured) {
+        return None;
+    }
+    if account_closed(name) {
         return None;
     }
     // A shell missing in this image (bash in a minimal container): /bin/sh.
@@ -1326,5 +1364,24 @@ mod authorized_keys_tests {
             authorized_keys_lookup(&format!("restrict {A}\n{A}\n"), &a),
             Lookup::Listed
         );
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::shadow_closed;
+
+    #[test]
+    fn locked_and_expired_accounts_are_closed() {
+        let today = 20_000;
+        assert!(!shadow_closed("$6$salt$hash", -1, today), "a normal account");
+        assert!(!shadow_closed("!", -1, today), "no password (useradd): keys still work");
+        assert!(!shadow_closed("*", -1, today));
+        assert!(!shadow_closed("!*", -1, today));
+        assert!(shadow_closed("!$6$salt$hash", -1, today), "passwd -l");
+        assert!(shadow_closed("!!$6$salt$hash", -1, today), "locked twice");
+        assert!(shadow_closed("$6$salt$hash", today, today), "expired today (chage -E)");
+        assert!(shadow_closed("!", 1, today), "usermod -e 1");
+        assert!(!shadow_closed("$6$salt$hash", today + 1, today), "expires tomorrow");
     }
 }

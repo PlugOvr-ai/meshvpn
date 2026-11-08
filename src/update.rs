@@ -13,6 +13,80 @@ use std::time::Duration;
 
 pub const REPO: &str = "PlugOvr-ai/meshvpn";
 
+/// Keys that sign releases (ed25519 public keys): `SHA256SUMS.sig` signs the release's
+/// `SHA256SUMS` with one of them, made apart from the build (the build machines don't hold
+/// the key). More than one, so a key can be replaced.
+const RELEASE_KEYS: &[&str] = &["hHYAO3iLkvQIVXUW8GHBOaGOY-6HqTPAFEH7XofinYk"];
+/// Releases from this version on are signed. Older ones are only checked against the
+/// checksums they publish.
+pub const SIGNED_FROM: &str = "0.27.0";
+
+/// What a release signature covers: the tag (so an older release's list can't pass for a
+/// newer one) and the checksum list.
+pub fn release_message(tag: &str, sums: &[u8]) -> Vec<u8> {
+    let mut m = format!("meshvpn release v1\n{}\n", tag.trim_start_matches('v')).into_bytes();
+    m.extend_from_slice(sums);
+    m
+}
+
+fn verify_release(keys: &[&str], tag: &str, sums: &[u8], sig: &[u8]) -> Result<()> {
+    let sig = crate::keys::unb64(&String::from_utf8_lossy(sig)).context("reading SHA256SUMS.sig")?;
+    let msg = release_message(tag, sums);
+    for k in keys {
+        if let Ok(key) = crate::keys::unb64_32(k)
+            && crate::keys::verify(&crate::keys::Key32(key), &msg, &sig).is_ok()
+        {
+            return Ok(());
+        }
+    }
+    bail!("the release signature doesn't verify - not installing")
+}
+
+/// Checks release `tag`'s `SHA256SUMS` against its `SHA256SUMS.sig` (the keys built in).
+pub fn verify_release_sums(tag: &str, sums: &[u8], sig: &[u8]) -> Result<()> {
+    verify_release(RELEASE_KEYS, tag, sums, sig)
+}
+
+/// The checksum of `name` in the release's signed list.
+pub fn signed_sum(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|l| {
+        let (hash, file) = l.split_once(char::is_whitespace)?;
+        (file.trim().trim_start_matches('*') == name).then(|| hash.to_lowercase())
+    })
+}
+
+/// The SHA-256 `name` of release `tag` must have: from the signed `SHA256SUMS` (releases from
+/// `SIGNED_FROM` on), else from the release's `<name>.sha256`.
+async fn expected_sum(client: &reqwest::Client, repo: &str, tag: &str, name: &str) -> Result<String> {
+    let base = format!("https://github.com/{repo}/releases/download/{tag}");
+    let get = |url: String| async move {
+        let r = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("downloading {url}"))?;
+        if !r.status().is_success() {
+            bail!("downloading {url}: HTTP {}", r.status());
+        }
+        Ok::<_, anyhow::Error>(r.bytes().await?)
+    };
+    if at_least(tag, SIGNED_FROM) {
+        let sums = get(format!("{base}/SHA256SUMS")).await?;
+        let sig = get(format!("{base}/SHA256SUMS.sig"))
+            .await
+            .context("release not signed (yet) - not installing; try again later")?;
+        verify_release(RELEASE_KEYS, tag, &sums, &sig)?;
+        return signed_sum(&String::from_utf8_lossy(&sums), name)
+            .ok_or_else(|| anyhow!("{name} is not in the release's signed checksums"));
+    }
+    let sums = get(format!("{base}/{name}.sha256")).await?;
+    Ok(String::from_utf8_lossy(&sums)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase())
+}
+
 /// Where releases of this build come from: an extension's own (enterprise builds update to
 /// enterprise builds), else the open-source repository.
 pub fn repo() -> String {
@@ -88,7 +162,7 @@ pub fn current_exe() -> Result<PathBuf> {
 }
 
 /// Downloads file `name` of release `tag` of GitHub repository `repo` and checks it against the
-/// published `<name>.sha256`.
+/// release's signed checksums (see `expected_sum`).
 pub async fn download_verified(client: &reqwest::Client, repo: &str, tag: &str, name: &str) -> Result<Vec<u8>> {
     let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let get = |url: String| async move {
@@ -103,12 +177,7 @@ pub async fn download_verified(client: &reqwest::Client, repo: &str, tag: &str, 
         Ok::<_, anyhow::Error>(r.bytes().await?)
     };
     let data = get(format!("{base}/{name}")).await?;
-    let sums = get(format!("{base}/{name}.sha256")).await?;
-    let expected = String::from_utf8_lossy(&sums)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let expected = expected_sum(client, repo, tag, name).await?;
     let actual: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
     if expected != actual {
         bail!("checksum mismatch for {name} - not installing");
@@ -132,12 +201,7 @@ pub async fn download_binary(client: &reqwest::Client, tag: &str, target: &str) 
         Ok::<_, anyhow::Error>(r.bytes().await?)
     };
     let data = get(format!("{base}/{archive}")).await?;
-    let sums = get(format!("{base}/{archive}.sha256")).await?;
-    let expected = String::from_utf8_lossy(&sums)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let expected = expected_sum(client, &repo(), tag, &archive).await?;
     let actual: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
     if expected != actual {
         bail!("checksum mismatch for {archive} - not installing");
@@ -196,6 +260,46 @@ pub async fn install(client: &reqwest::Client, tag: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_signatures() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pk = crate::keys::b64(sk.verifying_key().as_bytes());
+        let sums = b"abc123  meshvpn-x86_64-unknown-linux-musl.tar.gz\ndef456  install.sh\n";
+        let sig = crate::keys::b64(&sk.sign(&release_message("v0.27.0", sums)).to_bytes());
+        assert!(verify_release(&[&pk], "v0.27.0", sums, sig.as_bytes()).is_ok());
+        assert!(
+            verify_release(&[&pk], "0.27.0", sums, sig.as_bytes()).is_ok(),
+            "with or without the v"
+        );
+        assert!(
+            verify_release(&[&pk], "v0.27.1", sums, sig.as_bytes()).is_err(),
+            "another tag"
+        );
+        assert!(
+            verify_release(&[&pk], "v0.27.0", b"x", sig.as_bytes()).is_err(),
+            "other sums"
+        );
+        assert!(
+            verify_release(RELEASE_KEYS, "v0.27.0", sums, sig.as_bytes()).is_err(),
+            "another key"
+        );
+        assert_eq!(
+            signed_sum(std::str::from_utf8(sums).unwrap(), "install.sh").as_deref(),
+            Some("def456")
+        );
+        assert_eq!(signed_sum("abc  *install.sh\n", "install.sh").as_deref(), Some("abc"));
+        assert_eq!(signed_sum("abc  install.sh.bak\n", "install.sh"), None);
+    }
+
+    #[test]
+    fn signatures_made_with_openssl_verify() {
+        // scripts/sign-release.sh: openssl pkeyutl -sign -rawin, base64url without padding.
+        let key = "Gv_DzljIyxqS1MSKeDBNz5o2Q1L1LklPqxsZs1RzMy0";
+        let sig = "hAbSq0Z-ojsEd5vDcCt6WgnyVHL1ZPzTz9h06JpOMpg_1Pkd8QbLZbnD2mAHLzb93SXRmc2R5q_AVPvLs-9FCA";
+        assert!(verify_release(&[key], "v0.27.0", b"abc  x.tar.gz\n", sig.as_bytes()).is_ok());
+    }
 
     #[test]
     fn version_ordering() {

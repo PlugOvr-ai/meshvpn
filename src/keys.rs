@@ -128,6 +128,18 @@ impl Identity {
     }
 }
 
+/// A one-time key pair (an invite's): the secret (base64) and its public key.
+pub fn one_time_key() -> (String, NodeId) {
+    let secret = random32();
+    let public = Key32(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+    (b64(&secret), public)
+}
+
+/// Signs with a one-time key's secret (base64).
+pub fn sign_one_time(secret: &str, msg: &[u8]) -> Result<[u8; 64]> {
+    Ok(SigningKey::from_bytes(&unb64_32(secret)?).sign(msg).to_bytes())
+}
+
 pub fn verify(id: &NodeId, msg: &[u8], sig: &[u8]) -> Result<()> {
     let key = VerifyingKey::from_bytes(&id.0).map_err(|_| anyhow!("invalid node key"))?;
     let sig: [u8; 64] = sig.try_into().map_err(|_| anyhow!("bad signature length"))?;

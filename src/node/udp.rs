@@ -44,6 +44,11 @@ pub(super) const PATH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
 /// Below the ~30 s after which NATs forget an idle UDP mapping, so both sides' holes overlap.
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// Probes this far behind the sender's newest (by its clock) are taken for replays.
+const PROBE_REPLAY_MS: u64 = 120_000;
+/// Unfinished split datagrams, in all and per sending address.
+const MAX_FRAGS: usize = 256;
+const MAX_FRAGS_PER_SOURCE: usize = 32;
 /// An answer to a probe counts only this soon.
 const PROBE_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
@@ -78,6 +83,7 @@ impl UdpPath {
 /// A split datagram being put back together.
 pub(super) struct Reassembly {
     started: Instant,
+    from: SocketAddr,
     parts: Vec<Option<Vec<u8>>>,
 }
 
@@ -428,7 +434,7 @@ impl Node {
     }
 
     /// A part of a split datagram; the whole datagram once all parts are there.
-    fn udp_frag(&self, d: &[u8]) -> Option<Vec<u8>> {
+    fn udp_frag(&self, d: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
         if d.len() < 16 {
             return None;
         }
@@ -442,22 +448,45 @@ impl Node {
         }
         let mut st = self.state.lock().unwrap();
         st.id_prefix.get(&prefix)?; // only known nodes (the data is authenticated as a whole)
-        if st.udp_frags.len() > 256 {
-            st.udp_frags.retain(|_, r| r.started.elapsed() < Duration::from_secs(2));
-            if st.udp_frags.len() > 256 {
+        // The id prefix is no secret, so anyone can send parts in a node's name. Parts from a
+        // node's current UDP path come first: others can't crowd them out.
+        let on_path = st.udp_paths.values().any(|p| p.addr == from);
+        if !st.udp_frags.contains_key(&(prefix, id)) {
+            let from_here = st.udp_frags.values().filter(|r| r.from == from).count();
+            let in_name = || {
+                st.udp_frags
+                    .iter()
+                    .filter(|((p, _), r)| *p == prefix && !st.udp_paths.values().any(|u| u.addr == r.from))
+                    .count()
+            };
+            if from_here >= MAX_FRAGS_PER_SOURCE || (!on_path && in_name() >= MAX_FRAGS_PER_SOURCE) {
                 return None;
             }
-        }
-        // At most 32 unfinished per sender: one can't crowd out the others.
-        if !st.udp_frags.contains_key(&(prefix, id)) && st.udp_frags.keys().filter(|(p, _)| *p == prefix).count() >= 32
-        {
-            return None;
+            if st.udp_frags.len() >= MAX_FRAGS {
+                st.udp_frags.retain(|_, r| r.started.elapsed() < Duration::from_secs(2));
+            }
+            if st.udp_frags.len() >= MAX_FRAGS {
+                if !on_path {
+                    return None;
+                }
+                // Make room: the oldest one not from a path.
+                let paths: Vec<SocketAddr> = st.udp_paths.values().map(|p| p.addr).collect();
+                let victim = st
+                    .udp_frags
+                    .iter()
+                    .filter(|(_, r)| !paths.contains(&r.from))
+                    .min_by_key(|(_, r)| r.started)
+                    .map(|(k, _)| *k)?;
+                st.udp_frags.remove(&victim);
+            }
         }
         let r = st.udp_frags.entry((prefix, id)).or_insert_with(|| Reassembly {
             started: Instant::now(),
+            from,
             parts: vec![None; count],
         });
-        if r.parts.len() != count {
+        // Parts of one datagram come from one place.
+        if r.parts.len() != count || r.from != from {
             return None;
         }
         r.parts[index] = Some(d[15..].to_vec());
@@ -484,7 +513,7 @@ impl Node {
                     }
                 }
                 Some(&FRAG) => {
-                    if let Some(whole) = self.udp_frag(d)
+                    if let Some(whole) = self.udp_frag(d, from)
                         && whole.first() == Some(&DATA)
                         && let Some(pkt) = self.udp_data(&whole, from)
                     {
@@ -528,6 +557,19 @@ impl Node {
             }
         }
         if !ack {
+            // A recorded probe sent again (from anywhere) gets no answer: answers to a forged
+            // source would make us send packets at someone else. The sender's timestamps only
+            // go up (by its own clock); a probe more than two minutes behind its newest, or seen
+            // before, is a replay.
+            let seen = st.udp_probes_seen.entry(src).or_default();
+            if ts.saturating_add(PROBE_REPLAY_MS) < seen.0 || seen.1.contains(&nonce) {
+                return;
+            }
+            seen.0 = seen.0.max(ts);
+            seen.1.push_back(nonce);
+            while seen.1.len() > 256 {
+                seen.1.pop_front();
+            }
             // The MAC proves the sender. The timestamp is only echoed back for the RTT, so
             // clocks that differ between machines don't matter.
             let reply = self.probe_datagram(ACK, &src, ts, nonce, Some(from), &key);

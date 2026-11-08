@@ -407,6 +407,16 @@ def test_admin_invites(lab):
     check(not hub.online("d"), "a node with only the network key got in")
     check("not admitted" in hub.log(), "refused attempts should be logged at the admin")
     wait(lambda: "needs an invite" in (d.status().get("turned_away") or ""), "d is told why", 20)
+    # the ticket without the invite's one-time key: what every member sees in the claims
+    raw = json.loads(base64.urlsafe_b64decode(invite(hub)[6:] + "=="))
+    check(raw.pop("ticket_key", None), "invites of managed networks should carry the ticket's one-time key")
+    stolen = "mesh1-" + base64.urlsafe_b64encode(json.dumps(raw).encode()).decode().rstrip("=")
+    e = lab.node("e", [net])
+    e.mv(f"join {stolen} --name e")
+    e.up()
+    time.sleep(8)
+    check(not hub.online("e"), "a node got in with a ticket seen in the mesh, without the invite's key")
+    wait(lambda: "prove" in (e.status().get("turned_away") or ""), "e is told why", 20)
     # expired: refused right away, the existing setup stays
     expired = invite(hub, "--expires 2s")
     time.sleep(4)

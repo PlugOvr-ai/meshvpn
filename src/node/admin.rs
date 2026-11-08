@@ -8,6 +8,10 @@
 //! expires). The first member that accepts one countersigns it as a witness, so nodes that were
 //! offline at the time accept it later too. A ticket admits at most `uses` nodes: the earliest
 //! claims win on every node, so a ticket used twice still only lets one node in.
+//!
+//! Tickets travel inside every claim, so every member sees them. A ticket is therefore bound to
+//! a one-time key whose secret is only in the invite: a claim counts only if that key signed it
+//! too (for this node and time), so seeing a ticket is not enough to use it.
 
 use super::*;
 
@@ -159,6 +163,18 @@ impl Node {
         if st.banned.contains_key(&claim.node) {
             bail!("banned");
         }
+        // A bound ticket: only who has the invite can claim it (members see the ticket itself).
+        if let Some(key) = &ticket.key {
+            let msg = Claim::proof_bytes(&ticket.net, &ticket.id, &claim.node, claim.at);
+            let ok = claim
+                .proof
+                .as_deref()
+                .and_then(|p| crate::keys::unb64(p).ok())
+                .is_some_and(|s| crate::keys::verify(key, &msg, &s).is_ok());
+            if !ok {
+                bail!("the admission doesn't prove it holds the invite (update meshvpn on the new node)");
+            }
+        }
         if let Some(a) = st.claims.get(&claim.node)
             && a.claim.ticket.data == claim.ticket.data
         {
@@ -299,12 +315,7 @@ impl Node {
             return Some(c.clone());
         }
         let ticket = self.cfg.ticket.clone()?;
-        let claim = Claim {
-            net: self.net.clone(),
-            ticket,
-            node: self.ident.id,
-            at: now_ms(),
-        };
+        let claim = self.make_claim(ticket, self.cfg.ticket_key.as_deref());
         let msg = ClaimMsg {
             claim: SignedDoc::sign(&claim, &self.ident),
             witness: None,
@@ -318,6 +329,28 @@ impl Node {
             warn!("saving the admission: {e:#}");
         }
         Some(msg)
+    }
+
+    /// Our claim on `ticket`, with the proof from the invite's one-time key if it is bound.
+    fn make_claim(&self, ticket: SignedDoc, ticket_key: Option<&str>) -> Claim {
+        let at = now_ms();
+        let proof = ticket
+            .open::<Ticket>(|t| t.issuer)
+            .ok()
+            .filter(|t| t.key.is_some())
+            .zip(ticket_key)
+            .and_then(|(t, secret)| {
+                let msg = Claim::proof_bytes(&t.net, &t.id, &self.ident.id, at);
+                crate::keys::sign_one_time(secret, &msg).ok()
+            })
+            .map(|s| crate::keys::b64(&s));
+        Claim {
+            net: self.net.clone(),
+            ticket,
+            node: self.ident.id,
+            at,
+            proof,
+        }
     }
 
     // ----------------------------------------------------------------------------- commands
@@ -475,6 +508,7 @@ impl Node {
         uses: u32,
         valid_ms: u64,
         client: Option<crate::proto::ClientGrant>,
+        bind: Option<NodeId>,
     ) -> Result<(Option<SignedDoc>, Vec<NodeId>)> {
         let st = self.state.lock().unwrap();
         let Some((_, roster)) = &st.roster else {
@@ -497,29 +531,26 @@ impl Node {
             uses: uses.max(1),
             issuer: self.ident.id,
             client,
+            key: bind,
         };
         Ok((Some(SignedDoc::sign(&ticket, &self.ident)), roster.admins.clone()))
     }
 
     /// A new admission for this node from `ticket` (a client renewing its time): saved,
     /// accepted here and sent to everyone.
-    pub fn readmit(&self, ticket: SignedDoc) -> Result<String> {
+    pub fn readmit(&self, ticket: SignedDoc, ticket_key: Option<String>) -> Result<String> {
         let t = ticket.open::<Ticket>(|t| t.issuer)?;
         if t.net != self.net {
             bail!("this invite is for another network");
         }
-        let claim = Claim {
-            net: self.net.clone(),
-            ticket,
-            node: self.ident.id,
-            at: now_ms(),
-        };
+        let claim = self.make_claim(ticket, ticket_key.as_deref());
         let msg = ClaimMsg {
             claim: SignedDoc::sign(&claim, &self.ident),
             witness: None,
         };
         let mut cfg = Config::load(&self.dir)?;
         cfg.ticket = Some(claim.ticket.clone());
+        cfg.ticket_key = ticket_key;
         cfg.claim = Some(msg.clone());
         cfg.save(&self.dir)?;
         let mut st = self.state.lock().unwrap();

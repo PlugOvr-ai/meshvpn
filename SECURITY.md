@@ -40,9 +40,34 @@ where appropriate) and named in the release notes.
 
 ## What helps you check a release
 
-- `SHA256SUMS` and a `.sha256` file for every archive of a release; `meshvpn update` checks them.
-  They come from the same GitHub release as the archives, so they catch a broken download, not a
-  release that someone else published: releases aren't signed yet.
+- `SHA256SUMS` and a `.sha256` file for every archive of a release.
+- From 0.27.0 on, `SHA256SUMS.sig`: an Ed25519 signature of `SHA256SUMS`, made with a release key
+  that the build machines don't hold. `meshvpn update` and `meshvpn desktop setup` install a
+  release only if this signature verifies against the keys built into meshvpn, and the file's
+  checksum is in the signed list. The signature also names the version, so an older release's
+  list can't be passed off as a newer one's. Releases before 0.27.0 are checked against their
+  checksums only.
+
+  Public key (raw, base64url): `hHYAO3iLkvQIVXUW8GHBOaGOY-6HqTPAFEH7XofinYk`, as PEM:
+
+  ```
+  -----BEGIN PUBLIC KEY-----
+  MCowBQYDK2VwAyEAhHYAO3iLkvQIVXUW8GHBOaGOY+6HqTPAFEH7XofinYk=
+  -----END PUBLIC KEY-----
+  ```
+
+  To check a download by hand (OpenSSL 3), with the key above in `release.pub` and `V` the
+  version without the `v` (e.g. `0.27.0`):
+
+  ```sh
+  { printf 'meshvpn release v1\n%s\n' "$V"; cat SHA256SUMS; } > msg
+  tr -- '-_' '+/' < SHA256SUMS.sig | base64 -d 2>/dev/null > sig.bin   # add = padding if needed
+  openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in msg -sigfile sig.bin
+  sha256sum -c --ignore-missing SHA256SUMS
+  ```
+
+  The installer (`install.sh`) itself comes from the release it installs, so `curl | sh`
+  can't be safer than the release page; check it as above first if that matters to you.
 - A software bill of materials (CycloneDX, `meshvpn-<version>.cdx.json`) with every crate the
   release is built from, to match against vulnerability databases.
 

@@ -594,17 +594,22 @@ Set `RUST_LOG=meshvpn=debug` for verbose logs.
 
 ## Security model and limitations
 
-Found a vulnerability? Please report it privately, see [SECURITY.md](SECURITY.md). Every release has SHA-256 checksums
-and a CycloneDX software bill of materials (`meshvpn-<version>.cdx.json`).
+Found a vulnerability? Please report it privately, see [SECURITY.md](SECURITY.md). Every release has SHA-256 checksums,
+from 0.27.0 on signed (`SHA256SUMS.sig`), and a CycloneDX software bill of materials (`meshvpn-<version>.cdx.json`).
+What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 
 * In managed networks (the default since v0.7) only admins invite, ban and change the admins. In open networks every
   member can do all of that. Members are trusted either way: they can reach each other's services and share data.
   Treat invite codes like passwords until they are used or expire. If two admins ban nodes at the same moment, run the
   ban again.
-* Updates are downloaded from this repository's GitHub releases and checked against the published SHA-256 checksums.
-  That protects against corrupted downloads, but not against a compromised GitHub account. Nodes never install
-  updates by themselves: only `meshvpn update` does.
-* The end-to-end layer has no replay protection or forward secrecy (the hop-by-hop Noise links have both).
+* Updates are downloaded from this repository's GitHub releases. From 0.27.0 on, `meshvpn update` installs a release
+  only if its checksums carry a valid signature of the release key, which the build machines don't hold (so a
+  compromised GitHub account alone can't ship an update). Nodes never install updates by themselves: only
+  `meshvpn update` does.
+* The end-to-end layer has replay protection (since 0.24.0) but no forward secrecy (the hop-by-hop Noise links have
+  both).
+* Invites are bearer secrets: whoever has one can join (until it is used up or expires). Members see the tickets in
+  each other's admissions, but can't use them: a ticket counts only together with the invite's one-time key.
 * IPv4 only, Linux only (the TUN setup and systemd integration).
 * Direct UDP paths work through the common kinds of NAT (one public port per internal port, as most home routers do).
   "Hard" NATs that use a new port for every destination (some carrier-grade NATs and corporate firewalls) can't be
@@ -636,8 +641,12 @@ tests/e2e/run.py --binary ... --keep nat_traversal                              
 
 They run on every push, and a release is only published when all of them pass.
 
-To publish a release, push a tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow then builds static
-binaries for every architecture, `.deb`/`.rpm` packages, checksums and the SBOM, and attaches `install.sh`.
+To publish a release, add its section to [CHANGELOG.md](CHANGELOG.md), then push a tag
+(`git tag -a v0.2.0 -m "meshvpn v0.2.0" && git push origin v0.2.0`). The release workflow refuses a tag without a
+changelog section, builds static binaries for every architecture, `.deb`/`.rpm` packages, checksums and the SBOM,
+attaches `install.sh`, and puts the changelog section at the top of the release notes. Then sign it where the release
+key is (never on a build machine): `scripts/sign-release.sh PlugOvr-ai/meshvpn v0.2.0`. Until then `meshvpn update`
+won't install it.
 
 The end-to-end behavior was tested with three rootless network namespaces: a public node, a NAT'd node without a
 listener, and a node whose firewall only allows SSH to a jump host. That covered direct links, relayed traffic, SSH

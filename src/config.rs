@@ -358,6 +358,9 @@ pub struct Config {
     pub trusted_admins: Vec<crate::keys::NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::proto::SignedDoc>,
+    /// The invite's one-time key for the ticket (see `Ticket::key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<crate::proto::ClaimMsg>,
     /// Who may log in here over SSH without a password (see `meshvpn ssh`).
@@ -413,6 +416,7 @@ impl Config {
             ssh_allow: vec![],
             trusted_admins: vec![],
             ticket: None,
+            ticket_key: None,
             claim: None,
             ssh_allow_all: vec![],
             ssh_allow_keys: vec![],
@@ -530,6 +534,17 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 pub fn create_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| permission_hint(e, dir))?;
     crate::sys::set_mode(dir, 0o700).ok();
+    #[cfg(windows)]
+    if dir.starts_with(SYSTEM_DIR) {
+        // ProgramData lets every user read, and create folders: once per run, the folder and
+        // everything in it becomes the administrators' and SYSTEM's only (see sys).
+        static DONE: std::sync::Once = std::sync::Once::new();
+        DONE.call_once(|| {
+            if let Err(e) = crate::sys::secure_system_dir(Path::new(SYSTEM_DIR)) {
+                tracing::warn!("restricting access to {SYSTEM_DIR}: {e:#}");
+            }
+        });
+    }
     Ok(())
 }
 
@@ -607,6 +622,9 @@ pub struct Invite {
     /// Managed networks: the admission ticket, and the admins to trust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<crate::proto::SignedDoc>,
+    /// The secret of the ticket's one-time key: only in the invite, never in the mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admins: Vec<crate::keys::NodeId>,
     /// Where to meet the inviting node if neither can reach the other (hole punching).
@@ -682,6 +700,7 @@ mod tests {
             id: "abc".into(),
             v: 3,
             ticket: None,
+            ticket_key: None,
             admins: vec![],
             join: None,
         };

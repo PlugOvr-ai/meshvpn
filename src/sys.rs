@@ -175,6 +175,64 @@ pub fn set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
+/// Windows: `dir` and everything in it belong to the administrators, and only they and SYSTEM
+/// may open it. C:\\ProgramData is readable by all users and lets them create folders, so a
+/// folder made there (or planted before meshvpn was installed) would otherwise expose the
+/// node's keys, or be the planter's to change.
+#[cfg(windows)]
+pub fn secure_system_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Well-known SIDs, so it works in every language: SYSTEM and BUILTIN\Administrators.
+    const SYSTEM: &str = "*S-1-5-18";
+    const ADMINS: &str = "*S-1-5-32-544";
+    let run = |args: &[&str]| -> anyhow::Result<()> {
+        let out = std::process::Command::new("icacls")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .context("running icacls")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "icacls {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+        Ok(())
+    };
+    let d = dir.to_string_lossy().into_owned();
+    // The owner may always change the access list: first take that away from whoever made it.
+    run(&[&d, "/setowner", ADMINS, "/T", "/C", "/Q"])?;
+    // Then a new list for the folder: no inherited entries, nothing explicit but these two.
+    run(&[&d, "/reset", "/Q"])?;
+    run(&[
+        &d,
+        "/inheritance:r",
+        "/grant:r",
+        &format!("{SYSTEM}:(OI)(CI)F"),
+        &format!("{ADMINS}:(OI)(CI)F"),
+        "/Q",
+    ])?;
+    // Users' default entries, should any be explicit.
+    let _ = run(&[
+        &d,
+        "/remove:g",
+        "*S-1-5-32-545",
+        "*S-1-5-11",
+        "*S-1-1-0",
+        "*S-1-3-0",
+        "/Q",
+    ]);
+    // Everything inside: only what the folder passes down.
+    let inner = dir.join("*").to_string_lossy().into_owned();
+    if std::fs::read_dir(dir).is_ok_and(|mut r| r.next().is_some()) {
+        run(&[&inner, "/reset", "/T", "/C", "/Q"])?;
+    }
+    Ok(())
+}
+
 /// Creates new files readable by the owner only (Unix).
 #[cfg_attr(windows, allow(unused_variables))]
 pub fn private(opts: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {

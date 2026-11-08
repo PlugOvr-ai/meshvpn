@@ -166,6 +166,8 @@ struct State {
     v4_withheld: HashSet<Ipv4Addr>,
     /// The addresses routes were last worked out for.
     route_ips: Vec<Ipv4Addr>,
+    /// When the first network's saved state last changed, as `route_ips` were set.
+    route_first_changed: Option<std::time::SystemTime>,
     /// Host key of whatever answers SSH here (published in our record).
     my_ssh_host_key: Option<String>,
     update_available: Option<String>,
@@ -224,6 +226,8 @@ struct State {
     replay: HashMap<NodeId, replay::Window>,
     /// Nonces of the probes we sent lately, per node: only an answer to one of them counts.
     udp_probes_sent: HashMap<NodeId, VecDeque<(u64, Instant)>>,
+    /// Probes heard per sender: its newest timestamp and recent nonces (replays aren't answered).
+    udp_probes_seen: HashMap<NodeId, (u64, VecDeque<u64>)>,
     /// Addresses nodes answered our probes from lately (authenticated): proof that an address
     /// is theirs (`lan_check`).
     udp_answered_from: HashMap<NodeId, Vec<(IpAddr, Instant)>>,
@@ -2971,17 +2975,21 @@ impl Node {
         }
         let mut ips: Vec<Ipv4Addr> = st.ip_map.keys().copied().filter(|ip| *ip != self.my_ip).collect();
         ips.sort();
-        // Looked at again when this network's nodes change, as the first network's are on disk.
+        // Looked at again when this network's nodes change, or the first network's (on disk).
+        let first = crate::networks::base(&self.dir);
+        let first_changed = std::fs::metadata(crate::config::SavedState::path(&first))
+            .and_then(|m| m.modified())
+            .ok();
         let routed =
             |st: &State| ips.iter().filter(|ip| !st.v4_withheld.contains(ip)).count() == st.kernel_routes.len();
-        if ips == st.route_ips && routed(st) {
+        if ips == st.route_ips && first_changed == st.route_first_changed && routed(st) {
             return;
         }
         st.route_ips = ips.clone();
+        st.route_first_changed = first_changed;
         // The same address in this machine's first network: the first network keeps it (a member
         // of this one could make an identity with any address, about 2^22 tries). This
         // network's node is reached over IPv6, or not at all from this machine.
-        let first = crate::networks::base(&self.dir);
         let theirs: HashMap<Ipv4Addr, String> = Config::load(&first)
             .map(|c| {
                 let net = c.network_id();

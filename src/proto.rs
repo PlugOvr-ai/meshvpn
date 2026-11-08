@@ -78,6 +78,10 @@ pub struct Ticket {
     /// A client, not a node: a user's computer, a member until `ClientGrant::until` only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientGrant>,
+    /// The public half of a one-time key whose secret is only in the invite: a claim must be
+    /// signed with it too, so members who see the ticket in claims can't use it themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<NodeId>,
 }
 
 /// What makes a member a client: whose computer it is, and until when it may be one. Clients
@@ -96,6 +100,16 @@ pub struct Claim {
     pub ticket: SignedDoc,
     pub node: NodeId,
     pub at: u64,
+    /// With a bound ticket (`Ticket::key`): the invite's one-time key signs `proof_bytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+}
+
+impl Claim {
+    /// What the invite's one-time key signs: this node, this time, this ticket.
+    pub fn proof_bytes(net: &str, ticket_id: &str, node: &NodeId, at: u64) -> Vec<u8> {
+        format!("meshvpn ticket proof v1\n{net}\n{ticket_id}\n{node}\n{at}").into_bytes()
+    }
 }
 
 /// A claim as it travels, with the countersignature of the member that first saw it while

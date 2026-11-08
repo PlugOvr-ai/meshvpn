@@ -100,10 +100,15 @@ pub enum Request {
         valid_ms: u64,
         #[serde(default)]
         client: Option<crate::proto::ClientGrant>,
+        /// The public half of the invite's one-time key (see `Ticket::key`).
+        #[serde(default)]
+        bind: Option<crate::keys::NodeId>,
     },
     /// A new admission from an invite's ticket (a client renewing).
     Readmit {
         ticket: crate::proto::SignedDoc,
+        #[serde(default)]
+        ticket_key: Option<String>,
     },
     Tags {
         add: Vec<String>,
@@ -436,13 +441,18 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
                 message: format!("{e:#}"),
             },
         },
-        Ok(Request::Readmit { ticket }) => match node.readmit(ticket) {
+        Ok(Request::Readmit { ticket, ticket_key }) => match node.readmit(ticket, ticket_key) {
             Ok(text) => Response::Message { text },
             Err(e) => Response::Error {
                 message: format!("{e:#}"),
             },
         },
-        Ok(Request::IssueTicket { uses, valid_ms, client }) => match node.issue_ticket(uses, valid_ms, client) {
+        Ok(Request::IssueTicket {
+            uses,
+            valid_ms,
+            client,
+            bind,
+        }) => match node.issue_ticket(uses, valid_ms, client, bind) {
             Ok((ticket, admins)) => Response::Message {
                 text: serde_json::json!({ "ticket": ticket, "admins": admins }).to_string(),
             },

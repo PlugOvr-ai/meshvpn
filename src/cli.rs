@@ -975,7 +975,10 @@ fn real_main(cli: Cli) -> Result<i32> {
             {
                 require_owner()?;
                 if control::is_running(&dir) {
-                    let req = control::Request::Readmit { ticket };
+                    let req = control::Request::Readmit {
+                        ticket,
+                        ticket_key: inv.ticket_key.clone(),
+                    };
                     let resp = tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &req))?;
                     match resp {
                         control::Response::Message { text } => say(json, &text),
@@ -985,6 +988,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 } else {
                     let mut cfg = cfg;
                     cfg.ticket = Some(ticket);
+                    cfg.ticket_key = inv.ticket_key.clone();
                     cfg.claim = None;
                     cfg.save(&dir)?;
                     say(json, "admission renewed - it applies when meshvpn starts");
@@ -997,6 +1001,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             cfg.key_version = inv.v;
             cfg.trusted_admins = inv.admins;
             cfg.ticket = inv.ticket;
+            cfg.ticket_key = inv.ticket_key;
             cfg.join = inv.join;
             cfg.save(&dir)?;
             println!("Joined network \"{}\".\n", cfg.network);
@@ -2559,7 +2564,10 @@ fn make_invite(
     boot.retain(|e| seen.insert(e.clone()));
     boot.truncate(12);
 
-    let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms, client)?;
+    // A one-time key binds the ticket to this invite: its secret is only in the invite.
+    let (ticket_key, bind) = keys::one_time_key();
+    let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms, client, bind)?;
+    let ticket_key = ticket.as_ref().map(|_| ticket_key);
     // Where to meet if neither side can reach the other (only with the DHT on, see node/join.rs).
     let join = if cfg.dht && control::is_running(dir) {
         let req = control::Request::RegisterJoin {
@@ -2579,6 +2587,7 @@ fn make_invite(
         id: cfg.network_id(),
         v: cfg.key_version,
         ticket,
+        ticket_key,
         admins,
         join,
     })
@@ -2738,9 +2747,15 @@ fn invite_ticket(
     uses: u32,
     valid_ms: u64,
     client: Option<proto::ClientGrant>,
+    bind: keys::NodeId,
 ) -> Result<(Option<proto::SignedDoc>, Vec<keys::NodeId>)> {
     if control::is_running(dir) {
-        let req = control::Request::IssueTicket { uses, valid_ms, client };
+        let req = control::Request::IssueTicket {
+            uses,
+            valid_ms,
+            client,
+            bind: Some(bind),
+        };
         let control::Response::Message { text } =
             tokio::runtime::Runtime::new()?.block_on(control::request(dir, &req))?
         else {
@@ -2770,6 +2785,7 @@ fn invite_ticket(
         uses: uses.max(1),
         issuer: ident.id,
         client,
+        key: Some(bind),
     };
     Ok((Some(proto::SignedDoc::sign(&ticket, &ident)), roster.admins))
 }

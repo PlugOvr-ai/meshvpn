@@ -289,3 +289,18 @@ pub fn lan_interface_for(peer: Ipv4Addr) -> Option<String> {
 pub fn interface_name(dir: &Path) -> Option<String> {
     crate::config::Config::load(dir).ok().map(|c| c.interface)
 }
+
+/// Release signatures (see `SECURITY.md`), for an extension's own downloads: whether release
+/// `tag` must be signed, the check of its `SHA256SUMS` against `SHA256SUMS.sig`, and the
+/// checksum of `name` in that list.
+pub mod release {
+    pub fn signed(tag: &str) -> bool {
+        crate::update::at_least(tag, crate::update::SIGNED_FROM)
+    }
+    pub fn verify(tag: &str, sums: &[u8], sig: &[u8]) -> anyhow::Result<()> {
+        crate::update::verify_release_sums(tag, sums, sig)
+    }
+    pub fn sum(sums: &str, name: &str) -> Option<String> {
+        crate::update::signed_sum(sums, name)
+    }
+}

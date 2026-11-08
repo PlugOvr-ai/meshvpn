@@ -26,6 +26,10 @@ jobs:
     steps:
       - run: |
           echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || { echo "not a release tag: $TAG"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: The changelog has this release
+        run: |
+          grep -Eq "^## \[${TAG#v}\]" CHANGELOG.md || { echo "CHANGELOG.md has no section for ${TAG#v}"; exit 1; }
 
   build:
     needs: tag
@@ -44,11 +48,12 @@ jobs:
           # Raspberry Pi Zero / 1
           - { target: arm-unknown-linux-musleabihf, packages: false }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
           tool: cross,cargo-deb,cargo-generate-rpm
 
@@ -74,7 +79,7 @@ jobs:
           cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
           cargo generate-rpm --target ${{ matrix.target }} --output dist/
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist-${{ matrix.target }}
           path: dist/*
@@ -85,9 +90,10 @@ jobs:
     name: build macOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Set version from tag
         run: |
@@ -109,7 +115,7 @@ jobs:
             cp target/$t/release/meshvpn README.md LICENSE staging/
             tar -czf dist/meshvpn-$t.tar.gz -C staging .
           done
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist-macos
           path: dist/*
@@ -119,8 +125,10 @@ jobs:
     name: build Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - name: Set version from tag
         shell: pwsh
         run: |
@@ -149,7 +157,7 @@ jobs:
           Copy-Item wintun\wintun\LICENSE.txt staging\wintun-LICENSE.txt
           Compress-Archive staging\* dist\meshvpn-$t.zip
           tar -czf dist\meshvpn-$t.tar.gz -C staging .
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist-windows
           path: dist/*
@@ -165,10 +173,10 @@ jobs:
           - { arch: x86_64, runner: ubuntu-latest }
           - { arch: aarch64, runner: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Build
         run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/desktop-out:/out" alpine:3.22 sh /build/build-bundle.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist-desktop-${{ matrix.arch }}
           path: desktop-out/*.tar.gz
@@ -183,14 +191,14 @@ jobs:
     needs: [build, macos, windows, desktop, e2e]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
           tool: cargo-cyclonedx
       - name: SBOM (CycloneDX)
@@ -266,6 +274,9 @@ jobs:
 
           Then: \`sudo meshvpn init\` to create a network, or \`sudo meshvpn join <invite>\` to join one.
           NOTES
+          # This release's section of the changelog first.
+          awk -v v="${TAG#v}" '/^## /{p = index($0, "[" v "]") == 4; next} p' CHANGELOG.md > changes.md
+          if [ -s changes.md ]; then { echo "## Changes"; cat changes.md; echo; cat notes.md; } > n.md && mv n.md notes.md; fi
 
       - name: Nothing but files to publish
         run: |
