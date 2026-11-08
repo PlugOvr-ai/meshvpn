@@ -17,6 +17,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import pathlib
 import random
 import shlex
 import string
@@ -26,6 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMAGE = "meshvpn-e2e"
@@ -1871,13 +1873,47 @@ def test_desktop_cinnamon(lab):
     desktop_from_packages(lab, "cinnamon", "cinnamon-session", "x-terminal-emulator")
 
 
+VIRTUALGL_DEB = ("virtualgl_3.1.5_amd64.deb", "df3f7788ce41b182a47c0d298e5cd6d2d63579522cb41825970b7726e825485e")
+
+
+def virtualgl_deb():
+    """VirtualGL's package, downloaded once into MESHVPN_E2E_CACHE (default ~/.cache/meshvpn-e2e), so the
+    test doesn't depend on GitHub's download servers answering at that moment (they sometimes don't)."""
+    name, sha = VIRTUALGL_DEB
+    cache = pathlib.Path(os.environ.get("MESHVPN_E2E_CACHE", pathlib.Path.home() / ".cache" / "meshvpn-e2e"))
+    path = cache / name
+    if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == sha:
+        return path
+    cache.mkdir(parents=True, exist_ok=True)
+    url = f"https://github.com/VirtualGL/virtualgl/releases/download/3.1.5/{name}"
+    last = None
+    for attempt in range(8):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                data = r.read()
+            if hashlib.sha256(data).hexdigest() != sha:
+                raise RuntimeError("checksum mismatch")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            tmp.rename(path)
+            return path
+        except Exception as e:  # noqa: BLE001 - any failure: try again
+            last = e
+            time.sleep(min(60, 5 * 2 ** attempt))
+    raise RuntimeError(f"downloading {url} failed 8 times (GitHub?): {last}")
+
+
 @test
 def test_desktop_gpu(lab):
     """setup --gpu: OpenGL through VirtualGL (on Mesa's software EGL device here), the picture as H.264 (x264 standing in for NVENC)."""
     check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
     box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
     run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
-    out = box.mv("desktop setup --from /tmp/desktop.tar.gz --gpu", timeout=1500)
+    # VirtualGL from the cache (MESHVPN_VIRTUALGL_DIR), not from GitHub during the test.
+    box.sh("mkdir -p /tmp/vgl")
+    run(["docker", "cp", str(virtualgl_deb()), f"{box.c}:/tmp/vgl/"])
+    out = box.sh("MESHVPN_VIRTUALGL_DIR=/tmp/vgl meshvpn desktop setup --from /tmp/desktop.tar.gz --gpu", timeout=1500)
+    check("from /tmp/vgl" in out, f"VirtualGL should come from the local copy: {out[-800:]}")
     check("GPU support installed" in out and box.sh("test -f /usr/lib/libvglfaker.so", ok=False).returncode == 0, out[-800:])
     box.sh("chmod 644 /tmp/desktop.tar.gz")
     box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")

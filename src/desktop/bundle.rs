@@ -118,10 +118,20 @@ pub fn install_gpu() -> Result<()> {
         bail!("no supported package manager (apt, dnf, zypper) for VirtualGL - install it yourself");
     };
     let url = format!("https://github.com/VirtualGL/virtualgl/releases/download/{VIRTUALGL}/{file}");
-    println!("Downloading VirtualGL {VIRTUALGL} ({file})...");
-    let rt = tokio::runtime::Runtime::new()?;
-    let data = rt
-        .block_on(async {
+    // A copy at hand (machines without internet, tests): MESHVPN_VIRTUALGL_DIR/<file>. Checked
+    // against the same checksum as a download.
+    let local = std::env::var_os("MESHVPN_VIRTUALGL_DIR")
+        .map(|d| std::path::PathBuf::from(d).join(&file))
+        .filter(|p| p.is_file());
+    let data = if let Some(p) = local {
+        println!("VirtualGL {VIRTUALGL} from {}", p.display());
+        std::fs::read(&p)
+            .with_context(|| format!("reading {}", p.display()))?
+            .into()
+    } else {
+        println!("Downloading VirtualGL {VIRTUALGL} ({file})...");
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
             let c = crate::update::client(None)?;
             // GitHub's download servers answer 5xx now and then: a few tries.
             let mut tries = 0;
@@ -137,7 +147,12 @@ pub fn install_gpu() -> Result<()> {
                 }
             }
         })
-        .with_context(|| format!("downloading {url}"))?;
+        .with_context(|| {
+            format!(
+                "downloading {url} (without internet: put {file} into a directory and set MESHVPN_VIRTUALGL_DIR to it)"
+            )
+        })?
+    };
     let want = VIRTUALGL_SHA256
         .iter()
         .find(|(f, _)| *f == file)

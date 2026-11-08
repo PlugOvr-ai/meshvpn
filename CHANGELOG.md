@@ -10,10 +10,18 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-11-08
+
+### Added
+- `desktop setup --gpu` takes the VirtualGL package from `MESHVPN_VIRTUALGL_DIR` if it is there (machines
+  without internet); it is checked against the same checksum as a download.
+
 ### Changed
 - README: a note that meshvpn is early (before 1.0) software, provided as is, at your own risk.
 - `net matrix`: the age of a measurement in the largest unit that fits (`17m`, `5h`, `2d`), not in
   seconds. `--json` still gives seconds.
+- The end-to-end tests take VirtualGL from a cache instead of GitHub (a GitHub outage failed
+  them for 0.27.0 and 0.27.1).
 
 ## [0.27.1] - 2026-11-08
 

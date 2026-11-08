@@ -36,6 +36,11 @@ jobs:
       - name: Build the desktop bundle
         if: steps.bundle.outputs.cache-hit != 'true'
         run: docker run --rm -v "$PWD/desktop:/build:ro" -v "$PWD/desktop-out:/out" alpine:3.22 sh /build/build-bundle.sh
+      - name: Downloads the tests need (VirtualGL), cached so a GitHub hiccup doesn't fail them
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/meshvpn-e2e
+          key: e2e-downloads-virtualgl-3.1.5
       - name: Make sure the TUN module is loaded
         run: sudo modprobe tun || true
       - name: End-to-end tests
