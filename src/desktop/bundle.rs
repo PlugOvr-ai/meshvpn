@@ -123,8 +123,19 @@ pub fn install_gpu() -> Result<()> {
     let data = rt
         .block_on(async {
             let c = crate::update::client(None)?;
-            let r = c.get(&url).send().await?.error_for_status()?;
-            anyhow::Ok(r.bytes().await?)
+            // GitHub's download servers answer 5xx now and then: a few tries.
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
+                    Ok(r) => break anyhow::Ok(r.bytes().await?),
+                    Err(e) if tries < 4 && e.status().is_none_or(|s| s.is_server_error()) => {
+                        eprintln!("  {e} - trying again");
+                        tokio::time::sleep(std::time::Duration::from_secs(5 * tries)).await;
+                    }
+                    Err(e) => break Err(e.into()),
+                }
+            }
         })
         .with_context(|| format!("downloading {url}"))?;
     let want = VIRTUALGL_SHA256

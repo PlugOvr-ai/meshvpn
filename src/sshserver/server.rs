@@ -131,6 +131,7 @@ fn no_login_shell(shell: &str) -> bool {
 /// Locked or expired in /etc/shadow, as sshd with PAM sees it: the account expired
 /// (`chage -E`, `usermod -e`), or a password was locked (`passwd -l` on an account that had one:
 /// "!$..."). A bare "!" or "*" means "no password", which is fine for key logins.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn shadow_closed(hash: &str, expire_days: i64, today: i64) -> bool {
     let locked = hash
         .strip_prefix('!')

@@ -10,7 +10,17 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
-## [0.27.0] - 2026-11-08
+## [0.27.1] - 2026-11-08
+
+The first release with the changes of 0.27.0: that tag's build failed on macOS and was not
+published.
+
+### Fixed
+- The macOS build (an SSH-server helper that only Linux uses).
+- `desktop setup --gpu` tries the VirtualGL download again when GitHub's servers answer with an
+  error.
+
+## [0.27.0] - 2026-11-08 [not released]
 
 ### Security
 - **Signed releases.** From this version on, every release has `SHA256SUMS.sig`, an Ed25519
