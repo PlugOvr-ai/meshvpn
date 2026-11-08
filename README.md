@@ -648,11 +648,16 @@ tests/e2e/run.py --binary ... --keep nat_traversal                              
 They run on every push, and a release is only published when all of them pass.
 
 To publish a release, add its section to [CHANGELOG.md](CHANGELOG.md), then push a tag
-(`git tag -a v0.2.0 -m "meshvpn v0.2.0" && git push origin v0.2.0`). The release workflow refuses a tag without a
-changelog section, builds static binaries for every architecture, `.deb`/`.rpm` packages, checksums and the SBOM,
-attaches `install.sh`, and puts the changelog section at the top of the release notes. Then sign it where the release
-key is (never on a build machine): `scripts/sign-release.sh PlugOvr-ai/meshvpn v0.2.0`. Until then `meshvpn update`
-won't install it.
+(`git tag -a v0.2.0 -m "meshvpn v0.2.0" && git push origin v0.2.0`; only maintainers may create `v*` tags). The
+release workflow refuses a tag without a changelog section, builds static binaries for every architecture,
+`.deb`/`.rpm` packages, checksums and the SBOM, runs the end-to-end tests, signs `SHA256SUMS` with the release key
+(GitHub environment `release`) and publishes it all with the changelog section at the top of the release notes.
+
+The release key's certificate (`release-key.cert`) runs out after about a year; the workflow warns 30 days ahead.
+Renew it where the root key is: `scripts/certify-release-key.sh release-key.pub.pem 400 > release-key.cert`, commit.
+If the release key leaked: make a new one, store it as the secret `MESHVPN_RELEASE_KEY` of the environment
+`release`, certify it, and add the old one to `REVOKED_KEYS` in `src/update.rs`. In an emergency a root key can sign
+a release itself: `scripts/sign-release.sh PlugOvr-ai/meshvpn vX.Y.Z`.
 
 The end-to-end behavior was tested with three rootless network namespaces: a public node, a NAT'd node without a
 listener, and a node whose firewall only allows SSH to a jump host. That covered direct links, relayed traffic, SSH

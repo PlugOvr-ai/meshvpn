@@ -1,5 +1,6 @@
 #!/bin/sh
-# Signs a published release: uploads SHA256SUMS.sig, an Ed25519 signature over
+# Emergency only - releases are signed by the release workflow (release key, see src/update.rs).
+# Signs a published release with a root key: uploads SHA256SUMS.sig, an Ed25519 signature over
 #   "meshvpn release v1\n<version>\n" followed by the release's SHA256SUMS
 # (see src/update.rs, release_message). Run it on the machine that holds the release key, after
 # the release workflow has published the release:
@@ -22,11 +23,11 @@ openssl pkeyutl -sign -inkey "$key" -rawin -in "$tmp/msg" -out "$tmp/sig.bin"
 # The signature must verify with the key's public half...
 openssl pkey -in "$key" -pubout -out "$tmp/pub.pem"
 openssl pkeyutl -verify -pubin -inkey "$tmp/pub.pem" -rawin -in "$tmp/msg" -sigfile "$tmp/sig.bin" >/dev/null
-# ...and that must be one of the keys meshvpn trusts.
+# ...and that must be one of the root keys meshvpn trusts.
 pub="$(openssl pkey -pubin -in "$tmp/pub.pem" -outform DER | tail -c 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
 here="$(dirname "$0")/../src/update.rs"
 if [ -f "$here" ] && ! grep -q "\"$pub\"" "$here"; then
-    echo "this key ($pub) is not in RELEASE_KEYS ($here)" >&2
+    echo "this key ($pub) is not in ROOT_KEYS ($here)" >&2
     exit 1
 fi
 base64 < "$tmp/sig.bin" | tr '+/' '-_' | tr -d '=\n' > "$tmp/SHA256SUMS.sig"

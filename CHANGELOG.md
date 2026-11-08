@@ -10,6 +10,21 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-08
+
+### Security
+- **Releases are signed automatically, with two levels of keys.** Offline root keys (built into
+  meshvpn) certify a release key until a date (`release-key.cert`, in every release); the release
+  workflow signs with that key, which only `v*` tags can use, on GitHub's own runners. A release
+  key that leaks is replaced without an update of meshvpn: it stops counting at its expiry date,
+  and at once where it is listed as revoked. An expired key never signs an update. Releases
+  signed by a root key still verify.
+- Only maintainers may create, move or delete `v*` tags.
+
+### Added
+- `scripts/verify-release.sh`: checks a release by hand, as `meshvpn update` does.
+- `scripts/certify-release-key.sh`: certifies a release key with a root key.
+
 ## [0.27.2] - 2026-11-08
 
 ### Added

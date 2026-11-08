@@ -41,14 +41,22 @@ where appropriate) and named in the release notes.
 ## What helps you check a release
 
 - `SHA256SUMS` and a `.sha256` file for every archive of a release.
-- From 0.27.0 on, `SHA256SUMS.sig`: an Ed25519 signature of `SHA256SUMS`, made with a release key
-  that the build machines don't hold. `meshvpn update` and `meshvpn desktop setup` install a
-  release only if this signature verifies against the keys built into meshvpn, and the file's
-  checksum is in the signed list. The signature also names the version, so an older release's
-  list can't be passed off as a newer one's. Releases before 0.27.0 are checked against their
-  checksums only.
+- `SHA256SUMS.sig`: an Ed25519 signature of `SHA256SUMS` (and of the version, so an older
+  release's list can't be passed off as a newer one's). `meshvpn update` and `meshvpn desktop
+  setup` install a release only if it verifies, and the file's checksum is in the signed list.
+  Releases before 0.27.0 are checked against their checksums only.
 
-  Public key (raw, base64url): `hHYAO3iLkvQIVXUW8GHBOaGOY-6HqTPAFEH7XofinYk`, as PEM:
+  The keys come in two levels (as with TUF or Tailscale's distsign):
+  - **Root keys**, built into meshvpn and kept offline. They certify release keys, and in an
+    emergency sign a release themselves.
+  - **The release key** signs releases automatically in the release workflow. It is a GitHub
+    secret that only `v*` tags (which only maintainers may create) can use, on GitHub's own
+    runners. `release-key.cert` in every release (and in the repository) is a root key's
+    statement that this key may sign releases until a date. A release key that leaks is
+    replaced by certifying a new one; it stops counting at its expiry date, at once in builds
+    that list it as revoked, and it can never sign an update past its date.
+
+  Root key (raw, base64url): `hHYAO3iLkvQIVXUW8GHBOaGOY-6HqTPAFEH7XofinYk`, as PEM:
 
   ```
   -----BEGIN PUBLIC KEY-----
@@ -56,15 +64,11 @@ where appropriate) and named in the release notes.
   -----END PUBLIC KEY-----
   ```
 
-  To check a download by hand (OpenSSL 3), with the key above in `release.pub` and `V` the
-  version without the `v` (e.g. `0.27.0`):
-
-  ```sh
-  { printf 'meshvpn release v1\n%s\n' "$V"; cat SHA256SUMS; } > msg
-  tr -- '-_' '+/' < SHA256SUMS.sig | base64 -d 2>/dev/null > sig.bin   # add = padding if needed
-  openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in msg -sigfile sig.bin
-  sha256sum -c --ignore-missing SHA256SUMS
-  ```
+  To check a download by hand (OpenSSL 3 and jq): put `SHA256SUMS`, `SHA256SUMS.sig`,
+  `release-key.cert` and the files into one directory and run
+  [`scripts/verify-release.sh`](scripts/verify-release.sh) `<version> <directory>`. It checks
+  the certificate against the root key, the signature against the certified key, and the files
+  against `SHA256SUMS`, the same way `meshvpn update` does; read it, it is short.
 
   The installer (`install.sh`) itself comes from the release it installs, so `curl | sh`
   can't be safer than the release page; check it as above first if that matters to you.

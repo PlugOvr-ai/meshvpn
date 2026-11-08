@@ -291,14 +291,16 @@ pub fn interface_name(dir: &Path) -> Option<String> {
 }
 
 /// Release signatures (see `SECURITY.md`), for an extension's own downloads: whether release
-/// `tag` must be signed, the check of its `SHA256SUMS` against `SHA256SUMS.sig`, and the
+/// `tag` must be signed, the check of its `SHA256SUMS` against `SHA256SUMS.sig` (and
+/// `release-key.cert`), and the
 /// checksum of `name` in that list.
 pub mod release {
     pub fn signed(tag: &str) -> bool {
         crate::update::at_least(tag, crate::update::SIGNED_FROM)
     }
-    pub fn verify(tag: &str, sums: &[u8], sig: &[u8]) -> anyhow::Result<()> {
-        crate::update::verify_release_sums(tag, sums, sig)
+    /// `cert`: the release's `release-key.cert`, if it has one.
+    pub fn verify(tag: &str, sums: &[u8], sig: &[u8], cert: Option<&[u8]>) -> anyhow::Result<()> {
+        crate::update::verify_release_sums(tag, sums, sig, cert)
     }
     pub fn sum(sums: &str, name: &str) -> Option<String> {
         crate::update::signed_sum(sums, name)

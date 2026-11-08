@@ -13,10 +13,21 @@ use std::time::Duration;
 
 pub const REPO: &str = "PlugOvr-ai/meshvpn";
 
-/// Keys that sign releases (ed25519 public keys): `SHA256SUMS.sig` signs the release's
-/// `SHA256SUMS` with one of them, made apart from the build (the build machines don't hold
-/// the key). More than one, so a key can be replaced.
-const RELEASE_KEYS: &[&str] = &["hHYAO3iLkvQIVXUW8GHBOaGOY-6HqTPAFEH7XofinYk"];
+/// Release signatures: two levels, as with TUF or Tailscale's distsign.
+///
+/// * The **root keys** (Ed25519, below) are kept offline. They rarely sign anything: a release
+///   key's certificate, or a release itself in an emergency.
+/// * The **release key** signs releases automatically in the release workflow (a GitHub secret,
+///   only for `v*` tags, only on GitHub's own runners). A root key certifies it until a date:
+///   `release-key.cert`, attached to every release.
+///
+/// `SHA256SUMS.sig` signs the release's `SHA256SUMS` (see `release_message`) with the release key
+/// or a root key. A release key that leaks is replaced by certifying a new one; the old one
+/// stops counting at its expiry date (and at once in builds that list it in `REVOKED_KEYS`),
+/// without any update of the root keys.
+const ROOT_KEYS: &[&str] = &["hHYAO3iLkvQIVXUW8GHBOaGOY-6HqTPAFEH7XofinYk"];
+/// Release keys that no longer count, whatever their certificate says.
+const REVOKED_KEYS: &[&str] = &[];
 /// Releases from this version on are signed. Older ones are only checked against the
 /// checksums they publish.
 pub const SIGNED_FROM: &str = "0.27.0";
@@ -29,22 +40,84 @@ pub fn release_message(tag: &str, sums: &[u8]) -> Vec<u8> {
     m
 }
 
-fn verify_release(keys: &[&str], tag: &str, sums: &[u8], sig: &[u8]) -> Result<()> {
-    let sig = crate::keys::unb64(&String::from_utf8_lossy(sig)).context("reading SHA256SUMS.sig")?;
-    let msg = release_message(tag, sums);
-    for k in keys {
-        if let Ok(key) = crate::keys::unb64_32(k)
-            && crate::keys::verify(&crate::keys::Key32(key), &msg, &sig).is_ok()
-        {
-            return Ok(());
-        }
-    }
-    bail!("the release signature doesn't verify - not installing")
+/// A root key's statement that `key` may sign releases until `expires_ms`.
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
+pub struct KeyCert {
+    pub key: String,
+    pub expires_ms: u64,
+    #[serde(default)]
+    pub expires: String,
+    pub sig: String,
 }
 
-/// Checks release `tag`'s `SHA256SUMS` against its `SHA256SUMS.sig` (the keys built in).
-pub fn verify_release_sums(tag: &str, sums: &[u8], sig: &[u8]) -> Result<()> {
-    verify_release(RELEASE_KEYS, tag, sums, sig)
+/// What a root key signs to certify a release key.
+pub fn cert_message(key: &str, expires_ms: u64) -> Vec<u8> {
+    format!("meshvpn release key v1\n{key}\n{expires_ms}\n").into_bytes()
+}
+
+fn verifies(key: &str, msg: &[u8], sig: &[u8]) -> bool {
+    crate::keys::unb64_32(key).is_ok_and(|k| crate::keys::verify(&crate::keys::Key32(k), msg, sig).is_ok())
+}
+
+/// Checks release `tag`'s checksum list `sums` against its signature `sig`: made by a root key,
+/// or by a release key that `cert` (the release's `release-key.cert`) certifies. An expired
+/// release key still counts for releases no newer than `running` (the desktop bundle of this
+/// version), never for an update.
+/// The keys a check trusts, and the release keys it no longer does.
+struct Trust<'a> {
+    roots: &'a [&'a str],
+    revoked: &'a [&'a str],
+}
+
+fn verify_with(
+    trust: &Trust,
+    tag: &str,
+    sums: &[u8],
+    sig: &[u8],
+    cert: Option<&[u8]>,
+    running: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let sig = crate::keys::unb64(&String::from_utf8_lossy(sig)).context("reading SHA256SUMS.sig")?;
+    let msg = release_message(tag, sums);
+    let (roots, revoked) = (trust.roots, trust.revoked);
+    if roots.iter().any(|k| verifies(k, &msg, &sig)) {
+        return Ok(());
+    }
+    let Some(cert) = cert else {
+        bail!("the release signature doesn't verify (and the release has no key certificate) - not installing");
+    };
+    let c: KeyCert = serde_json::from_slice(cert).context("reading release-key.cert")?;
+    let csig = crate::keys::unb64(&c.sig).context("reading release-key.cert")?;
+    if !roots
+        .iter()
+        .any(|k| verifies(k, &cert_message(&c.key, c.expires_ms), &csig))
+    {
+        bail!("the release key's certificate isn't signed by a root key - not installing");
+    }
+    if revoked.contains(&c.key.as_str()) {
+        bail!("the release was signed with a revoked key - not installing");
+    }
+    if now_ms > c.expires_ms && is_newer(tag, running) {
+        bail!(
+            "the release key expired ({}) - not installing",
+            crate::node::fmt_time(c.expires_ms)
+        );
+    }
+    if !verifies(&c.key, &msg, &sig) {
+        bail!("the release signature doesn't verify - not installing");
+    }
+    Ok(())
+}
+
+/// Checks release `tag`'s `SHA256SUMS` against its `SHA256SUMS.sig` and `release-key.cert`
+/// (the keys built in).
+pub fn verify_release_sums(tag: &str, sums: &[u8], sig: &[u8], cert: Option<&[u8]>) -> Result<()> {
+    let trust = Trust {
+        roots: ROOT_KEYS,
+        revoked: REVOKED_KEYS,
+    };
+    verify_with(&trust, tag, sums, sig, cert, &current(), crate::node::now_ms())
 }
 
 /// The checksum of `name` in the release's signed list.
@@ -75,7 +148,8 @@ async fn expected_sum(client: &reqwest::Client, repo: &str, tag: &str, name: &st
         let sig = get(format!("{base}/SHA256SUMS.sig"))
             .await
             .context("release not signed (yet) - not installing; try again later")?;
-        verify_release(RELEASE_KEYS, tag, &sums, &sig)?;
+        let cert = get(format!("{base}/release-key.cert")).await.ok();
+        verify_release_sums(tag, &sums, &sig, cert.as_deref())?;
         return signed_sum(&String::from_utf8_lossy(&sums), name)
             .ok_or_else(|| anyhow!("{name} is not in the release's signed checksums"));
     }
@@ -260,31 +334,133 @@ pub async fn install(client: &reqwest::Client, tag: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// The old check (root keys only, no certificate).
+    fn v(roots: &[&str], tag: &str, sums: &[u8], sig: &[u8]) -> Result<()> {
+        verify_with(&Trust { roots, revoked: &[] }, tag, sums, sig, None, "0.27.0", 0)
+    }
+
+    fn b64sig(k: &SigningKey, msg: &[u8]) -> String {
+        crate::keys::b64(&k.sign(msg).to_bytes())
+    }
+
+    #[test]
+    fn the_release_key_certificate_in_the_repository_holds() {
+        let c: KeyCert = serde_json::from_str(include_str!("../release-key.cert")).unwrap();
+        let sig = crate::keys::unb64(&c.sig).unwrap();
+        assert!(
+            ROOT_KEYS
+                .iter()
+                .any(|k| verifies(k, &cert_message(&c.key, c.expires_ms), &sig)),
+            "release-key.cert must be signed by a root key"
+        );
+        assert!(!REVOKED_KEYS.contains(&c.key.as_str()));
+    }
+
+    #[test]
+    fn release_keys_certified_by_a_root_key() {
+        let root = SigningKey::from_bytes(&[1u8; 32]);
+        let other_root = SigningKey::from_bytes(&[2u8; 32]);
+        let rel = SigningKey::from_bytes(&[3u8; 32]);
+        let root_pk = crate::keys::b64(root.verifying_key().as_bytes());
+        let rel_pk = crate::keys::b64(rel.verifying_key().as_bytes());
+        let roots = [root_pk.as_str()];
+        let sums = b"abc  meshvpn-x86_64-unknown-linux-musl.tar.gz\n";
+        let day = 86_400_000u64;
+        let cert = |by: &SigningKey, expires_ms: u64| {
+            serde_json::to_vec(&KeyCert {
+                key: rel_pk.clone(),
+                expires_ms,
+                expires: String::new(),
+                sig: b64sig(by, &cert_message(&rel_pk, expires_ms)),
+            })
+            .unwrap()
+        };
+        let sig = b64sig(&rel, &release_message("v0.28.0", sums));
+        let check = |cert: Option<&[u8]>, revoked: &[&str], running: &str, now: u64| {
+            let trust = Trust { roots: &roots, revoked };
+            verify_with(&trust, "v0.28.0", sums, sig.as_bytes(), cert, running, now)
+        };
+        let good = cert(&root, 400 * day);
+        assert!(
+            check(Some(&good), &[], "0.27.2", 10 * day).is_ok(),
+            "certified release key"
+        );
+        assert!(
+            check(None, &[], "0.27.2", 10 * day).is_err(),
+            "no certificate: only root keys count"
+        );
+        assert!(
+            check(Some(&cert(&other_root, 400 * day)), &[], "0.27.2", 10 * day).is_err(),
+            "certified by an unknown key"
+        );
+        assert!(check(Some(&good), &[&rel_pk], "0.27.2", 10 * day).is_err(), "revoked");
+        // Expired: no updates signed with it, but this version's own files still check out.
+        assert!(
+            check(Some(&good), &[], "0.27.2", 401 * day).is_err(),
+            "expired, for an update"
+        );
+        assert!(
+            check(Some(&good), &[], "0.28.0", 401 * day).is_ok(),
+            "expired, this version's own release"
+        );
+        // A certificate whose dates were changed afterwards.
+        let mut c: KeyCert = serde_json::from_slice(&good).unwrap();
+        c.expires_ms = 9_000 * day;
+        assert!(
+            check(Some(&serde_json::to_vec(&c).unwrap()), &[], "0.27.2", 500 * day).is_err(),
+            "changed date"
+        );
+        // A root key may still sign a release itself.
+        let root_sig = b64sig(&root, &release_message("v0.28.0", sums));
+        assert!(
+            verify_with(
+                &Trust {
+                    roots: &roots,
+                    revoked: &[]
+                },
+                "v0.28.0",
+                sums,
+                root_sig.as_bytes(),
+                None,
+                "0.27.2",
+                0
+            )
+            .is_ok()
+        );
+        // The release key's signature for another version doesn't count.
+        assert!(
+            verify_with(
+                &Trust {
+                    roots: &roots,
+                    revoked: &[]
+                },
+                "v0.28.1",
+                sums,
+                sig.as_bytes(),
+                Some(&good),
+                "0.27.2",
+                0
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn release_signatures() {
-        use ed25519_dalek::{Signer, SigningKey};
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let pk = crate::keys::b64(sk.verifying_key().as_bytes());
         let sums = b"abc123  meshvpn-x86_64-unknown-linux-musl.tar.gz\ndef456  install.sh\n";
         let sig = crate::keys::b64(&sk.sign(&release_message("v0.27.0", sums)).to_bytes());
-        assert!(verify_release(&[&pk], "v0.27.0", sums, sig.as_bytes()).is_ok());
+        assert!(v(&[&pk], "v0.27.0", sums, sig.as_bytes()).is_ok());
         assert!(
-            verify_release(&[&pk], "0.27.0", sums, sig.as_bytes()).is_ok(),
+            v(&[&pk], "0.27.0", sums, sig.as_bytes()).is_ok(),
             "with or without the v"
         );
-        assert!(
-            verify_release(&[&pk], "v0.27.1", sums, sig.as_bytes()).is_err(),
-            "another tag"
-        );
-        assert!(
-            verify_release(&[&pk], "v0.27.0", b"x", sig.as_bytes()).is_err(),
-            "other sums"
-        );
-        assert!(
-            verify_release(RELEASE_KEYS, "v0.27.0", sums, sig.as_bytes()).is_err(),
-            "another key"
-        );
+        assert!(v(&[&pk], "v0.27.1", sums, sig.as_bytes()).is_err(), "another tag");
+        assert!(v(&[&pk], "v0.27.0", b"x", sig.as_bytes()).is_err(), "other sums");
+        assert!(v(ROOT_KEYS, "v0.27.0", sums, sig.as_bytes()).is_err(), "another key");
         assert_eq!(
             signed_sum(std::str::from_utf8(sums).unwrap(), "install.sh").as_deref(),
             Some("def456")
@@ -298,7 +474,7 @@ mod tests {
         // scripts/sign-release.sh: openssl pkeyutl -sign -rawin, base64url without padding.
         let key = "Gv_DzljIyxqS1MSKeDBNz5o2Q1L1LklPqxsZs1RzMy0";
         let sig = "hAbSq0Z-ojsEd5vDcCt6WgnyVHL1ZPzTz9h06JpOMpg_1Pkd8QbLZbnD2mAHLzb93SXRmc2R5q_AVPvLs-9FCA";
-        assert!(verify_release(&[key], "v0.27.0", b"abc  x.tar.gz\n", sig.as_bytes()).is_ok());
+        assert!(v(&[key], "v0.27.0", b"abc  x.tar.gz\n", sig.as_bytes()).is_ok());
     }
 
     #[test]

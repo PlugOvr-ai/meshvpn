@@ -189,7 +189,11 @@ jobs:
       contents: write
     # Published only when every end-to-end test passed.
     needs: [build, macos, windows, desktop, e2e]
+    # GitHub's own runners only: the release key must never reach a self-hosted machine.
     runs-on: ubuntu-latest
+    # The release key (secret MESHVPN_RELEASE_KEY) lives in this environment, which only `v*` tags
+    # may use.
+    environment: release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -217,6 +221,31 @@ jobs:
           for f in *.tar.gz *.zip *.run; do [ -e "$f" ] || continue; sha256sum "$f" > "$f.sha256"; done
           sha256sum -- meshvpn-* *.deb *.rpm install.sh install.ps1 deploy.sh | grep -v '\.sha256$' > SHA256SUMS
           ls -l
+
+      - name: Sign (release key, certified by a root key; see src/update.rs)
+        working-directory: dist
+        env:
+          RELEASE_KEY: ${{ secrets.MESHVPN_RELEASE_KEY }}
+        run: |
+          set -eu
+          test -n "$RELEASE_KEY" || { echo "no release key (secret MESHVPN_RELEASE_KEY in the environment release)"; exit 1; }
+          b64url() { base64 | tr '+/' '-_' | tr -d '=\n'; }
+          umask 077
+          k="$(mktemp)"
+          printf '%s\n' "$RELEASE_KEY" > "$k"
+          { printf 'meshvpn release v1\n%s\n' "${TAG#v}"; cat SHA256SUMS; } > "$RUNNER_TEMP/msg"
+          openssl pkeyutl -sign -inkey "$k" -rawin -in "$RUNNER_TEMP/msg" -out "$RUNNER_TEMP/sig.bin"
+          openssl pkey -in "$k" -pubout -out "$RUNNER_TEMP/pub.pem"
+          rm -f "$k"
+          b64url < "$RUNNER_TEMP/sig.bin" > SHA256SUMS.sig
+          cp ../release-key.cert .
+          # The certificate must be for this key, valid, and not about to run out.
+          pub="$(openssl pkey -pubin -in "$RUNNER_TEMP/pub.pem" -outform DER | tail -c 32 | b64url)"
+          test "$(jq -r .key release-key.cert)" = "$pub" || { echo "release-key.cert is for another key"; exit 1; }
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin -in "$RUNNER_TEMP/msg" -sigfile "$RUNNER_TEMP/sig.bin"
+          left=$(( ($(jq -r .expires_ms release-key.cert) / 1000 - $(date +%s)) / 86400 ))
+          test "$left" -gt 0 || { echo "release-key.cert has expired - certify the key again (scripts/certify-release-key.sh)"; exit 1; }
+          if [ "$left" -lt 30 ]; then echo "::warning::release-key.cert expires in $left days - certify the key again (scripts/certify-release-key.sh)"; fi
 
       - name: Release notes
         run: |
