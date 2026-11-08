@@ -11,6 +11,7 @@ attacker needed and what they could do.
 ## [Unreleased]
 
 ### Changed
+- README: a note that meshvpn is early (before 1.0) software, provided as is, at your own risk.
 - `net matrix`: the age of a measurement in the largest unit that fits (`17m`, `5h`, `2d`), not in
   seconds. `--json` still gives seconds.
 

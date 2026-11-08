@@ -14,6 +14,12 @@ laptop (behind NAT) ───► server (public IP) ◄─── ssh -R ──�
             └───────────── relayed through server, end-to-end encrypted ──────────┘
 ```
 
+> **Early software, use at your own risk.** meshvpn is before version 1.0: it is still developing quickly,
+> and its behaviour, configuration and protocol can change between releases. It is provided "as is", without
+> warranty of any kind and with liability excluded as far as the law permits (Apache License 2.0, sections 7 and
+> 8). Test it before you rely on it, keep other access to important machines, and don't use it where a failure
+> could endanger people or cause serious damage.
+
 **New here? The [tutorial](docs/tutorial.md) builds a complete network step by step**, from the first node to
 containers without root, SSH, the browser desktop and troubleshooting. **Training across machines?** See
 [distributed training](docs/distributed-training.md), with a [small example](examples/distributed-training).
