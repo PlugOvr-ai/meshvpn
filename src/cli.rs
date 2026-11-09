@@ -283,8 +283,11 @@ enum Cmd {
         /// Local port for the viewer (default: any free one).
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// Only print the link, don't open a browser.
+        /// Also open the link in a browser here (default: only print it).
         #[arg(long)]
+        open: bool,
+        /// Old flag; printing only is now the default.
+        #[arg(long, hide = true)]
         no_browser: bool,
         /// Which desktop: xfce, mate or cinnamon (installed on the node with `meshvpn desktop setup
         /// --desktop`), or plain (meshvpn's built-in minimal one). Default: the node's choice.
@@ -1816,6 +1819,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             node,
             user,
             port,
+            open,
             no_browser,
             session,
             xfce,
@@ -1881,7 +1885,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                 if std::env::var_os("MESHVPN_DESKTOP_BRIDGE").is_some() {
                     let mut target = desktop::client::Target::test(&node, user.as_deref());
                     target.session = desktop_session(session.as_deref(), xfce, plain, screen);
-                    desktop::client::run(target, port, !no_browser)?;
+                    desktop::client::run(target, port, open && !no_browser)?;
                     return Ok(0);
                 }
                 let st = agent::status(&dir)?;
@@ -1903,7 +1907,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                         control: None,
                     },
                     port,
-                    !no_browser,
+                    open && !no_browser,
                 )?;
             }
         },

@@ -417,7 +417,7 @@ shows `ssh server: built-in` when it is active.
 ## Remote desktop in the browser
 
 ```sh
-meshvpn desktop gpu-box            # opens the desktop of gpu-box in your browser
+meshvpn desktop gpu-box            # prints a link to gpu-box's desktop (--open: open a browser too)
 meshvpn desktop gpu-box -u ubuntu  # as another account
 ```
 

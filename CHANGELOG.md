@@ -10,6 +10,14 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-11-09
+
+### Changed
+
+- `meshvpn desktop <node>` and `d` in the console no longer open a browser by themselves (under WSL
+  that started an X browser). They print the link, clickable in the terminal; `--open` opens a
+  browser as before. `--no-browser` is still accepted.
+
 ## [0.28.1] - 2026-11-08
 
 The first release that meshvpn update verifies through the release key alone. Machines on 0.27.x

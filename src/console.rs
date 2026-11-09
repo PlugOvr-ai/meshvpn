@@ -502,11 +502,7 @@ impl App {
                 ];
                 match crate::desktop::client::ssh_hint(v.port) {
                     Some(h) => lines.extend(h),
-                    None => lines.push(if crate::desktop::client::open_url(&v.url) {
-                        "Opened in your browser.".into()
-                    } else {
-                        "Open the link in a browser on this machine.".into()
-                    }),
+                    None => lines.push("Ctrl+click the link, or copy it into a browser on this machine.".into()),
                 }
                 lines.push(String::new());
                 lines.push("It stays available until you quit the console. (any key closes this)".into());
@@ -523,7 +519,7 @@ impl App {
                 "meshvpn console - the mesh in your terminal",
                 "",
                 "Nodes tab:   ↑↓ select   Enter shell   u shell as another user",
-                "             d desktop (opens the browser)   r refresh   q quit",
+                "             d desktop (shows a link)   r refresh   q quit",
                 "",
                 "Anywhere:    Alt+0 nodes, Alt+1..9 shells, Alt+←/→ previous/next",
                 "             or Ctrl+B then: 0..9, n, p, w close tab, d desktop, ? help",

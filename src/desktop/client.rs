@@ -110,7 +110,8 @@ pub fn start(target: Target, port: u16) -> Result<Viewer> {
     Ok(Viewer { url, port })
 }
 
-/// `meshvpn desktop <node>`: print the link, open the browser, serve until Ctrl+C.
+/// `meshvpn desktop <node>`: print the link (clickable in the terminal), open a browser only
+/// with `--open`, serve until Ctrl+C. Opening by default started an X browser under WSL.
 pub fn run(mut target: Target, port: u16, open_browser: bool) -> Result<()> {
     let label = target.label();
     // No key for the node: log in once now (password), every tab uses that connection.
@@ -118,7 +119,7 @@ pub fn run(mut target: Target, port: u16, open_browser: bool) -> Result<()> {
         target.control = target.remote.login(&target.node)?;
     }
     let v = start(target, port)?;
-    println!("Desktop of {label}: {}", v.url);
+    println!("Desktop of {label}: {}", terminal_link(&v.url));
     match ssh_hint(v.port) {
         Some(lines) => {
             for l in lines {
@@ -126,7 +127,9 @@ pub fn run(mut target: Target, port: u16, open_browser: bool) -> Result<()> {
             }
         }
         None => {
-            if open_browser && !open_url(&v.url) {
+            if !open_browser {
+                println!("Ctrl+click the link (or copy it into a browser on this machine).");
+            } else if !open_url(&v.url) {
                 println!("(open it in a browser on this machine)");
             }
         }
@@ -163,6 +166,23 @@ pub fn ssh_hint(port: u16) -> Option<Vec<String>> {
         "  (or in this SSH session: press Enter, type ~C, then".into(),
         format!("   -L {port}:127.0.0.1:{port} and Enter) - then open the link there."),
     ])
+}
+
+/// The URL as a terminal hyperlink (OSC 8) when stdout is a terminal; terminals without
+/// hyperlinks ignore the escape and show the plain URL, which most of them link by themselves.
+pub fn terminal_link(url: &str) -> String {
+    use std::io::IsTerminal;
+    // Windows: only Windows Terminal; the old console window would print the escape as text.
+    let capable = if cfg!(windows) {
+        std::env::var_os("WT_SESSION").is_some()
+    } else {
+        std::env::var("TERM").map_or(true, |t| t != "dumb")
+    };
+    if std::io::stdout().is_terminal() && capable {
+        format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+    } else {
+        url.to_string()
+    }
 }
 
 pub fn open_url(url: &str) -> bool {
