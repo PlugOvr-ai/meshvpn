@@ -556,6 +556,9 @@ impl Node {
         let mut st = self.state.lock().unwrap();
         if let Some(m) = self.accept_claim(&mut st, msg)? {
             self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None);
+            // The others dropped our record while we weren't admitted, and a copy that came
+            // before the admission was refused: send it again, after the admission on each link.
+            self.announce(&mut st);
         }
         Ok(match &t.client {
             Some(c) => format!(

@@ -10,14 +10,17 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
-## [0.29.1] - 2026-11-10
+## [0.29.2] - 2026-11-10
 
-0.29.0 was tagged but never released: its tests found bugs in the new gossip, fixed here. A new
-node's name reached `/etc/hosts` and its route was set up up to 10 s late, and SSH keys added just
-before a node linked up reached it up to 2 s late. In networks of up to 32 nodes, records now
-spread as in 0.28 (every link-up re-announces at once).
+0.29.0 and 0.29.1 were tagged but never released: their tests found bugs in the new gossip, fixed
+here. A new node's name reached `/etc/hosts` and its route was set up up to 10 s late, and SSH keys
+added just before a node linked up reached it up to 2 s late. In networks of up to 32 nodes, records
+now spread as in 0.28 (every link-up re-announces at once).
 
 ### Fixed
+- A client renewing its time (`meshvpn join <new client invite>`) could stay unreachable for up to
+  a minute: the others had dropped its record when its time was up and refused the copy that came
+  before the renewal. It now sends its record again right after the renewal.
 - Two networks on one machine could lose each other's names in `/etc/hosts`: both meshvpn
   processes rewrote the file at the same moment, each without the other's block. The rewrite now
   takes a lock (`/etc/hosts.meshvpn-lock`).
