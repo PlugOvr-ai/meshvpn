@@ -292,7 +292,6 @@ pub fn install_desktop(name: &str) -> Result<()> {
     Ok(())
 }
 
-
 /// A browser older than this has missed security fixes: Chromium publishes them about weekly.
 const BROWSER_OLD_DAYS: u64 = 30;
 

@@ -878,9 +878,7 @@ impl Node {
     /// After a link came up or went down: re-announce if the record changes, but not more often
     /// than `LINK_ANNOUNCE_GAP`.
     fn links_changed(self: &Arc<Self>, st: &mut State) {
-        if st.announce_pending
-            || (self.neighbor_list(st) == st.my_neighbors && self.endpoints(st) == st.my_endpoints)
-        {
+        if st.announce_pending || (self.neighbor_list(st) == st.my_neighbors && self.endpoints(st) == st.my_endpoints) {
             return;
         }
         let since = st.last_announce.map_or(LINK_ANNOUNCE_GAP, |t| t.elapsed());
@@ -998,15 +996,20 @@ impl Node {
                 old.push(*id);
             }
         }
-        // The owner sent the record to all its links itself. Of the nodes we know, the share
-        // it has no link to is what forwarding has to reach: about none in a full mesh (the
-        // digests find the rest), all in a sparse one.
-        let others = st.records.len().saturating_sub(1).max(1) as f64;
-        let linked = (info.links as usize).max(info.neighbors.len()) as f64;
-        let missing = ((others - linked) / others).clamp(0.0, 1.0);
-        // Nodes of an older version have no digests to catch up with: they always get it.
-        if !rand::Rng::gen_bool(&mut rand::thread_rng(), missing) {
-            return old;
+        // The owner sent the record to all its links itself. When its record lists all of them,
+        // the nodes above are exactly the ones still missing it. When the list is cut short
+        // (NEIGHBORS_MAX), only the share of the other nodes it has no link to is: about none
+        // in a full mesh (the digests find the rest), all in a sparse one.
+        if (info.links as usize) > info.neighbors.len() {
+            // The other nodes we know, and the owner's links to them (not to us).
+            let others = st.records.len().saturating_sub(1).max(1) as f64;
+            let to_us = usize::from(st.links.contains_key(&info.id));
+            let linked = (info.links as usize).saturating_sub(to_us) as f64;
+            let missing = ((others - linked) / others).clamp(0.0, 1.0);
+            // Nodes of an older version have no digests to catch up with: they always get it.
+            if !rand::Rng::gen_bool(&mut rand::thread_rng(), missing) {
+                return old;
+            }
         }
         new.shuffle(&mut rand::thread_rng());
         new.truncate(FANOUT);
@@ -2795,6 +2798,8 @@ impl Node {
             }
         }
         info!("link up: {} ({}) via {}", info.name, peer, addr);
+        // The record came with the hello: the gossip that follows brings nothing new.
+        self.update_hosts();
         Ok(Established {
             peer,
             link_id,

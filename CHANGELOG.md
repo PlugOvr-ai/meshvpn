@@ -10,7 +10,10 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
-## [0.29.0] - 2026-11-10
+## [0.29.1] - 2026-11-10
+
+0.29.0 was tagged but never released: its tests found two bugs in the new gossip (names reached
+`/etc/hosts` up to 10 s late, and small networks learned of new nodes late). Both are fixed here.
 
 ### Added
 - **Xfce without root again**: `install.sh | sh -s -- --user --desktop xfce` puts meshvpn, Xfce and
