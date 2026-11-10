@@ -2,7 +2,7 @@
 name = "meshvpn"
 version = "0.18.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["PlugOvr.ai <cw@plugovr.ai>"]
 description = "Decentralized mesh VPN: no coordination server, relaying, and support for nodes behind a reverse SSH tunnel"
 license = "Apache-2.0"

@@ -69,6 +69,16 @@ pub fn write(network: Option<&str>, block: Option<&str>) -> Result<()> {
         ),
         None => (BEGIN.to_string(), END.to_string()),
     };
+    // One meshvpn per network writes its own block: without the lock, two writing at once
+    // (both linking up to new nodes) would each put back the file without the other's block.
+    // If the lock can't be had, write anyway, as before.
+    let _lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(format!("{HOSTS}.meshvpn-lock"))
+        .ok()
+        .filter(|f| f.lock().is_ok());
     let current = std::fs::read_to_string(HOSTS).unwrap_or_default();
     let mut kept = String::new();
     let mut inside = false;

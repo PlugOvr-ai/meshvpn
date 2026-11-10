@@ -875,9 +875,15 @@ impl Node {
         n
     }
 
-    /// After a link came up or went down: re-announce if the record changes, but not more often
-    /// than `LINK_ANNOUNCE_GAP`.
+    /// After a link came up or went down: re-announce at once, as a new link is often followed
+    /// by something that needs the newest record (a login with keys added since). With more
+    /// links than a record lists, only if the record changes, and not more often than
+    /// `LINK_ANNOUNCE_GAP`: while 200 nodes connect, each would send ~200 records to ~200 links.
     fn links_changed(self: &Arc<Self>, st: &mut State) {
+        if st.links.len() <= NEIGHBORS_MAX {
+            self.announce(st);
+            return;
+        }
         if st.announce_pending || (self.neighbor_list(st) == st.my_neighbors && self.endpoints(st) == st.my_endpoints) {
             return;
         }
@@ -1109,9 +1115,9 @@ impl Node {
         // recomputes them anyway every 10 s.
         let mut structural = false;
         for s in list {
-            let before = Self::shape(&st, &s);
+            let before = self.shape(&st, &s);
             if let Some(id) = self.ingest_id(&mut st, s.clone(), true) {
-                structural |= before.as_ref() != st.records.get(&id).map(|r| Self::shape_of(&r.info)).as_ref();
+                structural |= before != self.shape_of(&st, &id);
                 changed.push((id, s));
             }
         }
@@ -1143,25 +1149,25 @@ impl Node {
         }
     }
 
-    /// What routes, addresses, hosts and known_hosts are made of, of a record we have for the
-    /// node of `s` (None for a node new to us).
-    fn shape(st: &State, s: &SignedInfo) -> Option<String> {
+    /// What routes, addresses, names, logins and known_hosts are made of, of a record we have
+    /// for the node of `s` (None for a node new to us): the record without what changes with
+    /// every heartbeat (seq, load, measurements, links count), and whether the node is online.
+    fn shape(&self, st: &State, s: &SignedInfo) -> Option<String> {
         // The record's id without verifying: only to find the old record to compare with.
         let (id, _) = s.peek()?;
-        st.records.get(&id).map(|r| Self::shape_of(&r.info))
+        self.shape_of(st, &id)
     }
 
-    fn shape_of(i: &NodeInfo) -> String {
-        format!(
-            "{}|{}|{:?}|{:?}|{:?}|{}|{}",
-            i.name,
-            i.noise_pub.hex(),
-            i.neighbors,
-            i.endpoints,
-            i.ssh_host_key,
-            i.ipv6,
-            i.exit
-        )
+    fn shape_of(&self, st: &State, id: &NodeId) -> Option<String> {
+        let r = st.records.get(id)?;
+        let mut i = r.info.clone();
+        i.seq = 0;
+        i.measured = 0;
+        i.links = 0;
+        i.perf.clear();
+        i.inventory = None;
+        let online = self.is_online(st, id);
+        Some(format!("{online}|{}", serde_json::to_string(&i).unwrap_or_default()))
     }
 
     /// Our digest: (id, seq) of every record we have, our own included.
