@@ -262,7 +262,7 @@ pub fn resolve_mode(want: &str) -> Result<Mode> {
         }
         bail!(
             "{} is not installed on this machine - install it with `sudo meshvpn desktop setup --desktop {}` \
-             there, or use the built-in desktop (--plain)",
+             there (Xfce without root: install.sh --user --desktop xfce), or use the built-in desktop (--plain)",
             m.label(),
             m.name()
         );
@@ -275,7 +275,29 @@ pub fn resolve_mode(want: &str) -> Result<Mode> {
         .unwrap_or(Mode::Plain))
 }
 
+/// A desktop installed without root is in ~/.local/bin, which a login or a daemon often doesn't
+/// have in its PATH. Called first thing in `attach`: nothing else runs yet, and the session and
+/// its programs inherit this.
+fn find_user_desktop() {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let bin = PathBuf::from(home).join(".local/bin");
+    if has_xfce() || !bin.join("xfce4-session").is_file() {
+        return;
+    }
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    paths.push(bin);
+    if let Ok(path) = std::env::join_paths(paths) {
+        // Safety: see above, there are no other threads yet.
+        unsafe { std::env::set_var("PATH", path) };
+    }
+}
+
 pub fn attach(want: &str) -> Result<()> {
+    find_user_desktop();
     let notice = |text: &str| {
         let mut out = std::io::stdout();
         let _ = out.write_all(&frame(S_NOTICE, text.as_bytes()));

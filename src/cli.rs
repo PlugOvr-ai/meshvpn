@@ -537,6 +537,16 @@ enum DesktopCmd {
     Local,
     /// End your desktop session on this machine (closes its applications).
     Stop,
+    /// Point an unpacked packed desktop at another place, of the same length as the one it was
+    /// built for (used by the installer without root).
+    #[command(hide = true)]
+    Relocate {
+        dir: PathBuf,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     /// Connect stdin/stdout to your desktop session (used through SSH by `meshvpn desktop <node>`).
     #[command(hide = true)]
     Attach {
@@ -1873,6 +1883,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     say(json, "no desktop session is running");
                 }
             }
+            Some(DesktopCmd::Relocate { dir, from, to }) => desktop::bundle::relocate(&dir, &from, &to)?,
             Some(DesktopCmd::Attach { session }) => desktop::session::attach(&session)?,
             Some(DesktopCmd::Session { session }) => {
                 init_logging(None)?;

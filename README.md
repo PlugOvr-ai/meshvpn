@@ -451,6 +451,35 @@ applications you want to run.
   runs on the system's Xvfb with Mesa's software rendering (installed with it): fine for office work, slower than the
   others. Screen lockers don't start in Xfce and MATE sessions (they would lock a desktop only a browser shows);
   Cinnamon starts its own, so an idle Cinnamon session can lock and then needs the account's password.
+* **Xfce without root,** for example in a Docker image where you aren't root:
+  `curl -fsSL .../install.sh | sh -s -- --user --desktop xfce join mesh1-...` (or `sh meshvpn-full-<arch>.run join
+  mesh1-...` from the release, for machines without internet). Without a package manager, Xfce comes packed with the
+  Chromium browser and all their libraries: any distribution, x86_64 and ARM64, about 650 MB to download, 1.9 GB in
+  `~/.local` per user. It needs no privileges, user namespaces or changes to how the container is started. The
+  installer changes the path built into the programs to one of the same length, a link like `/tmp/mvx7k` that points to
+  your files, so `/tmp` must be writable, and `HOME` must be set and writable. If `/tmp` is emptied the link comes back
+  when a desktop program starts; if another user has taken the name, nothing runs and installing again picks a new one.
+  Terminals keep using the machine's own programs. Allow logins with `meshvpn ssh allow <user>@<node> --as <you>`, then
+  `meshvpn desktop <node> --user <you>` from the other node. Container users with no name (not in `/etc/passwd`, such
+  as `docker run --user 54321`) log in by number: `--as 54321`, with `HOME` set. Without `/dev/net/tun` this runs in
+  userspace mode, see above.
+  **It doesn't update itself:** a new meshvpn release brings a new browser, so install the newest release regularly
+  (`meshvpn doctor` warns when the browser is over 30 days old). The browser is Chromium as nixpkgs builds it; where the
+  machine blocks user namespaces (default Docker) it runs without its sandbox and shows a warning, so only open sites
+  you trust there. Licences are in `~/.local/share/meshvpn/desktop-full/opt/meshvpn-desktop-full`, the complete source
+  is on the release page as `meshvpn-full-sources-<arch>.tar.gz.part*`. `sh meshvpn-full-<arch>.run --uninstall`
+  removes the desktop and keeps meshvpn. (With root, `install.sh --full` installs the same for the whole machine, in
+  `/nix/store`; the package manager's desktop above is the better choice there.)
+* **Built into a Docker image,** so that nobody has to install it and the 1.9 GB survive new containers (use your
+  image's user in `--chown`: without it, a non-root user can't delete the file from `/tmp`):
+  ```dockerfile
+  COPY --chown=1000:1000 meshvpn-full-x86_64.run /tmp/full.run
+  RUN sh /tmp/full.run && rm -f /tmp/full.run
+  ```
+  Containers usually have no systemd or cron, so **nothing starts meshvpn after a restart: run `~/.local/bin/meshvpn up`
+  in the background from your entrypoint.** Join when the container first starts, not in the Dockerfile, or all
+  containers of the image would be the same node, and keep `~/.config/meshvpn` on a volume so that a new container stays
+  that node. A read-only root works (`--read-only --tmpfs /tmp`) as long as the home is writable.
 * **The GPU for 3D and for the picture:** `sudo meshvpn desktop setup --gpu` on the node installs VirtualGL, ffmpeg and
   the system's Xvfb. From then on OpenGL programs in desktop sessions render on a GPU the user may use (VirtualGL with
   EGL, for every program of the session, the desktop's compositor included; with bookings the booked GPU, since only its
@@ -623,13 +652,15 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
   both).
 * Invites are bearer secrets: whoever has one can join (until it is used up or expires). Members see the tickets in
   each other's admissions, but can't use them: a ticket counts only together with the invite's one-time key.
-* IPv4 only, Linux only (the TUN setup and systemd integration).
+* The first network has IPv4 and IPv6 mesh addresses (macOS: IPv4 only). Platform differences: see the table at the
+  top.
 * Direct UDP paths work through the common kinds of NAT (one public port per internal port, as most home routers do).
   "Hard" NATs that use a new port for every destination (some carrier-grade NATs and corporate firewalls) can't be
   punched through. Those nodes keep using TCP and relays, which is slower on lossy links (TCP-over-TCP). For the best
   results, allow UDP on port 7870 in front of public nodes, as you do for TCP. Switch it off with `udp = false`.
   `meshvpn net why <node>` tells you which case you're in.
-* The mesh is full-mesh by design, which suits networks of up to a few dozen nodes.
+* Every node keeps a link to every other node. Tested with up to 200 nodes on one machine (about 175 kB/s per
+  node at rest, see `docs/design-scaling.md`); much larger networks need links on demand, which isn't built yet.
 * Overlay IPs come from a 22-bit hash. A collision is unlikely in small networks; if one happens, the node with the
   lower id keeps the address.
 

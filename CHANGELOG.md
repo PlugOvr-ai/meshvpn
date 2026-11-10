@@ -10,6 +10,27 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-10
+
+### Added
+- **Xfce without root again**: `install.sh | sh -s -- --user --desktop xfce` puts meshvpn, Xfce and
+  Chromium into `~/.local`, for machines and Docker images without root. It is the packed desktop
+  of 0.22 (`--full`), which 0.23 had dropped by mistake. `meshvpn doctor` warns when its browser is
+  older than 30 days. The README shows how to build it into a Docker image.
+- `tests/load/run.py`: a load test with one container per node (and `--old-binary` for a network in
+  mid-upgrade); the numbers are in `docs/design-scaling.md`.
+
+### Changed
+- **Networks of 100 and more nodes.** Records of other nodes are no longer flooded to every link:
+  nodes exchange digests (which record versions they have) and pull what they miss, and forward a
+  record only to a few links. A node lists at most 32 of its links in its record, and re-announces
+  it at most every 2 s while links come and go. Records that bring nothing new are dropped before
+  the signature check. Measured at rest per node: 50 nodes 17 kB/s instead of 738 kB/s, 100 nodes
+  66 kB/s instead of 10 MB/s; 200 nodes now work (175 kB/s), where before the test machine ran out
+  of memory. Networks with older nodes keep working: those still get every record as before.
+- `install.sh --desktop` without root no longer aborts the whole install: Xfce comes as the packed
+  desktop, MATE and Cinnamon are skipped with a warning and meshvpn is installed without them.
+
 ## [0.28.2] - 2026-11-09
 
 ### Changed

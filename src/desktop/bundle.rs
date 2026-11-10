@@ -292,6 +292,115 @@ pub fn install_desktop(name: &str) -> Result<()> {
     Ok(())
 }
 
+
+/// A browser older than this has missed security fixes: Chromium publishes them about weekly.
+const BROWSER_OLD_DAYS: u64 = 30;
+
+/// The browser of a packed desktop, as its installer describes it (desktop/build-full.sh).
+#[derive(Debug, PartialEq)]
+pub struct PackedBrowser {
+    pub version: String,
+    pub days_old: u64,
+}
+
+impl PackedBrowser {
+    pub fn is_old(&self) -> bool {
+        self.days_old > BROWSER_OLD_DAYS
+    }
+}
+
+fn parse_packed_browser(text: &str, now_secs: u64) -> Option<PackedBrowser> {
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::trim))
+    };
+    let date: u64 = field("date")?.parse().ok()?;
+    Some(PackedBrowser {
+        version: field("chromium")?.to_string(),
+        days_old: now_secs.saturating_sub(date) / 86400,
+    })
+}
+
+/// The installed packed desktop's browser, if there is one (the user's own wins, as in `find`).
+pub fn packed_browser() -> Option<PackedBrowser> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let own = user_base().map(|b| b.with_file_name("desktop-full/opt/meshvpn-desktop-full/browser"));
+    [own, Some(PathBuf::from("/opt/meshvpn-desktop-full/browser"))]
+        .into_iter()
+        .flatten()
+        .find_map(|f| parse_packed_browser(&std::fs::read_to_string(f).ok()?, now))
+}
+
+/// The packed desktop was built for /nix/store, and that path is compiled into its programs and
+/// libraries. Without root it can't be there, so every mention becomes another path of the same
+/// length, which leaves the offsets inside the files valid.
+#[cfg(not(unix))]
+pub fn relocate(_dir: &Path, _from: &str, _to: &str) -> Result<()> {
+    bail!("the packed desktop is for Linux")
+}
+
+#[cfg(unix)]
+pub fn relocate(dir: &Path, from: &str, to: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if from.len() != to.len() || from.is_empty() {
+        bail!("the new path must be as long as the old one: {from} and {to}");
+    }
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        // Nix makes everything read-only, and removing it later needs this too.
+        let mode = std::fs::symlink_metadata(&d)?.permissions().mode();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode | 0o700))
+            .with_context(|| format!("changing {}", d.display()))?;
+        for entry in std::fs::read_dir(&d).with_context(|| format!("reading {}", d.display()))? {
+            let path = entry?.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                todo.push(path);
+            } else if meta.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                let text = target.to_string_lossy();
+                if text.contains(from) {
+                    let new = text.replace(from, to);
+                    std::fs::remove_file(&path)?;
+                    std::os::unix::fs::symlink(new, &path).with_context(|| format!("changing {}", path.display()))?;
+                }
+            } else if meta.is_file() {
+                let mut data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                if replace_same_length(&mut data, from.as_bytes(), to.as_bytes()) > 0 {
+                    let mode = meta.permissions().mode();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o200))?;
+                    std::fs::write(&path, &data).with_context(|| format!("changing {}", path.display()))?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_same_length(data: &mut [u8], from: &[u8], to: &[u8]) -> usize {
+    let mut found = 0;
+    let mut at = 0;
+    while at + from.len() <= data.len() {
+        // The first byte alone rules out nearly every place: this reads 2 GB in seconds.
+        let Some(next) = data[at..=data.len() - from.len()].iter().position(|b| *b == from[0]) else {
+            break;
+        };
+        at += next;
+        if &data[at..at + from.len()] == from {
+            data[at..at + from.len()].copy_from_slice(to);
+            found += 1;
+            at += from.len();
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
 pub fn archive_name() -> String {
     format!("meshvpn-desktop-{}.tar.gz", std::env::consts::ARCH)
 }
@@ -373,4 +482,63 @@ fn install(data: &[u8]) -> Result<Bundle> {
     let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::remove_dir_all(&old);
     Ok(Bundle { dir: dest })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_browser_age() {
+        let day = 86400;
+        let b = parse_packed_browser("chromium=156.0.1\nnixpkgs=abc\ndate=1000\n", 1000 + 31 * day).unwrap();
+        assert_eq!(b.version, "156.0.1");
+        assert_eq!(b.days_old, 31);
+        assert!(b.is_old());
+        assert!(
+            !parse_packed_browser("chromium=1\ndate=1000\n", 1000 + 30 * day)
+                .unwrap()
+                .is_old()
+        );
+        // A clock behind the build isn't old, and a file we can't read isn't anything.
+        assert_eq!(parse_packed_browser("chromium=1\ndate=1000\n", 5).unwrap().days_old, 0);
+        assert!(parse_packed_browser("chromium=1\n", 5).is_none());
+        assert!(parse_packed_browser("chromium=1\ndate=soon\n", 5).is_none());
+    }
+
+    #[test]
+    fn relocating_keeps_every_offset() {
+        let mut data = b"/nix/store/a\0/nix/stor\0x/nix/store".to_vec();
+        let len = data.len();
+        assert_eq!(replace_same_length(&mut data, b"/nix/store", b"/tmp/mvab1"), 2);
+        assert_eq!(data, b"/tmp/mvab1/a\0/nix/stor\0x/tmp/mvab1");
+        assert_eq!(data.len(), len);
+        let mut short = b"/nix".to_vec();
+        assert_eq!(replace_same_length(&mut short, b"/nix/store", b"/tmp/mvab1"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relocating_a_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mv-relocate-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("prog"), b"run /nix/store/x").unwrap();
+        std::fs::set_permissions(sub.join("prog"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(sub.join("other"), b"nothing").unwrap();
+        std::os::unix::fs::symlink("/nix/store/y", sub.join("link")).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", sub.join("kept")).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        relocate(&dir, "/nix/store", "/tmp/mvab1").unwrap();
+        assert_eq!(std::fs::read(sub.join("prog")).unwrap(), b"run /tmp/mvab1/x");
+        assert_eq!(
+            std::fs::metadata(sub.join("prog")).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(std::fs::read_link(sub.join("link")).unwrap(), Path::new("/tmp/mvab1/y"));
+        assert_eq!(std::fs::read_link(sub.join("kept")).unwrap(), Path::new("/elsewhere"));
+        assert!(relocate(&dir, "/nix/store", "/short").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -31,6 +31,11 @@ pub const T_EXT: u8 = 17;
 /// `meshvpn net why`: test the direct path together, and what each side saw.
 pub const T_WHY: u8 = 18;
 pub const T_WHY_REPLY: u8 = 19;
+/// Which records a node has: (node id, seq) pairs, 40 bytes each, to one neighbor at a time.
+/// The neighbor sends back what is newer on its side and asks (`T_WANT`) for what is newer here.
+pub const T_DIGEST: u8 = 20;
+/// The records of these node ids, please (32 bytes each).
+pub const T_WANT: u8 = 21;
 
 /// A JSON document signed by a node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -228,6 +233,13 @@ pub struct NodeInfo {
     /// Has its IPv6 address in the mesh: others send it IPv6 (older nodes have none).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ipv6: bool,
+    /// Exchanges digests (`T_DIGEST`): records are forwarded to it by a few nodes only, not by
+    /// every node that has them (older nodes get every record from everyone, as before).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub digest: bool,
+    /// How many links this node has; `neighbors` names only some of them in a big mesh.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub links: u64,
 }
 
 /// GPUs of a node reserved for someone until `expires` (ms since epoch).
@@ -393,6 +405,18 @@ impl SignedInfo {
     }
 
     /// Checks the signature and that the record belongs to network `net`.
+    /// Node id and seq, read without checking the signature: only to skip records that are
+    /// not newer than what we have before the costly part.
+    pub fn peek(&self) -> Option<(NodeId, u64)> {
+        #[derive(Deserialize)]
+        struct Peek {
+            id: NodeId,
+            seq: u64,
+        }
+        let p: Peek = serde_json::from_str(&self.data).ok()?;
+        Some((p.id, p.seq))
+    }
+
     pub fn verify(&self, net: &str) -> Result<NodeInfo> {
         let info: NodeInfo = serde_json::from_str(&self.data)?;
         verify(&info.id, self.data.as_bytes(), &unb64(&self.sig)?)?;
@@ -657,6 +681,8 @@ mod tests {
             login_user: None,
             exit: false,
             ipv6: false,
+            digest: false,
+            links: 0,
             version: String::new(),
         }
     }

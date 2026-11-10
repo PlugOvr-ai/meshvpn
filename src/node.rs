@@ -55,6 +55,24 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const FORGET_AFTER_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Gossip messages stay well below the 64 KB link frame limit.
 const GOSSIP_BYTES: usize = 48 * 1024;
+/// Links a new record is passed on to, besides older nodes (which get every record from
+/// everyone). Digests (`DIGEST_EVERY`) catch what this misses.
+const FANOUT: usize = 4;
+/// A digest to one random neighbor this often.
+const DIGEST_EVERY: Duration = Duration::from_secs(10);
+/// Gossip waits for nothing: when this many frames are queued for a link (a slow or stuck
+/// peer), records for it are dropped, and the next digest sends what it still needs.
+const GOSSIP_QUEUE: usize = 64;
+/// Digests leave out records signed in the last seconds: forwarding is still delivering them,
+/// and sending them again would only double the traffic. (A record's seq is its signing time.)
+const DIGEST_GRACE_MS: u64 = 5_000;
+/// A record names at most this many of the links to nodes others can dial (links to nodes
+/// nobody can dial are always named: the others reach those only through us). Enough for relay
+/// routes; a record listing all links of a big mesh would grow with every node.
+const NEIGHBORS_MAX: usize = 32;
+/// A link coming up or going down re-announces the record at most this often (while a big
+/// mesh forms, every node gets hundreds of links within seconds).
+const LINK_ANNOUNCE_GAP: Duration = Duration::from_secs(2);
 /// An offline node whose name is now used by a newer, online node (typically the same machine
 /// set up again) is forgotten automatically after this long.
 const AUTO_FORGET_AFTER: Duration = Duration::from_secs(600);
@@ -162,6 +180,11 @@ struct State {
     extra_bootstrap: Vec<String>,
     my_seq: u64,
     my_signed: Option<SignedInfo>,
+    /// The `neighbors` of `my_signed`.
+    my_neighbors: Vec<NodeId>,
+    last_announce: Option<Instant>,
+    /// A link change is waiting for `LINK_ANNOUNCE_GAP` to pass.
+    announce_pending: bool,
     my_endpoints: Vec<String>,
     hosts_written: String,
     known_hosts_written: String,
@@ -827,9 +850,58 @@ impl Node {
         eps
     }
 
+    /// The links this node's record names (see `NEIGHBORS_MAX`): all of them in a small mesh;
+    /// in a big one those to nodes nobody can dial, and of the rest the ones whose pair hash is
+    /// lowest. Both ends of a pair rank it the same, so a named link is mostly named by both,
+    /// as relay routes require.
+    fn neighbor_list(&self, st: &State) -> Vec<NodeId> {
+        let mut n: Vec<NodeId> = st.links.keys().copied().collect();
+        if n.len() > NEIGHBORS_MAX {
+            let me = self.ident.id;
+            let dialable = |p: &NodeId| st.records.get(p).is_some_and(|r| !r.info.endpoints.is_empty());
+            let (mut keep, mut rest): (Vec<NodeId>, Vec<NodeId>) = n.into_iter().partition(|p| !dialable(p));
+            rest.sort_by_cached_key(|p| {
+                let (a, b) = if me < *p { (me, *p) } else { (*p, me) };
+                let mut h = blake3::Hasher::new();
+                h.update(&a.0);
+                h.update(&b.0);
+                *h.finalize().as_bytes()
+            });
+            rest.truncate(NEIGHBORS_MAX);
+            keep.extend(rest);
+            n = keep;
+        }
+        n.sort();
+        n
+    }
+
+    /// After a link came up or went down: re-announce if the record changes, but not more often
+    /// than `LINK_ANNOUNCE_GAP`.
+    fn links_changed(self: &Arc<Self>, st: &mut State) {
+        if st.announce_pending
+            || (self.neighbor_list(st) == st.my_neighbors && self.endpoints(st) == st.my_endpoints)
+        {
+            return;
+        }
+        let since = st.last_announce.map_or(LINK_ANNOUNCE_GAP, |t| t.elapsed());
+        if since >= LINK_ANNOUNCE_GAP {
+            self.announce(st);
+            return;
+        }
+        st.announce_pending = true;
+        let me = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(LINK_ANNOUNCE_GAP - since).await;
+            let mut st = me.state.lock().unwrap();
+            if st.announce_pending {
+                me.announce(&mut st);
+            }
+        });
+    }
+
     fn resign(&self, st: &mut State) {
-        let mut neighbors: Vec<NodeId> = st.links.keys().copied().collect();
-        neighbors.sort();
+        let neighbors = self.neighbor_list(st);
+        st.my_neighbors = neighbors.clone();
         st.my_endpoints = self.endpoints(st);
         st.my_udp = self.udp_candidates(st);
         st.my_udp6 = self.udp6_candidates();
@@ -870,6 +942,8 @@ impl Node {
             measured: st.measured,
             exit: st.exit_offer,
             ipv6: self.my_ip6.is_some(),
+            digest: true,
+            links: st.links.len() as u64,
             ssh_keys: if self.cfg.publish_ssh_keys {
                 local_ssh_keys()
             } else {
@@ -886,9 +960,58 @@ impl Node {
             return;
         }
         self.resign(st);
+        st.last_announce = Some(Instant::now());
+        st.announce_pending = false;
         let signed = st.my_signed.clone().unwrap();
         let f = frame(T_GOSSIP, &serde_json::to_vec(&vec![signed]).unwrap());
-        self.broadcast(st, &f, None);
+        for l in st.links.values() {
+            Self::send_gossip(l, f.clone());
+        }
+    }
+
+    /// Queues gossip for a link unless its queue is long already (see `GOSSIP_QUEUE`).
+    fn send_gossip(l: &LinkEntry, f: Vec<u8>) {
+        if l.tx.max_capacity() - l.tx.capacity() < GOSSIP_QUEUE {
+            let _ = l.tx.try_send(f);
+        }
+    }
+
+    /// Whether `id` exchanges digests (so it needs a record from a few nodes, not all).
+    fn digests(st: &State, id: &NodeId) -> bool {
+        st.records.get(id).is_some_and(|r| r.info.digest)
+    }
+
+    /// The links a record that arrived from `from` goes on to: not its owner, nor the nodes
+    /// the owner has a link to (it sent the record to them itself); of the others every node
+    /// of an older version, and `FANOUT` random ones of the rest.
+    fn gossip_targets(&self, st: &State, info: &NodeInfo, from: NodeId) -> Vec<NodeId> {
+        use rand::seq::SliceRandom;
+        let mut old = vec![];
+        let mut new = vec![];
+        for id in st.links.keys() {
+            if *id == from || *id == info.id || info.neighbors.contains(id) {
+                continue;
+            }
+            if Self::digests(st, id) {
+                new.push(*id);
+            } else {
+                old.push(*id);
+            }
+        }
+        // The owner sent the record to all its links itself. Of the nodes we know, the share
+        // it has no link to is what forwarding has to reach: about none in a full mesh (the
+        // digests find the rest), all in a sparse one.
+        let others = st.records.len().saturating_sub(1).max(1) as f64;
+        let linked = (info.links as usize).max(info.neighbors.len()) as f64;
+        let missing = ((others - linked) / others).clamp(0.0, 1.0);
+        // Nodes of an older version have no digests to catch up with: they always get it.
+        if !rand::Rng::gen_bool(&mut rand::thread_rng(), missing) {
+            return old;
+        }
+        new.shuffle(&mut rand::thread_rng());
+        new.truncate(FANOUT);
+        old.extend(new);
+        old
     }
 
     fn broadcast(&self, st: &State, f: &[u8], except: Option<NodeId>) {
@@ -903,11 +1026,22 @@ impl Node {
 
     /// Accepts a record if it is valid and newer than what we have. Returns true if it changed.
     fn ingest(&self, st: &mut State, signed: SignedInfo, live: bool) -> bool {
+        self.ingest_id(st, signed, live).is_some()
+    }
+
+    /// `ingest`, returning the node whose record changed.
+    fn ingest_id(&self, st: &mut State, signed: SignedInfo, live: bool) -> Option<NodeId> {
+        // Copies of a record we have already (gossip brings some) cost no signature check.
+        if let Some((id, seq)) = signed.peek()
+            && st.records.get(&id).is_some_and(|r| r.info.seq >= seq)
+        {
+            return None;
+        }
         let info = match signed.verify(&self.net) {
             Ok(i) => i,
             Err(e) => {
                 debug!("dropping invalid record: {e}");
-                return false;
+                return None;
             }
         };
         if info.id == self.ident.id {
@@ -915,25 +1049,25 @@ impl Node {
             if info.seq >= st.my_seq {
                 st.my_seq = info.seq + 1;
             }
-            return false;
+            return None;
         }
         if let Some(old) = st.records.get(&info.id)
             && old.info.seq >= info.seq
         {
-            return false;
+            return None;
         }
         if st.forgotten.get(&info.id).is_some_and(|f| f.seq >= info.seq) {
-            return false;
+            return None;
         }
         if st.banned.contains_key(&info.id) {
-            return false;
+            return None;
         }
         if !Self::admitted(st, &info.id) {
-            return false; // managed network, and this node has no admission (yet)
+            return None; // managed network, and this node has no admission (yet)
         }
         if live && info.seq > now_ms() + 3_600_000 {
             debug!("dropping record from the future for {}", info.id);
-            return false;
+            return None;
         }
         if !st.records.contains_key(&info.id) {
             info!(
@@ -958,7 +1092,7 @@ impl Node {
                 last_heard: (live && seen_before).then(Instant::now),
             },
         );
-        true
+        Some(id)
     }
 
     fn handle_gossip(&self, from: NodeId, payload: &[u8]) {
@@ -967,19 +1101,160 @@ impl Node {
         };
         let mut st = self.state.lock().unwrap();
         let mut changed = vec![];
+        // Most records only bring a newer seq, load or measurements: routes, addresses and
+        // names need recomputing (O(N^2)) only when what they're made of changed. The tick
+        // recomputes them anyway every 10 s.
+        let mut structural = false;
         for s in list {
-            if self.ingest(&mut st, s.clone(), true) {
-                changed.push(s);
+            let before = Self::shape(&st, &s);
+            if let Some(id) = self.ingest_id(&mut st, s.clone(), true) {
+                structural |= before.as_ref() != st.records.get(&id).map(|r| Self::shape_of(&r.info)).as_ref();
+                changed.push((id, s));
             }
         }
         if !changed.is_empty() {
-            self.rebuild(&mut st);
-            // Flood onwards; the seq check above stops loops.
-            for f in gossip_frames(&changed) {
-                self.broadcast(&st, &f, Some(from));
+            if structural {
+                self.rebuild(&mut st);
+            }
+            // Onwards to a few nodes (all older ones); the seq check above stops loops.
+            let mut out: HashMap<NodeId, Vec<SignedInfo>> = HashMap::new();
+            for (id, s) in changed {
+                let Some(info) = st.records.get(&id).map(|r| &r.info) else {
+                    continue;
+                };
+                for to in self.gossip_targets(&st, info, from) {
+                    out.entry(to).or_default().push(s.clone());
+                }
+            }
+            for (to, recs) in out {
+                if let Some(l) = st.links.get(&to) {
+                    for f in gossip_frames(&recs) {
+                        Self::send_gossip(l, f);
+                    }
+                }
             }
             drop(st);
-            self.update_hosts();
+            if structural {
+                self.update_hosts();
+            }
+        }
+    }
+
+    /// What routes, addresses, hosts and known_hosts are made of, of a record we have for the
+    /// node of `s` (None for a node new to us).
+    fn shape(st: &State, s: &SignedInfo) -> Option<String> {
+        // The record's id without verifying: only to find the old record to compare with.
+        let (id, _) = s.peek()?;
+        st.records.get(&id).map(|r| Self::shape_of(&r.info))
+    }
+
+    fn shape_of(i: &NodeInfo) -> String {
+        format!(
+            "{}|{}|{:?}|{:?}|{:?}|{}|{}",
+            i.name,
+            i.noise_pub.hex(),
+            i.neighbors,
+            i.endpoints,
+            i.ssh_host_key,
+            i.ipv6,
+            i.exit
+        )
+    }
+
+    /// Our digest: (id, seq) of every record we have, our own included.
+    fn digest_frame(&self, st: &State) -> Vec<u8> {
+        let mut d = Vec::with_capacity((st.records.len() + 1) * 40);
+        for (id, seq) in st
+            .records
+            .values()
+            .map(|r| (r.info.id, r.info.seq))
+            .chain(std::iter::once((self.ident.id, st.my_seq)))
+        {
+            d.extend_from_slice(&id.0);
+            d.extend_from_slice(&seq.to_be_bytes());
+        }
+        frame(T_DIGEST, &d)
+    }
+
+    /// Sends the digest to one random neighbor that understands it.
+    fn send_digest(&self) {
+        use rand::seq::IteratorRandom;
+        let st = self.state.lock().unwrap();
+        let Some(l) = st
+            .links
+            .iter()
+            .filter(|(id, _)| Self::digests(&st, id))
+            .map(|(_, l)| l)
+            .choose(&mut rand::thread_rng())
+        else {
+            return;
+        };
+        Self::send_gossip(l, self.digest_frame(&st));
+    }
+
+    /// A neighbor's digest: send it what is newer here, ask for what is newer there.
+    fn handle_digest(&self, from: NodeId, payload: &[u8]) {
+        let theirs: HashMap<NodeId, u64> = payload
+            .as_chunks::<40>()
+            .0
+            .iter()
+            .map(|c| {
+                (
+                    crate::keys::Key32(c[..32].try_into().unwrap()),
+                    u64::from_be_bytes(c[32..].try_into().unwrap()),
+                )
+            })
+            .collect();
+        let st = self.state.lock().unwrap();
+        let Some(l) = st.links.get(&from) else { return };
+        let settled = now_ms().saturating_sub(DIGEST_GRACE_MS);
+        let mut give: Vec<SignedInfo> = st
+            .records
+            .values()
+            .filter(|r| r.info.seq < settled && theirs.get(&r.info.id).is_none_or(|s| *s < r.info.seq))
+            .map(|r| r.signed.clone())
+            .collect();
+        if st.my_seq < settled && theirs.get(&self.ident.id).is_none_or(|s| *s < st.my_seq) {
+            give.extend(st.my_signed.clone());
+        }
+        let want: Vec<u8> = theirs
+            .iter()
+            .filter(|(id, seq)| {
+                **id != self.ident.id
+                    && **seq < settled
+                    && st.records.get(id).is_none_or(|r| r.info.seq < **seq)
+                    && !st.banned.contains_key(id)
+                    && st.forgotten.get(id).is_none_or(|f| f.seq < **seq)
+            })
+            .flat_map(|(id, _)| id.0)
+            .collect();
+        for f in gossip_frames(&give) {
+            Self::send_gossip(l, f);
+        }
+        if !want.is_empty() {
+            Self::send_gossip(l, frame(T_WANT, &want));
+        }
+    }
+
+    /// A neighbor asks for records after comparing digests.
+    fn handle_want(&self, from: NodeId, payload: &[u8]) {
+        let st = self.state.lock().unwrap();
+        let Some(l) = st.links.get(&from) else { return };
+        let give: Vec<SignedInfo> = payload
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .filter_map(|c| {
+                let id = crate::keys::Key32(*c);
+                if id == self.ident.id {
+                    st.my_signed.clone()
+                } else {
+                    st.records.get(&id).map(|r| r.signed.clone())
+                }
+            })
+            .collect();
+        for f in gossip_frames(&give) {
+            Self::send_gossip(l, f);
         }
     }
 
@@ -2511,7 +2786,7 @@ impl Node {
                     st.observed_ips.truncate(3);
                 }
             }
-            self.announce(&mut st);
+            self.links_changed(&mut st);
             self.rebuild(&mut st);
             // Tell the new neighbor everything we know.
             let link = st.links.get(&peer).unwrap();
@@ -2565,6 +2840,8 @@ impl Node {
                     }
                 }
                 T_GOSSIP => self.handle_gossip(peer, payload),
+                T_DIGEST => self.handle_digest(peer, payload),
+                T_WANT => self.handle_want(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
                 T_MEASURE => self.handle_measure(peer, payload),
                 T_WHY => self.handle_why(peer, payload),
@@ -2648,7 +2925,7 @@ impl Node {
             st.links.remove(&peer);
             let name = st.records.get(&peer).map(|r| r.info.name.clone()).unwrap_or_default();
             info!("link down: {name} ({peer}): {reason}");
-            self.announce(&mut st);
+            self.links_changed(&mut st);
             self.rebuild(&mut st);
             drop(st);
             // Try to get it back right away instead of waiting for the next tick.
@@ -2881,6 +3158,8 @@ impl Node {
             for (key, addrs, boot) in dials {
                 tokio::spawn(self.clone().dial(key, addrs, boot));
             }
+            const _: () = assert!(DIGEST_EVERY.as_secs() == TICK.as_secs());
+            self.send_digest();
             if ticks.is_multiple_of(6) {
                 self.ssh_check();
             }
