@@ -264,11 +264,9 @@ impl Node {
         if st.v4_withheld.contains(&from) {
             return false;
         }
-        drop(st);
-        if from == overlay_ip(src) {
-            return self.owns_ip(src);
+        if st.ip_of.get(src) == Some(&from) {
+            return true;
         }
-        let st = self.state.lock().unwrap();
         st.exit_via == Some(*src) && is_public(from)
     }
 

@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, SavedState, Userspace};
-use crate::keys::{Identity, NodeId, OVERLAY_NETMASK, overlay_ip, overlay_ip6};
+use crate::keys::{IP_CANDIDATES, Identity, NodeId, OVERLAY_NETMASK, overlay_ip_at, overlay_ip6};
 use crate::link::{self, Cipher, LinkReader, LinkWriter};
 use crate::proto::*;
 
@@ -182,7 +182,7 @@ pub fn range_conflicts(dir: &std::path::Path, own_iface: &str) -> Vec<String> {
     let our_ips: Vec<Ipv4Addr> = cfgs
         .iter()
         .filter_map(|c| Identity::from_config(c).ok())
-        .map(|i| overlay_ip(&i.id))
+        .flat_map(|i| (0..IP_CANDIDATES).map(move |k| overlay_ip_at(&i.id, k)))
         .collect();
     for (name, ip, _) in crate::sys::ipv4_interfaces() {
         if name == own_iface || ours.contains(&name.as_str()) || our_ips.contains(&ip) || !is_overlay(IpAddr::V4(ip)) {
@@ -328,6 +328,13 @@ struct State {
     exit_via: Option<NodeId>,
     /// Mesh addresses claimed by more than one node (see rebuild).
     ip_conflicts: Vec<(Ipv4Addr, Vec<NodeId>)>,
+    /// The address each node has here (the reverse of `ip_map`).
+    ip_of: HashMap<NodeId, Ipv4Addr>,
+    /// Addresses two nodes claimed at once: nobody's from then on (see `assign_ips`).
+    burned_ips: HashSet<Ipv4Addr>,
+    /// The candidate address this node runs with, and the one it takes at its next start.
+    ip_index: u8,
+    next_ip_index: u8,
     /// Throughput tests over the data path being received: id -> (first, bytes, last, from).
     bench_ip_rx: HashMap<u64, (Instant, u64, Instant, Ipv4Addr)>,
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
@@ -436,6 +443,8 @@ pub struct Node {
     dht: Mutex<Option<mainline::async_dht::AsyncDht>>,
     /// `meshvpn leave`: the network was told; no new links or records until meshvpn stops.
     leaving: std::sync::atomic::AtomicBool,
+    /// Hash of the saved state last written (see `save_state`).
+    saved_hash: Mutex<Option<[u8; 32]>>,
 }
 
 /// Throughput tests over the data path: IP protocol 253 ("for experimentation", RFC 3692).
@@ -471,6 +480,9 @@ struct Established {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Status {
+    /// Links on demand (a big network): most nodes are reached through relays.
+    #[serde(default)]
+    pub on_demand: bool,
     pub name: String,
     pub network: String,
     pub id: String,
@@ -619,7 +631,9 @@ pub struct PeerStatus {
 pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     let ident = Identity::from_config(&cfg)?;
     let keys = cfg.all_keys()?;
-    let my_ip = overlay_ip(&ident.id);
+    let saved_ip = SavedState::load(&dir);
+    let ip_index = saved_ip.ip_index.min(IP_CANDIDATES - 1);
+    let my_ip = overlay_ip_at(&ident.id, ip_index);
 
     // Kernel TUN device if possible; otherwise (containers without /dev/net/tun or NET_ADMIN)
     // a TCP/IP stack in this process.
@@ -681,6 +695,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         ssh_listening: std::sync::atomic::AtomicBool::new(false),
         dht: Mutex::new(None),
         leaving: std::sync::atomic::AtomicBool::new(false),
+        saved_hash: Mutex::new(None),
         cfg,
     });
 
@@ -691,6 +706,9 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
             st.my_seq = me.seq;
         }
         st.keys = keys;
+        st.ip_index = ip_index;
+        st.next_ip_index = ip_index;
+        st.burned_ips = saved_ip.burned_ips.into_iter().collect();
         st.key_version = node.cfg.key_version;
         st.banned = node.cfg.banned.iter().map(|b| (b.id, b.name.clone())).collect();
         st.my_name = node.cfg.name.clone();
@@ -887,23 +905,32 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Mesh addresses of `ids`, and the contested ones. Addresses are 22 bits of a hash of the node
-/// id: a member could grind an identity with someone else's address. A contested address belongs
-/// to nobody (no traffic is routed to it or accepted from it) until one of the claimants is banned
-/// or forgotten.
+/// Most addresses remembered as burned (see `assign_ips`).
+const MAX_BURNED_IPS: usize = 4096;
+
+/// Mesh addresses of the nodes (`id`, address they claim), and the contested ones. Addresses are
+/// 22 bits of a hash: two nodes may get the same one by chance (about 1 in 9 networks of 1000
+/// nodes has a pair), and a member could grind an identity with someone else's address. A
+/// contested address belongs to nobody (no traffic is routed to it or accepted from it), and is
+/// burned: it stays nobody's when only one claimant is left, so no one takes over another node's
+/// address by claiming it too. Both claimants move to their next candidate (see `rebuild`).
 #[allow(clippy::type_complexity)]
-fn assign_ips<'a>(
-    ids: impl Iterator<Item = &'a NodeId>,
+fn assign_ips(
+    claims: impl Iterator<Item = (NodeId, Ipv4Addr)>,
     my_ip: Ipv4Addr,
+    burned: &mut HashSet<Ipv4Addr>,
 ) -> (HashMap<Ipv4Addr, NodeId>, Vec<(Ipv4Addr, Vec<NodeId>)>) {
     let mut by_ip: HashMap<Ipv4Addr, Vec<NodeId>> = HashMap::new();
-    for id in ids {
-        by_ip.entry(overlay_ip(id)).or_default().push(*id);
+    for (id, ip) in claims {
+        by_ip.entry(ip).or_default().push(id);
     }
     let mut conflicts = vec![];
     let mut ip_map = HashMap::new();
     for (ip, mut owners) in by_ip {
-        if ip == my_ip || owners.len() > 1 {
+        if (ip == my_ip || owners.len() > 1) && burned.len() < MAX_BURNED_IPS {
+            burned.insert(ip);
+        }
+        if ip == my_ip || owners.len() > 1 || burned.contains(&ip) {
             owners.sort();
             conflicts.push((ip, owners));
         } else {
@@ -1077,6 +1104,7 @@ impl Node {
             ssh_keys: st.my_ssh_keys.clone(),
             split: false,
             details: 0,
+            ip_index: st.ip_index,
         };
         let new_details = self.update_details(st, &info);
         let details_seq = st.my_details.as_ref().map_or(0, |(d, _)| d.seq);
@@ -1313,12 +1341,7 @@ impl Node {
             return None;
         }
         if !st.records.contains_key(&info.id) {
-            info!(
-                "discovered node {} ({}) at {}",
-                info.name,
-                info.id,
-                overlay_ip(&info.id)
-            );
+            info!("discovered node {} ({}) at {}", info.name, info.id, info.ip());
         }
         st.ciphers.remove(&info.id);
         st.udp_keys.remove(&info.id);
@@ -1487,7 +1510,14 @@ impl Node {
             return;
         };
         let (to, l) = l;
-        Self::send_gossip(l, self.digest_frame(&st, Self::splits(&st, to)));
+        let f = self.digest_frame(&st, Self::splits(&st, to));
+        // One link message holds the digest of ~1500 nodes; a larger one would end the link.
+        if f.len() > crate::link::MAX_PLAINTEXT {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| warn!("{} nodes: too many for one digest, digests are off", st.records.len()));
+            return;
+        }
+        Self::send_gossip(l, f);
     }
 
     /// A neighbor's digest: send it what is newer here, ask for what is newer there.
@@ -1745,6 +1775,8 @@ impl Node {
             );
             frames.push(self.digest_frame(st, true));
         }
+        // Too large for a link message (see send_digest): it would end the new link.
+        frames.retain(|f| f.len() <= crate::link::MAX_PLAINTEXT);
         frames
     }
 
@@ -1856,7 +1888,7 @@ impl Node {
     ) -> std::result::Result<String, String> {
         let access = self.ext_ssh_access();
         let st = self.state.lock().unwrap();
-        let Some(rec) = st.records.values().find(|r| overlay_ip(&r.info.id) == ip) else {
+        let Some(rec) = st.records.values().find(|r| r.info.ip() == ip) else {
             return Err(format!("{ip} is not a known mesh node"));
         };
         let node = &rec.info.name;
@@ -1935,7 +1967,7 @@ impl Node {
             return None;
         }
         let st = self.state.lock().unwrap();
-        let rec = st.records.values().find(|r| overlay_ip(&r.info.id) == ip)?;
+        let rec = st.records.values().find(|r| r.info.ip() == ip)?;
         (!st.banned.contains_key(&rec.info.id)).then(|| rec.info.name.clone())
     }
 
@@ -1963,7 +1995,7 @@ impl Node {
                 .filter(|r| r.node == rec.info.id && r.users.iter().any(|u| u == user))
                 .collect();
             // Both addresses: ssh may come over either.
-            let ip = format!("{},{}", overlay_ip(&rec.info.id), overlay_ip6(&self.net, &rec.info.id));
+            let ip = format!("{},{}", rec.info.ip(), overlay_ip6(&self.net, &rec.info.id));
             if in_scope && !st.banned.contains_key(&rec.info.id) {
                 for k in st.ssh_allow_keys.iter().filter(|k| k.users.iter().any(|u| u == user)) {
                     lines.push(format!("from=\"{ip}\" {} meshvpn:key:{}\n", k.key, k.comment));
@@ -2860,7 +2892,30 @@ impl Node {
 
     /// Rebuilds the IP map and the routing table.
     fn rebuild(&self, st: &mut State) {
-        let (ip_map, conflicts) = assign_ips(st.records.keys(), self.my_ip);
+        let claims: Vec<(NodeId, Ipv4Addr)> = st.records.values().map(|r| (r.info.id, r.info.ip())).collect();
+        let (ip_map, conflicts) = assign_ips(claims.iter().copied(), self.my_ip, &mut st.burned_ips);
+        // Ours is contested: the next candidate nobody claims, from the next start (at once, see tick).
+        if st.burned_ips.contains(&self.my_ip) && st.next_ip_index == st.ip_index {
+            let taken: HashSet<Ipv4Addr> = claims.iter().map(|(_, ip)| *ip).collect();
+            let next = (st.ip_index + 1..IP_CANDIDATES).find(|&i| {
+                let ip = overlay_ip_at(&self.ident.id, i);
+                !taken.contains(&ip) && !st.burned_ips.contains(&ip)
+            });
+            match next {
+                Some(i) => {
+                    warn!(
+                        "another node has this node's address {}: moving to {} (restarting)",
+                        self.my_ip,
+                        overlay_ip_at(&self.ident.id, i)
+                    );
+                    st.next_ip_index = i;
+                }
+                None => warn!(
+                    "another node has this node's address {} and no other is free",
+                    self.my_ip
+                ),
+            }
+        }
         if conflicts != st.ip_conflicts {
             for (ip, owners) in &conflicts {
                 let names: Vec<String> = owners
@@ -2868,13 +2923,14 @@ impl Node {
                     .map(|id| format!("{} ({id})", st.records.get(id).map_or("?", |r| r.info.name.as_str())))
                     .collect();
                 warn!(
-                    "address conflict: {ip} is claimed by {}{} - no traffic to or from it until one is banned or forgotten",
+                    "address conflict: {ip} is claimed by {}{} - no traffic to or from it (nodes from 0.31.1 on move to another address)",
                     names.join(", "),
                     if *ip == self.my_ip { " and this node" } else { "" }
                 );
             }
         }
         st.ip_conflicts = conflicts;
+        st.ip_of = ip_map.iter().map(|(ip, id)| (*id, *ip)).collect();
         st.ip_map = ip_map;
         let with_ipv6: Vec<NodeId> = st.records.values().filter(|r| r.info.ipv6).map(|r| r.info.id).collect();
         st.ip6_map = assign_ips6(with_ipv6.iter(), &self.net, self.my_ip6);
@@ -3088,20 +3144,13 @@ impl Node {
     pub fn mesh_ip_of6(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
         let st = self.state.lock().unwrap();
         let id = st.ip6_map.get(&ip)?;
-        let v4 = overlay_ip(id);
-        (st.ip_map.get(&v4) == Some(id)).then_some(v4)
+        st.ip_of.get(id).copied()
     }
 
     /// `id` is the only node with its IPv6 mesh address.
     pub(crate) fn owns_ip6(&self, id: &NodeId) -> bool {
         let st = self.state.lock().unwrap();
         st.ip6_map.get(&overlay_ip6(&self.net, id)) == Some(id)
-    }
-
-    /// `id` is the only node with its mesh address (see rebuild).
-    pub(crate) fn owns_ip(&self, id: &NodeId) -> bool {
-        let st = self.state.lock().unwrap();
-        st.ip_map.get(&overlay_ip(id)) == Some(id)
     }
 
     pub fn my_ip(&self) -> Ipv4Addr {
@@ -3147,7 +3196,7 @@ impl Node {
         }
         let mut matches: Vec<&Record> = st.records.values().filter(|r| r.info.name == h).collect();
         matches.sort_by_key(|r| self.name_rank(&st, r));
-        matches.first().map(|r| overlay_ip(&r.info.id))
+        matches.first().map(|r| r.info.ip())
     }
 
     async fn tun_loop(self: Arc<Self>) {
@@ -3834,7 +3883,23 @@ impl Node {
                 self.ssh_check();
             }
             self.update_hosts();
-            if ticks.is_multiple_of(6) {
+            // Another node has our address: start again with the next one (the TUN device, the
+            // userspace stack and the SSH server all have it from the start).
+            let moved = {
+                let st = self.state.lock().unwrap();
+                st.next_ip_index != st.ip_index
+            };
+            if moved && let Ok(exe) = crate::update::current_exe() {
+                self.restart(exe);
+            }
+            // Every minute, every 5 in big networks (where records change all the time and the
+            // file has MB); on changes that matter at once (bans, rotations) and when stopping.
+            let every = if self.state.lock().unwrap().records.len() > FULL_MESH_MAX {
+                30
+            } else {
+                6
+            };
+            if ticks.is_multiple_of(every) {
                 self.save_state();
             }
             ticks += 1;
@@ -3843,6 +3908,8 @@ impl Node {
     }
 
     fn save_state(&self) {
+        // One save at a time, so an older snapshot never overwrites a newer one.
+        let mut last = self.saved_hash.lock().unwrap();
         let st = self.state.lock().unwrap();
         let saved = SavedState {
             me: st.my_signed.clone(),
@@ -3859,9 +3926,11 @@ impl Node {
             leases: st.leases.clone(),
             docs: st.docs.values().map(|(_, s)| s.clone()).collect(),
             join_slots: st.join_slots.clone(),
+            ip_index: st.next_ip_index,
+            burned_ips: st.burned_ips.iter().copied().collect(),
         };
         drop(st);
-        if let Err(e) = saved.save(&self.dir) {
+        if let Err(e) = saved.save_if_changed(&self.dir, &mut last) {
             warn!("saving state: {e:#}");
         }
     }
@@ -3881,7 +3950,7 @@ impl Node {
             } else {
                 format!("{}-{}", r.info.name, r.info.id.short())
             };
-            entries.push((name, overlay_ip(&r.info.id), r.info.ssh_host_key.clone()));
+            entries.push((name, r.info.ip(), r.info.ssh_host_key.clone()));
         }
         // The extension's names: the host key of the node they point to.
         for (alias, ip) in aliases {
@@ -3967,7 +4036,7 @@ impl Node {
                     .peers
                     .iter()
                     .filter_map(|p| p.verify(&net).ok())
-                    .map(|i| (overlay_ip(&i.id), i.name))
+                    .map(|i| (i.ip(), i.name))
                     .collect()
             })
             .unwrap_or_default();
@@ -4086,7 +4155,7 @@ impl Node {
         let others: Vec<_> = others
             .into_iter()
             .map(|r| {
-                let ip = overlay_ip(&r.info.id);
+                let ip = r.info.ip();
                 crate::hosts::Entry {
                     name: r.info.name.clone(),
                     v4: (!st.v4_withheld.contains(&ip)).then_some(ip),
@@ -4141,7 +4210,7 @@ impl Node {
                     version: r.info.version.clone(),
                     exit: r.info.exit,
                     id: id.hex(),
-                    ip: overlay_ip(&id),
+                    ip: r.info.ip(),
                     ip6: r.info.ipv6.then(|| overlay_ip6(&self.net, &id)),
                     online: self.is_online(&st, &id),
                     path,
@@ -4164,6 +4233,7 @@ impl Node {
         peers.sort_by(|a, b| b.online.cmp(&a.online).then(a.name.cmp(&b.name)));
         let (nat, ipv6) = self.nat_report(&st);
         Status {
+            on_demand: self.on_demand(&st),
             name: st.my_name.clone(),
             network: self.cfg.network.clone(),
             id: self.ident.id.hex(),
@@ -4188,7 +4258,7 @@ impl Node {
                         .map(|id| st.records.get(id).map_or_else(|| id.short(), |r| r.info.name.clone()))
                         .collect();
                     w.push(format!(
-                        "address conflict: {ip} is claimed by {}{} - unreachable until one is banned (meshvpn ban) or forgotten",
+                        "address conflict: {ip} is claimed by {}{} - unreachable there (nodes from 0.31.1 on move to another address; older ones need an update, or a ban)",
                         names.join(" and "),
                         if *ip == self.my_ip { " and this node" } else { "" }
                     ));
@@ -4424,7 +4494,7 @@ impl Node {
     /// Test data as IP packets of protocol 253 (experiments) through the normal data path; the
     /// peer counts them and reports the rate it received.
     async fn bench_ip(self: &Arc<Self>, peer: NodeId, bytes: u64) -> Option<f32> {
-        let dst = overlay_ip(&peer);
+        let dst = self.state.lock().unwrap().ip_of.get(&peer).copied()?;
         let id = rand::rngs::OsRng.next_u64();
         let (otx, orx) = tokio::sync::oneshot::channel();
         self.state.lock().unwrap().bench_wait.insert(id, otx);
@@ -4469,7 +4539,7 @@ impl Node {
 
     /// Round trip over the data path (for peers reached through relays), best of three.
     async fn ping_ip(self: &Arc<Self>, peer: NodeId) -> Option<Duration> {
-        let dst = overlay_ip(&peer);
+        let dst = self.state.lock().unwrap().ip_of.get(&peer).copied()?;
         let mut best: Option<Duration> = None;
         for _ in 0..3 {
             let id = rand::rngs::OsRng.next_u64();
@@ -4852,7 +4922,7 @@ impl Node {
                 let rtt = perf.and_then(|p| p.rtt_us).unwrap_or(u32::MAX);
                 let h = crate::share::Holder {
                     name: r.info.name.clone(),
-                    mesh_ip: overlay_ip(&r.info.id),
+                    mesh_ip: r.info.ip(),
                     lan_ip,
                 };
                 (lan_ip.is_none(), rtt, h)
@@ -5499,6 +5569,7 @@ mod tests {
 
     #[test]
     fn contested_addresses_belong_to_nobody() {
+        use crate::keys::overlay_ip;
         // Grind ids until two share an address (22 bits: a few thousand tries).
         let mut seen: HashMap<Ipv4Addr, NodeId> = HashMap::new();
         let (a, b) = loop {
@@ -5509,13 +5580,27 @@ mod tests {
         };
         let c = crate::keys::Key32(crate::keys::random32());
         let mine = crate::keys::Key32(crate::keys::random32());
-        let (map, conflicts) = assign_ips([a, b, c].iter(), overlay_ip(&mine));
+        let claim = |id: &NodeId| (*id, overlay_ip(id));
+        let mut burned = HashSet::new();
+        let (map, conflicts) = assign_ips(
+            [claim(&a), claim(&b), claim(&c)].into_iter(),
+            overlay_ip(&mine),
+            &mut burned,
+        );
         assert_eq!(map.get(&overlay_ip(&c)), Some(&c));
         assert!(!map.contains_key(&overlay_ip(&a)));
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].0, overlay_ip(&a));
+        // b moves on; a, left alone with the address, still doesn't get it (it is burned).
+        let (map, _) = assign_ips(
+            [claim(&a), (b, overlay_ip_at(&b, 1)), claim(&c)].into_iter(),
+            overlay_ip(&mine),
+            &mut burned,
+        );
+        assert!(!map.contains_key(&overlay_ip(&a)));
+        assert_eq!(map.get(&overlay_ip_at(&b, 1)), Some(&b));
         // Someone claiming our own address gets nothing either.
-        let (map, conflicts) = assign_ips([c].iter(), overlay_ip(&c));
+        let (map, conflicts) = assign_ips([claim(&c)].into_iter(), overlay_ip(&c), &mut HashSet::new());
         assert!(map.is_empty() && conflicts.len() == 1);
     }
 

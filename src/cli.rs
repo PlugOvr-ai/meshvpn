@@ -112,8 +112,12 @@ enum Cmd {
     },
     /// Check this machine's setup and say how to fix problems.
     Doctor,
-    /// Show this node and its peers.
-    Status,
+    /// Show this node and its peers (in networks over 32 nodes: those with a direct path).
+    Status {
+        /// List every node, also in a big network.
+        #[arg(long)]
+        all: bool,
+    },
     /// List nodes with tags, hardware and GPUs. Selectors: all, tag:<tag>, names, mesh IPs.
     Nodes {
         /// Which nodes (default: all).
@@ -1692,7 +1696,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
             return Ok(if results.iter().all(|r| r.ok) { 0 } else { 1 });
         }
-        Cmd::Status => {
+        Cmd::Status { all } => {
             let resp = tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Status))?;
             let control::Response::Status(st) = resp else {
                 bail!("unexpected response")
@@ -1700,7 +1704,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
-                print_status(&st);
+                print_status(&st, all);
                 let others: Vec<String> = networks::all(&base)
                     .iter()
                     .filter(|(_, d)| *d != dir)
@@ -2132,7 +2136,7 @@ fn print_networks(base: &Path, json: bool) -> Result<()> {
             "first": name.is_empty(),
             "network": cfg.network,
             "node": cfg.name,
-            "ip": overlay_ip(&ident.id).to_string(),
+            "ip": crate::keys::overlay_ip_at(&ident.id, crate::config::SavedState::load(&d).ip_index).to_string(),
             "interface": st.as_ref().map(|s| s.interface.clone()).unwrap_or(cfg.interface.clone()),
             "port": cfg.listen_port(),
             "names": format!("<node>.{}", networks::suffix(&d)),
@@ -3368,7 +3372,7 @@ fn with_default_port(addr: &str) -> String {
     }
 }
 
-fn print_status(st: &node::Status) {
+fn print_status(st: &node::Status, all: bool) {
     println!(
         "● {}  {}  ({} on {}, network \"{}\", meshvpn {})",
         st.name,
@@ -3479,12 +3483,16 @@ fn print_status(st: &node::Status) {
         println!("No other nodes known yet.");
         return;
     }
-    let w = st.peers.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
+    // A big network (links on demand): the nodes with a direct path, and a summary of the rest.
+    let short = !all && st.on_demand;
+    let direct = |p: &&node::PeerStatus| p.online && p.path.starts_with("direct");
+    let shown: Vec<&node::PeerStatus> = st.peers.iter().filter(|p| !short || direct(p)).collect();
+    let w = shown.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
     println!(
         "{:<w$}  {:<15}  {:<7}  {:>6}  {:<8}  PATH",
         "NAME", "IP", "STATUS", "RTT", "VERSION"
     );
-    for p in &st.peers {
+    for p in shown {
         // Older than this node: highlighted (meshvpn update there).
         let version = if p.version.is_empty() {
             format!("{:<8}", "?")
@@ -3510,6 +3518,15 @@ fn print_status(st: &node::Status) {
         println!(
             "{:<w$}  {:<15}  {:<7}  {:>6}  {version}  {}",
             p.name, p.ip, status, rtt, path
+        );
+    }
+    if short {
+        let online = st.peers.iter().filter(|p| p.online).count();
+        let direct = st.peers.iter().filter(direct).count();
+        println!(
+            "\n{} other nodes: {online} online ({direct} direct, listed above; the others through relays), {} offline.\nAll of them: meshvpn status --all (or meshvpn nodes)",
+            st.peers.len(),
+            st.peers.len() - online
         );
     }
 }

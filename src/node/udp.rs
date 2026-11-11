@@ -1018,6 +1018,7 @@ mod tests {
             links: 0,
             split: false,
             details: 0,
+            ip_index: 0,
         };
         let c: Vec<String> = Node::peer_candidates(&info).iter().map(|a| a.to_string()).collect();
         assert!(c.contains(&"192.168.10.3:7870".to_string()));

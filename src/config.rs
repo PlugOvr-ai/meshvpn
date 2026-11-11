@@ -595,6 +595,13 @@ pub struct SavedState {
     /// Open invites that may be joined through hole punching.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub join_slots: Vec<JoinSlot>,
+    /// The candidate address this node uses (`keys::overlay_ip_at`), from the next start on.
+    #[serde(default)]
+    pub ip_index: u8,
+    /// Addresses two nodes claimed at once: they belong to nobody from then on, so a node can't
+    /// take over another's address by claiming it too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub burned_ips: Vec<std::net::Ipv4Addr>,
 }
 
 impl SavedState {
@@ -608,7 +615,20 @@ impl SavedState {
             .unwrap_or_default()
     }
     pub fn save(&self, dir: &Path) -> Result<()> {
-        write_private(&Self::path(dir), &serde_json::to_vec_pretty(self)?)
+        self.save_if_changed(dir, &mut None)
+    }
+
+    /// Writes only if the contents differ from the last write (`last`: their hash). Compact:
+    /// in a network of 1000 nodes the file has a few MB.
+    pub fn save_if_changed(&self, dir: &Path, last: &mut Option<[u8; 32]>) -> Result<()> {
+        let bytes = serde_json::to_vec(self)?;
+        let hash = *blake3::hash(&bytes).as_bytes();
+        if *last == Some(hash) {
+            return Ok(());
+        }
+        write_private(&Self::path(dir), &bytes)?;
+        *last = Some(hash);
+        Ok(())
     }
 }
 

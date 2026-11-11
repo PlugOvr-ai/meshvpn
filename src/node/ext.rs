@@ -53,7 +53,7 @@ impl Node {
             id: info.id,
             name: info.name.clone(),
             tags: info.tags.clone(),
-            ip: overlay_ip(&info.id),
+            ip: info.ip(),
             online: self.is_online(st, &info.id),
             admin: Self::is_admin(st, &info.id),
             ssh_users,

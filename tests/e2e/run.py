@@ -257,6 +257,10 @@ def test_links_on_demand(lab):
     check(ping(a, far.ip(), count=1), f"a can't reach {far.name} through relays")
     wait(lambda: far.name in direct(a), f"a direct to {far.name} after talking to it", timeout=15, interval=0.5)
     check(all(a.online(n) for n in others), "a still sees all nodes online")
+    # status lists the direct ones and sums up the rest; --all lists every node.
+    short, full = a.mv("status"), a.mv("status --all")
+    check("5 other nodes: 5 online" in short and "status --all" in short, f"no summary in status:\n{short}")
+    check(all(n in full for n in others), f"status --all doesn't list all nodes:\n{full}")
     wait(lambda: far.name not in direct(a), f"the idle path to {far.name} closes", timeout=150, interval=3)
     check(ping(a, far.ip(), count=1), f"a can't reach {far.name} again")
     check(all(a.online(n) for n in others), "nodes stay online without links to them")
@@ -264,6 +268,28 @@ def test_links_on_demand(lab):
     far2 = next(n for n in nodes if n is not a and n.name not in direct(a))
     a.mv(f"net env a {far2.name}")
     check(far2.name in direct(a), f"net env didn't open a direct path to {far2.name}")
+
+
+@test
+def test_address_collision(lab):
+    """Nodes that start with the same mesh address (forced here) all give it up and restart
+    with their next candidate; nobody keeps the contested one, and all reach each other."""
+    same = "100.64.0.9"
+    _, nodes = mesh(lab, ["hub", "a", "b"], env=f"MESHVPN_TEST_IP0={same}")
+
+    def ips_ok():
+        ips = [n.ip() for n in nodes]
+        return same not in ips and len(set(ips)) == len(ips)
+
+    wait(ips_ok, "every node moved off the shared address", timeout=90, interval=2)
+    for n in nodes:
+        wait(lambda n=n: all(n.online(m.name) for m in nodes if m is not n), f"{n.name} sees all online", timeout=90)
+    for n in nodes:
+        for m in nodes:
+            if m is not n:
+                wait(lambda n=n, m=m: ping(n, m.ip(), count=1), f"{n.name} reaches {m.name} at {m.ip()}", timeout=30)
+    check(ping(nodes[1], "b", count=1), "a can't reach b by name")
+    check("moving to" in nodes[1].sh("cat /var/log/meshvpn.log"), "a's log doesn't say it moved")
 
 
 @test

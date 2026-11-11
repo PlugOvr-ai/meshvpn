@@ -147,10 +147,32 @@ pub fn verify(id: &NodeId, msg: &[u8], sig: &[u8]) -> Result<()> {
         .map_err(|_| anyhow!("bad signature"))
 }
 
+/// How many candidate addresses a node has (`overlay_ip_at`): it moves to the next one when
+/// another node has its address.
+pub const IP_CANDIDATES: u8 = 16;
+
 /// Overlay address: 100.64.0.0/10 (CGNAT range, like Tailscale) + 22 bits of hash(node id).
 /// Deterministic, so no coordination server is needed to hand out addresses.
 pub fn overlay_ip(id: &NodeId) -> Ipv4Addr {
-    let h = blake3::hash(&id.0);
+    overlay_ip_at(id, 0)
+}
+
+/// Candidate `index` of a node's overlay address; 0 is `overlay_ip` (as before candidates).
+pub fn overlay_ip_at(id: &NodeId, index: u8) -> Ipv4Addr {
+    // Tests: `MESHVPN_TEST_IP0=<ip>` gives every node that first candidate, so all collide.
+    static TEST_IP0: std::sync::OnceLock<Option<Ipv4Addr>> = std::sync::OnceLock::new();
+    if index == 0
+        && let Some(ip) = TEST_IP0.get_or_init(|| std::env::var("MESHVPN_TEST_IP0").ok()?.parse().ok())
+    {
+        return *ip;
+    }
+    let h = if index == 0 {
+        blake3::hash(&id.0)
+    } else {
+        let mut x = blake3::Hasher::new_derive_key("meshvpn ipv4 candidate v1");
+        x.update(&id.0).update(&[index]);
+        x.finalize()
+    };
     let b = h.as_bytes();
     let mut n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0x003f_ffff;
     if n == 0 {
@@ -213,6 +235,18 @@ mod tests {
             assert_ne!(ip, Ipv4Addr::new(100, 64, 0, 0));
             assert_ne!(ip, Ipv4Addr::new(100, 127, 255, 255));
         }
+    }
+
+    #[test]
+    fn ip_candidates_differ() {
+        let a = Key32(random32());
+        assert_eq!(overlay_ip_at(&a, 0), overlay_ip(&a));
+        let all: std::collections::HashSet<_> = (0..IP_CANDIDATES).map(|i| overlay_ip_at(&a, i)).collect();
+        assert_eq!(all.len(), IP_CANDIDATES as usize);
+        assert!(
+            all.iter()
+                .all(|ip| ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        );
     }
 
     #[test]

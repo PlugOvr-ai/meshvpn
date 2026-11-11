@@ -97,6 +97,29 @@ older node online the record goes out every 30 s, as those decide who is online 
 records). Older nodes get full records from the owner directly and see the new nodes' details;
 records without details never go to them.
 
+## Estimate at 1000 nodes (after steps 2-4, 0.31.1; computed, not measured)
+
+The last load test with links on demand (200 nodes, before 0.30.1) showed 313 kB/s per node, but
+from two things fixed since: the automatic measurement pinged every node (now only direct ones,
+0.30.1), and every link change was announced at once (now in batches). It was stopped before a
+rerun because it overloaded the test machine, so these numbers come from the protocol, per node at
+rest:
+
+| What | Rule | At 1000 nodes |
+|---|---|---|
+| Keepalives | TCP ping + UDP keepalive per link every 10 s, ~150–200 B/s per link; ~8 links | ~1.5 kB/s |
+| Digests | one to a random neighbor every 10 s, 42 B per node (`T_DIGEST2`) | ~4 kB/s out, ~4 kB/s in |
+| Records | each node's core record every 5 min (`HEARTBEAT`), ~1–1.5 KB with 8 neighbor ids, pulled once by digest | ~5 kB/s |
+| Details | every 5 min or on change, pulled like records | ~5 kB/s |
+| **Total** | | **~20 kB/s** (goal: < 50) |
+
+Address collisions: about 1 network in 9 at 1000 nodes has a pair; both move (step 3). The saved
+state is a few MB, written every 5 minutes when it changed (step 4).
+
+**Next limit, at about 1500 nodes:** a digest is one link message (at most 64 KiB, `link::MAX_MSG`),
+42 B per node. Beyond ~1500 nodes it has to go in parts, and a node may then send only the records
+in the part's range (today it sends every record the digest doesn't name).
+
 ## Goals
 
 * 1000 nodes per network, each node using < 50 kB/s and < 1 % CPU for the mesh at rest.
@@ -153,6 +176,16 @@ can ask for the links before starting.
 
 ### Step 3: addresses without collisions
 
+*Done in 0.31.1, differently from the plan below:* both claimants move (to their next candidate,
+`blake3(derive "meshvpn ipv4 candidate v1", id ‖ k)`, k < 16, named by `ip_index` in the core
+record), and the contested address is burned: nobody's from then on, also when only one claimant
+is left. With "lower id keeps it", a member could grind an id with a lower value and someone's
+address and take it over. A node takes its new address by restarting in place (`restart`, as for
+updates): the TUN device, the userspace stack and the SSH server have it from the start. No
+admin-signed addresses in managed networks: the rule needs no coordinator, and the admin can ban
+a member who keeps forcing others to move. Older nodes compute addresses from the id: to them a
+moved node stays contested (unreachable, as before), never misrouted.
+
 The mesh IPv4 stays in 100.64.0.0/10, but becomes a claim instead of a pure hash:
 
 * A node starts with the hash address (as now, so nothing changes for existing nodes).
@@ -166,6 +199,11 @@ The mesh IPv4 stays in 100.64.0.0/10, but becomes a claim instead of a pure hash
 IPv6 mesh addresses have enough bits and stay hashes.
 
 ### Step 4: the rest of what grows with N
+
+*Done in 0.31.1:* `/etc/hosts` and `known_hosts` were already written only on change. `status` lists
+the nodes with a direct path and a summary above 32 nodes (`--all` for every node); `nodes` already
+has selectors and `--online`/`--free-gpus`, and `net matrix` measures only on request (0.30.1). The
+saved state is written only when it changed, compact, every 5 minutes above 32 nodes.
 
 * `/etc/hosts` and `known_hosts` are rewritten only when a name, address or host key changed
   (check whether that's already the case before touching it).

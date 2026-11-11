@@ -247,9 +247,18 @@ pub struct NodeInfo {
     pub split: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub details: u64,
+    /// Which candidate address this node uses (`keys::overlay_ip_at`): not 0 after it moved
+    /// away from an address another node has too.
+    #[serde(default, skip_serializing_if = "is_zero8")]
+    pub ip_index: u8,
 }
 
 impl NodeInfo {
+    /// The node's IPv4 mesh address (the one it claims; see `assign_ips` for who gets it).
+    pub fn ip(&self) -> std::net::Ipv4Addr {
+        crate::keys::overlay_ip_at(&self.id, self.ip_index)
+    }
+
     /// The details of this record as a document of their own.
     pub fn details_doc(&self, seq: u64) -> NodeDetails {
         NodeDetails {
@@ -433,6 +442,10 @@ pub struct SshKey {
 }
 
 /// Text from other nodes that ends up on terminals: short, no control characters.
+fn is_zero8(v: &u8) -> bool {
+    *v == 0
+}
+
 fn is_zero(v: &u64) -> bool {
     *v == 0
 }
@@ -578,7 +591,7 @@ impl SignedInfo {
                 info.name
             );
         }
-        if info.endpoints.len() > 32 || info.neighbors.len() > 4096 {
+        if info.endpoints.len() > 32 || info.neighbors.len() > 4096 || info.ip_index >= crate::keys::IP_CANDIDATES {
             bail!("oversized node info");
         }
         // Names end up in /etc/hosts and on terminals: only accept what we would generate.
@@ -800,6 +813,7 @@ mod tests {
             version: String::new(),
             split: false,
             details: 0,
+            ip_index: 0,
         }
     }
 

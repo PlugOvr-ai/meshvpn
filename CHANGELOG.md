@@ -10,6 +10,24 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-11-11
+
+Addresses without collisions and the rest of the scaling plan (1000 nodes: about 20 kB/s per node, computed).
+
+### Changed
+- **No more lost addresses when two nodes share one.** Mesh addresses are a 22-bit hash of the node
+  id, so two nodes can get the same one (about 1 network in 9 at 1000 nodes); until now neither was
+  reachable over IPv4 then. Both now restart with their next of 16 candidate addresses, which their
+  record names. The shared address belongs to nobody from then on, so a member can't take over
+  another node's address by claiming it too. Nodes before 0.31.1 still can't reach a moved node
+  over IPv4 (over IPv6 they can: those addresses stay as they are).
+- `meshvpn status` in networks over 32 nodes lists the nodes with a direct path and sums up the others;
+  `meshvpn status --all` lists every node.
+- The saved state (records of all nodes, a few MB at 1000 nodes) is written only when it changed, compact,
+  and every 5 minutes instead of every minute in networks over 32 nodes.
+- Networks beyond ~1500 nodes no longer lose their links every 10 s: a digest too large for one link
+  message is not sent (logged once). Digests in parts are the next step for such sizes.
+
 ## [0.31.0] - 2026-11-11
 
 Large networks no longer keep a full mesh, plus the remaining audit fixes for messages one member could abuse.
