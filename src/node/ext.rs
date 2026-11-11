@@ -229,9 +229,10 @@ impl Node {
             return;
         };
         if env.to != self.ident.id {
-            if env.ttl > 1 {
-                env.ttl -= 1;
-                let st = self.state.lock().unwrap();
+            let st = self.state.lock().unwrap();
+            // Clients relay nothing, and no one more hops than a message starts with.
+            if env.ttl > 1 && Self::client_of(&st, &self.ident.id).is_none() {
+                env.ttl = env.ttl.min(DEFAULT_TTL) - 1;
                 self.forward_ext(&st, &env);
             }
             return;

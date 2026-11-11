@@ -127,7 +127,7 @@ impl Node {
                 let due: Vec<(NodeId, Vec<SocketAddr>)> = st
                     .records
                     .keys()
-                    .filter(|id| !st.links.contains_key(*id) && !busy.contains(*id))
+                    .filter(|id| !st.links.contains_key(*id) && !busy.contains(*id) && self.wanted(&st, id))
                     .map(|id| (*id, self.punch_targets(&st, id)))
                     .filter(|(_, t)| !t.is_empty())
                     .take(MAX_RUNS.saturating_sub(busy.len()))

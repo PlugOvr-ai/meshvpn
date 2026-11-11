@@ -70,12 +70,16 @@ def start_container(name, binary):
 
 def up(c):
     run(["docker", "exec", "-d", c, "sh", "-c", "meshvpn up >> /var/log/meshvpn.log 2>&1"])
-    deadline = time.time() + 60
+    deadline = time.time() + 120
     while time.time() < deadline:
-        if run(["docker", "exec", c, "meshvpn", "status"], ok=False, timeout=30).returncode == 0:
-            return
+        try:
+            if run(["docker", "exec", c, "meshvpn", "status"], ok=False, timeout=30).returncode == 0:
+                return
+        except subprocess.TimeoutExpired:
+            pass  # a node busy joining a big network answers late
         time.sleep(0.5)
-    raise RuntimeError(f"{c}: meshvpn didn't start")
+    log = sh(c, "tail -30 /var/log/meshvpn.log", ok=False)
+    raise RuntimeError(f"{c}: meshvpn didn't start\n{log}")
 
 
 def join(name, binary, invite):
@@ -167,6 +171,8 @@ def measure(n, binary, window, settle, parallel, old_binary=None, old_share=0.0,
         "rss_MB_median": round(statistics.median(rss), 1), "rss_MB_max": round(max(rss), 1),
         "total_MBps": round(sum(rx) / 1e6, 2),
     })
+    direct = [sum(p["path"].startswith("direct") for p in status(c)["peers"]) for c in samples]
+    res["direct_paths_median"] = statistics.median(direct)
     state = int(sh(hub, "stat -c %s /etc/meshvpn/state.json"))
     res["state_kB"] = round(state / 1000, 1)
     res["record_bytes"] = round(state / n)
@@ -190,10 +196,15 @@ def main():
     ap.add_argument("--old-binary", help="an older meshvpn binary for some of the nodes")
     ap.add_argument("--old-share", type=float, default=0.5, help="share of nodes running --old-binary")
     ap.add_argument("-v", "--verbose", action="store_true", help="while joining, say what the samples miss")
+    ap.add_argument("--full-mesh", action="store_true",
+                    help="the binary links every node to every node (0.30 and older): needs a far bigger ARP table")
     ap.add_argument("sizes", nargs="+", type=int)
     args = ap.parse_args()
-    # Linux keeps one ARP table for all containers: a full mesh of N containers needs N*(N-1) entries.
-    need = max(args.sizes) * (max(args.sizes) + 4)
+    # Linux keeps one ARP table for all containers: a full mesh of N containers needs N*(N-1) entries;
+    # with links on demand (0.31: networks above 32 nodes) each node has about a dozen links, and
+    # the hub every node joined through.
+    n = max(args.sizes)
+    need = n * (n + 4) if args.full_mesh else n * 40
     with open("/proc/sys/net/ipv4/neigh/default/gc_thresh3") as f:
         have = int(f.read())
     if have < need:
@@ -216,7 +227,7 @@ def main():
     finally:
         cleanup()
     cols = ["nodes", "converge_s", "new_node_s", "rx_kBps_median", "rx_kBps_max", "tx_kBps_median",
-            "cpu_pct_median", "cpu_pct_max", "rss_MB_median", "total_MBps", "record_bytes"]
+            "cpu_pct_median", "cpu_pct_max", "rss_MB_median", "total_MBps", "record_bytes", "direct_paths_median"]
     print("\n| " + " | ".join(cols) + " |\n|" + "---|" * len(cols))
     for r in results:
         print("| " + " | ".join(str(r.get(c)) for c in cols) + " |")

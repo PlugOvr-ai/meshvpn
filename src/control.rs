@@ -29,6 +29,11 @@ pub enum Request {
         node: String,
     },
     SshOverview,
+    /// `meshvpn net env` (and so `launch`): direct paths to these nodes (ids in hex) before a
+    /// job starts, in a network that links nodes on demand. Answers how many are direct.
+    Connect {
+        nodes: Vec<String>,
+    },
     SshSetRules {
         rules: Vec<crate::config::SshAllow>,
         #[serde(default)]
@@ -344,6 +349,17 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
+            }
+        }
+        // Allowed for everyone: it only opens paths that traffic would open anyway.
+        Ok(Request::Connect { nodes }) => {
+            let ids: Vec<_> = nodes
+                .iter()
+                .filter_map(|n| crate::keys::Key32::from_hex(n).ok())
+                .collect();
+            let direct = node.open_paths(&ids, std::time::Duration::from_secs(5)).await;
+            Response::Message {
+                text: direct.to_string(),
             }
         }
         Ok(_) if !privileged => Response::Error {

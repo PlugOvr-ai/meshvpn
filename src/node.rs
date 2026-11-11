@@ -64,6 +64,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const FORGET_AFTER_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Gossip messages stay well below the 64 KB link frame limit.
 const GOSSIP_BYTES: usize = 48 * 1024;
+/// Forgotten nodes we keep a tombstone of, at most (each goes to every new link).
+const MAX_FORGOTTEN: usize = 4096;
 /// New versions of one node's record (or its details) that are taken at once, and per second
 /// after that.
 const RECORD_BURST: f32 = 5.0;
@@ -92,6 +94,54 @@ const LINK_ANNOUNCE_GAP: Duration = Duration::from_secs(2);
 /// An offline node whose name is now used by a newer, online node (typically the same machine
 /// set up again) is forgotten automatically after this long.
 const AUTO_FORGET_AFTER: Duration = Duration::from_secs(600);
+/// Networks of up to this many nodes keep a link to every node. In bigger ones each node keeps
+/// links to `RING_LINKS` + `RANDOM_LINKS` nodes (`structural`) and to the ones it talks to;
+/// everything else goes through those as relays until a direct path is up.
+const FULL_MESH_MAX: usize = 32;
+/// Links to the nearest nodes by id on each side: keeps the network connected.
+const RING_LINKS: usize = 2;
+/// Links to nodes others can dial, picked by a hash of the pair: short paths across.
+const RANDOM_LINKS: usize = 4;
+/// A link or UDP path nobody sent a packet over for this long is closed (big networks only).
+const IDLE_CLOSE: Duration = Duration::from_secs(300);
+/// A link no rule wants any more is closed after this long (a ring changes as nodes come and go).
+const UNWANTED_GRACE: Duration = Duration::from_secs(60);
+
+/// The limits of links on demand: `FULL_MESH_MAX`, `RING_LINKS`, `RANDOM_LINKS`, `IDLE_CLOSE`
+/// and `UNWANTED_GRACE`, or for tests `MESHVPN_TEST_ON_DEMAND=<max>,<ring>,<random>,<idle s>`
+/// (then the grace is the idle time too).
+struct OnDemand {
+    max: usize,
+    ring: usize,
+    random: usize,
+    idle: Duration,
+    grace: Duration,
+}
+
+fn on_demand_limits() -> &'static OnDemand {
+    static V: std::sync::OnceLock<OnDemand> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let test: Option<Vec<u64>> = std::env::var("MESHVPN_TEST_ON_DEMAND")
+            .ok()
+            .and_then(|v| v.split(',').map(|x| x.trim().parse().ok()).collect());
+        match test.as_deref() {
+            Some(&[max, ring, random, idle]) => OnDemand {
+                max: max as usize,
+                ring: ring as usize,
+                random: random as usize,
+                idle: Duration::from_secs(idle),
+                grace: Duration::from_secs(idle),
+            },
+            _ => OnDemand {
+                max: FULL_MESH_MAX,
+                ring: RING_LINKS,
+                random: RANDOM_LINKS,
+                idle: IDLE_CLOSE,
+                grace: UNWANTED_GRACE,
+            },
+        }
+    })
+}
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -158,6 +208,15 @@ fn tokens(map: &HashMap<NodeId, (f32, Instant)>, id: &NodeId) -> f32 {
     })
 }
 
+/// A hash both ends of a pair compute the same.
+fn pair_hash(x: &NodeId, y: &NodeId) -> [u8; 32] {
+    let (a, b) = if x < y { (x, y) } else { (y, x) };
+    let mut h = blake3::Hasher::new();
+    h.update(&a.0);
+    h.update(&b.0);
+    *h.finalize().as_bytes()
+}
+
 fn is_overlay(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => u32::from(v4) & u32::from(OVERLAY_NETMASK) == 0x6440_0000,
@@ -185,6 +244,10 @@ struct LinkEntry {
     rtt: Option<Duration>,
     /// When we last answered a digest from this link (`DIGEST_REPLY_GAP`).
     digest_at: Option<Instant>,
+    /// We dialed it: in a big network (`on_demand`), the dialer closes a link it no longer needs.
+    outbound: bool,
+    /// Since when no rule of `wanted` keeps the link.
+    unwanted_since: Option<Instant>,
 }
 
 struct Backoff {
@@ -279,6 +342,11 @@ struct State {
     /// New versions of each node's record we take (see `record_tokens`): tokens left, when.
     record_rate: HashMap<NodeId, (f32, Instant)>,
     details_rate: HashMap<NodeId, (f32, Instant)>,
+    /// When we last sent a packet to each node (or a command asked for a link to it): in a big
+    /// network, links and UDP paths are kept only to these and to the `structural` ones.
+    talking: HashMap<NodeId, Instant>,
+    /// The links a big network keeps in any case (`structural`), worked out every tick.
+    structural: HashSet<NodeId>,
     udp_paths: HashMap<NodeId, udp::UdpPath>,
     udp_probing: HashMap<NodeId, udp::Probing>,
     /// Datagrams split because a path can't carry full-size ones, being put back together.
@@ -307,6 +375,8 @@ struct State {
     /// Managed networks (see node/admin.rs).
     roster: Option<(SignedDoc, Roster)>,
     claims: HashMap<NodeId, admin::Admitted>,
+    /// Hashes of the claims checked already (`accept_claim`).
+    claims_seen: HashSet<[u8; 32]>,
     trusted_admins: Vec<NodeId>,
     my_claim: Option<ClaimMsg>,
     /// Why another node turned us away (name of that node, reason), until we are admitted.
@@ -344,6 +414,8 @@ pub struct Node {
     io: PacketIo,
     state: Mutex<State>,
     next_link_id: AtomicU64,
+    /// A node we had no path to is being talked to: dial it now, not at the next tick.
+    want_now: Notify,
     started: Instant,
     /// Nonces of the packets we send (session + counter, `replay`).
     nonces: replay::Sender,
@@ -597,6 +669,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         io,
         state: Mutex::new(State::default()),
         next_link_id: AtomicU64::new(1),
+        want_now: Notify::new(),
         started: Instant::now(),
         nonces,
         socks,
@@ -745,6 +818,16 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     }
     node.ssh_check();
     tokio::spawn(node.clone().tick_loop());
+    let n = node.clone();
+    tokio::spawn(async move {
+        loop {
+            n.want_now.notified().await;
+            let dials = n.dial_candidates(&mut n.state.lock().unwrap());
+            for (key, addrs, boot) in dials {
+                tokio::spawn(n.clone().dial(key, addrs, boot));
+            }
+        }
+    });
     tokio::spawn(node.clone().update_loop());
     tokio::spawn(node.clone().inventory_loop());
     tokio::spawn(crate::share::serve(node.clone()));
@@ -900,13 +983,7 @@ impl Node {
             let me = self.ident.id;
             let dialable = |p: &NodeId| st.records.get(p).is_some_and(|r| !r.info.endpoints.is_empty());
             let (mut keep, mut rest): (Vec<NodeId>, Vec<NodeId>) = n.into_iter().partition(|p| !dialable(p));
-            rest.sort_by_cached_key(|p| {
-                let (a, b) = if me < *p { (me, *p) } else { (*p, me) };
-                let mut h = blake3::Hasher::new();
-                h.update(&a.0);
-                h.update(&b.0);
-                *h.finalize().as_bytes()
-            });
+            rest.sort_by_cached_key(|p| pair_hash(&me, p));
             rest.truncate(NEIGHBORS_MAX);
             keep.extend(rest);
             n = keep;
@@ -920,7 +997,8 @@ impl Node {
     /// links than a record lists, only if the record changes, and not more often than
     /// `LINK_ANNOUNCE_GAP`: while 200 nodes connect, each would send ~200 records to ~200 links.
     fn links_changed(self: &Arc<Self>, st: &mut State) {
-        if st.links.len() <= NEIGHBORS_MAX {
+        // At once in a small full mesh; with links on demand they come and go all the time.
+        if st.links.len() <= NEIGHBORS_MAX && !self.on_demand(st) {
             self.announce(st);
             return;
         }
@@ -2439,6 +2517,22 @@ impl Node {
             {
                 return false;
             }
+            if !leaving {
+                // Forgetting is for nodes that are gone: one that is online here stays (in an
+                // open network every member may forget, so any of them could hide others).
+                if self.is_online(st, &f.id) {
+                    return false;
+                }
+                let have = st.records.get(&f.id).map(|r| r.info.seq);
+                // Open network: only a version we know, so the node's next record brings it back.
+                if st.roster.is_none() && have.is_some_and(|s| f.seq > s) {
+                    return false;
+                }
+                // Tombstones of nodes we never knew: a bounded number.
+                if have.is_none() && !st.forgotten.contains_key(&f.id) && st.forgotten.len() >= MAX_FORGOTTEN {
+                    return false;
+                }
+            }
         }
         st.forgotten.insert(f.id, f.clone());
         if leaving && let Some(l) = st.links.remove(&f.id) {
@@ -2637,6 +2731,120 @@ impl Node {
         st.links.contains_key(id) || st.udp_paths.get(id).is_some_and(|p| p.usable())
     }
 
+    /// A network too big for a link to every node (`FULL_MESH_MAX`).
+    fn on_demand(&self, st: &State) -> bool {
+        st.records.len() > on_demand_limits().max
+    }
+
+    /// The links a big network keeps whether or not traffic flows: to the `RING_LINKS` nearest
+    /// nodes by id on each side (both ends pick each other, so the ring holds even between
+    /// nodes of which only one can be dialed), and to `RANDOM_LINKS` nodes others can dial,
+    /// the ones whose pair hash with us is lowest (stable while nodes come and go). Clients
+    /// relay nothing and are nobody's structural link; they pick theirs like everyone else.
+    fn structural(&self, st: &State) -> HashSet<NodeId> {
+        let me = self.ident.id;
+        let mut ring: Vec<NodeId> = st
+            .records
+            .keys()
+            .filter(|id| **id != me && !st.banned.contains_key(*id) && Self::client_of(st, id).is_none())
+            .filter(|id| self.is_online(st, id))
+            .copied()
+            .collect();
+        let candidates = ring.clone();
+        ring.push(me);
+        ring.sort();
+        let mut out = HashSet::new();
+        if ring.len() > 1 {
+            let at = ring.iter().position(|id| *id == me).unwrap_or(0);
+            let n = ring.len();
+            for d in 1..=on_demand_limits().ring.min(n - 1) {
+                out.insert(ring[(at + d) % n]);
+                out.insert(ring[(at + n - d) % n]);
+            }
+            out.remove(&me);
+        }
+        let mut far: Vec<NodeId> = candidates
+            .into_iter()
+            .filter(|id| !out.contains(id))
+            .filter(|id| st.records.get(id).is_some_and(|r| !r.info.endpoints.is_empty()))
+            .collect();
+        far.sort_by_cached_key(|p| pair_hash(&me, p));
+        out.extend(far.into_iter().take(on_demand_limits().random));
+        out
+    }
+
+    /// Whether we want a link (or UDP path) to `id`: always in a small network; in a big one if
+    /// it is structural or we talked to it lately.
+    fn wanted(&self, st: &State, id: &NodeId) -> bool {
+        !self.on_demand(st)
+            || st.structural.contains(id)
+            || st
+                .talking
+                .get(id)
+                .is_some_and(|t| t.elapsed() < on_demand_limits().idle)
+    }
+
+    /// Notes that we send to `id`: in a big network, a direct path to it comes up (at once if
+    /// there was none) and stays while traffic flows.
+    fn talk_to(&self, st: &mut State, id: &NodeId) {
+        let now = Instant::now();
+        let fresh = st
+            .talking
+            .insert(*id, now)
+            .is_none_or(|t| now - t >= on_demand_limits().idle);
+        if fresh && self.on_demand(st) && !st.links.contains_key(id) {
+            self.want_now.notify_one();
+        }
+    }
+
+    /// Direct paths (a link or UDP) to `ids` within `wait`, in a network that links nodes on
+    /// demand (in a small one they are up anyway). Returns how many of them are direct.
+    pub async fn open_paths(&self, ids: &[NodeId], wait: Duration) -> usize {
+        let direct = |st: &State| {
+            ids.iter()
+                .filter(|id| st.links.contains_key(*id) || st.udp_paths.get(*id).is_some_and(|p| p.usable()))
+                .count()
+        };
+        {
+            let mut st = self.state.lock().unwrap();
+            let known: Vec<NodeId> = ids
+                .iter()
+                .filter(|id| **id != self.ident.id && st.records.contains_key(*id))
+                .copied()
+                .collect();
+            for id in &known {
+                self.talk_to(&mut st, id);
+            }
+        }
+        let until = Instant::now() + wait;
+        let want = ids.iter().filter(|id| **id != self.ident.id).count();
+        loop {
+            let n = direct(&self.state.lock().unwrap());
+            if n >= want || Instant::now() >= until {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Closes links we dialed that nothing wants any more (after `UNWANTED_GRACE`).
+    fn close_unwanted(&self, st: &mut State) {
+        let now = Instant::now();
+        st.talking.retain(|_, t| now - *t < on_demand_limits().idle);
+        let unwanted: HashSet<NodeId> = st.links.keys().filter(|id| !self.wanted(st, id)).copied().collect();
+        for (id, l) in st.links.iter_mut() {
+            if !l.outbound || !unwanted.contains(id) {
+                l.unwanted_since = None;
+                continue;
+            }
+            let since = *l.unwanted_since.get_or_insert(now);
+            if now - since >= on_demand_limits().grace {
+                debug!("closing the idle link to {id}");
+                l.kill.notify_one();
+            }
+        }
+    }
+
     fn is_online(&self, st: &State, id: &NodeId) -> bool {
         st.links.contains_key(id)
             || st
@@ -2773,6 +2981,7 @@ impl Node {
         let direct = {
             let mut st = self.state.lock().unwrap();
             let dst = self.node_for(&st, dst_ip)?;
+            self.talk_to(&mut st, &dst);
             st.udp_paths
                 .get(&dst)
                 .is_some_and(|p| p.usable())
@@ -2813,7 +3022,8 @@ impl Node {
         let src = NodeId::from_slice(&f[33..65]).ok()?;
         if dst != self.ident.id {
             // Relay for others. Contents are end-to-end encrypted; we can't read them.
-            let ttl = f[65];
+            // A sender may set any TTL; we never pass on more than we would start with.
+            let ttl = f[65].min(DEFAULT_TTL);
             if ttl <= 1 {
                 return None;
             }
@@ -3196,6 +3406,8 @@ impl Node {
                 addr: addr.clone(),
                 rtt: None,
                 digest_at: None,
+                outbound: initiator,
+                unwanted_since: None,
             };
             st.links.insert(peer, entry);
             self.ingest(&mut st, hello.info.clone(), true);
@@ -3285,7 +3497,12 @@ impl Node {
                 T_DOC => self.handle_doc(peer, payload),
                 T_EXT => self.handle_ext(payload),
                 T_REJECT => {
-                    let why: String = String::from_utf8_lossy(payload).chars().take(300).collect();
+                    // The text comes from the peer and ends up in the terminal: no escape sequences.
+                    let why: String = String::from_utf8_lossy(payload)
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(300)
+                        .collect();
                     let mut st = self.state.lock().unwrap();
                     let by = st
                         .records
@@ -3455,7 +3672,7 @@ impl Node {
         st.dht_hints.retain(|_, (_, at)| at.elapsed() < rendezvous::HINT_TTL);
         for (id, rec) in &st.records {
             let key = id.hex();
-            if st.links.contains_key(id) || !ready(st, &key) {
+            if st.links.contains_key(id) || !ready(st, &key) || !self.wanted(st, id) {
                 continue;
             }
             // Addresses found through the rendezvous first: they are newer than the record.
@@ -3598,6 +3815,14 @@ impl Node {
                 self.expire_clients(&mut st);
                 self.auto_forget(&mut st);
                 self.rebuild(&mut st);
+                st.structural = if self.on_demand(&st) {
+                    self.structural(&st)
+                } else {
+                    HashSet::new()
+                };
+                if self.on_demand(&st) {
+                    self.close_unwanted(&mut st);
+                }
                 self.dial_candidates(&mut st)
             };
             for (key, addrs, boot) in dials {
@@ -4473,6 +4698,12 @@ impl Node {
     /// Fills our row of the network matrix: RTT and LAN path for every online peer, and the
     /// throughput of direct links when `bytes` > 0. Then tells everyone.
     pub async fn measure(self: Arc<Self>, only: Option<Vec<NodeId>>, bytes: u64) {
+        // A group (net check, net matrix --measure): direct paths first, so the round trips and
+        // LAN paths are those its traffic will take (not the relays of a big network).
+        let on_demand = self.on_demand(&self.state.lock().unwrap());
+        if let Some(o) = only.as_ref().filter(|_| on_demand) {
+            self.open_paths(o, Duration::from_secs(3)).await;
+        }
         let peers: Vec<NodeInfo> = {
             let st = self.state.lock().unwrap();
             st.records

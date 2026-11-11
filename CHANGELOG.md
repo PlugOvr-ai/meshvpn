@@ -8,6 +8,28 @@ puts the section at the top of the release notes.
 Sections: **Added**, **Changed**, **Fixed**, **Security**, **Removed**. Security fixes say what an
 attacker needed and what they could do.
 
+## [Unreleased]
+
+## [0.31.0] - 2026-11-11
+
+Large networks no longer keep a full mesh, plus the remaining audit fixes for messages one member could abuse.
+
+### Changed
+- **Links on demand in networks over 32 nodes.** A node keeps links to 4 ring neighbours and 4 random nodes,
+  and opens a direct path to any other node only when it sends to it; a path unused for 5 minutes closes.
+  Before, every node kept a link to every other one. `net env` and `net matrix --measure` open the paths
+  they need first. Networks of up to 32 nodes stay a full mesh. Link changes are announced in batches.
+
+### Security
+- **In open networks any member could hide any node** for 5 minutes at a time, again and again, with a
+  forget message (every member may forget there). A node now forgets on another's word only nodes that are
+  offline here, and in open networks only a version of the record it has (the node's next record brings it
+  back). Tombstones of nodes it never knew are kept up to 4096.
+- Admission claims sent again cost no signature checks (before: 3-4 per copy, from any member).
+- Relayed packets and extension messages carry at most 8 hops, whatever the sender set (before: up to 255),
+  and clients no longer pass on extension messages.
+- The reason a node gives for turning another away is shown without control characters (no terminal escapes).
+
 ## [0.30.2] - 2026-11-11
 
 More messages from one node that made others do far more than the sender's own traffic (found by an audit

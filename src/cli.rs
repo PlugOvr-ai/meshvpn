@@ -1263,6 +1263,18 @@ fn real_main(cli: Cli) -> Result<i32> {
                         None => group.iter().min_by_key(|n| n.name.clone()).unwrap().clone(),
                     };
                     let vars = agent::training_env(&all[0], &group, &master, port)?;
+                    // Direct paths to the group before the job starts (a big network links
+                    // nodes on demand; launch's own traffic takes the mesh also when NCCL takes
+                    // the LAN). Older meshvpn doesn't know the request: nothing to do.
+                    if group.len() > 1 {
+                        let nodes = group
+                            .iter()
+                            .filter(|n| n.id != all[0].id)
+                            .map(|n| n.id.clone())
+                            .collect();
+                        let _ = tokio::runtime::Runtime::new()?
+                            .block_on(control::request(&dir, &control::Request::Connect { nodes }));
+                    }
                     if json {
                         let map: serde_json::Map<String, serde_json::Value> = vars
                             .into_iter()

@@ -296,6 +296,8 @@ impl Node {
         let peers: Vec<(NodeId, Vec<SocketAddr>)> = st
             .records
             .values()
+            // In a big network only towards the nodes we talk to or keep a link to.
+            .filter(|r| self.wanted(&st, &r.info.id))
             .map(|r| {
                 let id = r.info.id;
                 if self.is_online(&st, &id) {

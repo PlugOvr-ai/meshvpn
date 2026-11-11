@@ -177,17 +177,17 @@ def invite(admin, args=""):
     return admin.mvj(f"invite {args}")["invite"]
 
 
-def mesh(lab, names, net=None, tags=None, join_args="", admin_args=""):
+def mesh(lab, names, net=None, tags=None, join_args="", admin_args="", env=""):
     """A managed network: the first name is the admin (endpoint = its container name)."""
     net = net or lab.network("net")
     nodes = [lab.node(n, [net]) for n in names]
     hub = nodes[0]
     hub.mv(f"init --name {hub.name} --endpoint {hub.c}:7870 {admin_args}")
-    hub.up()
+    hub.up(env)
     for n in nodes[1:]:
         t = f"--tag {tags}" if tags else ""
         n.mv(f"join {invite(hub)} --name {n.name} {t} {join_args}")
-        n.up()
+        n.up(env)
     for n in nodes[1:]:
         wait(lambda n=n: hub.online(n.name), f"{n.name} online at {hub.name}")
     return net, nodes
@@ -235,6 +235,35 @@ def test_basics(lab):
     check("renamed b -> bee" in out, f"rename output: {out}")
     wait(lambda: a.online("bee"), "a sees the new name")
     check(ping(a, "bee.mesh"), "new name doesn't resolve")
+
+
+@test
+def test_links_on_demand(lab):
+    """A big network (here: above 2 nodes) keeps links only to the nearest nodes by id and to
+    the ones it talks to: others are reached through relays at once, directly within seconds,
+    and the direct path closes again when idle."""
+    env = "MESHVPN_TEST_ON_DEMAND=2,1,0,20"  # on demand above 2 nodes, 1 ring link each side, 20 s idle
+    _, nodes = mesh(lab, ["hub", "a", "b", "c", "d", "e"], env=env)
+    a = nodes[1]
+    others = [n.name for n in nodes if n is not a]
+
+    def direct(node):
+        return {p["name"] for p in node.status()["peers"] if p["path"].startswith("direct")}
+
+    wait(lambda: all(a.online(n) for n in others), "a sees all nodes online")
+    # The links every node opened to the hub to join close, except where the hub is a ring neighbor.
+    wait(lambda: all(len(direct(n)) <= 2 for n in nodes), "every node down to its 2 ring links", timeout=150, interval=3)
+    far = next(n for n in nodes if n is not a and n.name not in direct(a))
+    check(ping(a, far.ip(), count=1), f"a can't reach {far.name} through relays")
+    wait(lambda: far.name in direct(a), f"a direct to {far.name} after talking to it", timeout=15, interval=0.5)
+    check(all(a.online(n) for n in others), "a still sees all nodes online")
+    wait(lambda: far.name not in direct(a), f"the idle path to {far.name} closes", timeout=150, interval=3)
+    check(ping(a, far.ip(), count=1), f"a can't reach {far.name} again")
+    check(all(a.online(n) for n in others), "nodes stay online without links to them")
+    # launch runs `net env` on every node of the group: the paths are up before the job starts.
+    far2 = next(n for n in nodes if n is not a and n.name not in direct(a))
+    a.mv(f"net env a {far2.name}")
+    check(far2.name in direct(a), f"net env didn't open a direct path to {far2.name}")
 
 
 @test

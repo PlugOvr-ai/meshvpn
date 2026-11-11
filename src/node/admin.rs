@@ -152,6 +152,23 @@ impl Node {
     /// Checks a claim; on success it is recorded (with our witness if it is fresh) and
     /// returned for flooding. Errors say why a node can't join.
     pub(super) fn accept_claim(&self, st: &mut State, msg: ClaimMsg) -> Result<Option<ClaimMsg>> {
+        // A claim we took already costs no signature checks (anyone could resend one). Only
+        // taken ones: a claim refused now (its admin's roster not here yet) may be fine later.
+        let digest = *blake3::hash(&serde_json::to_vec(&msg.claim).unwrap_or_default()).as_bytes();
+        if st.claims_seen.contains(&digest) {
+            return Ok(None);
+        }
+        let res = self.check_claim(st, msg);
+        if res.is_ok() {
+            if st.claims_seen.len() >= 4096 {
+                st.claims_seen.clear();
+            }
+            st.claims_seen.insert(digest);
+        }
+        res
+    }
+
+    fn check_claim(&self, st: &mut State, msg: ClaimMsg) -> Result<Option<ClaimMsg>> {
         let claim = msg.claim.open::<Claim>(|c| c.node)?;
         let ticket = claim.ticket.open::<Ticket>(|t| t.issuer)?;
         if claim.net != self.net || ticket.net != self.net {
