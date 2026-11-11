@@ -189,6 +189,30 @@ def full(port, token):
     print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
 
 
+def full_mate(port, token):
+    """The packed desktop's MATE: its terminal, typing, its file manager, the browser for a link."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1280, 800))
+    v.until(lambda: v.size == [1280, 800] and v.frames >= 1, "first frame", 90)
+    v.settle(8)  # MATE starting
+    v.send(C_LAUNCH, b"mate-terminal")
+    v.until(lambda: any("Terminal" in w["title"] for w in v.windows), "the MATE terminal", 60)
+    v.settle(2)
+    for ch in "dpkg --version > /tmp/full_typed":
+        v.key(ord(ch), 1)
+    v.key(0xFF0D, 0)
+    v.settle(1)
+    v.send(C_LAUNCH, b"caja --no-desktop /tmp")
+    v.until(lambda: any(w["title"] == "tmp" or "Caja" in w["title"] for w in v.windows), "Caja", 60)
+    # A link opened as MATE's programs open one (GIO, which asks the MIME defaults).
+    # The session's environment, as the MATE session wrapper sets it for its programs.
+    v.send(C_LAUNCH, b"E=$HOME/.local/share/meshvpn/desktop-full/opt/meshvpn-desktop-full/env; "
+                     b"XDG_CONFIG_DIRS=$E/etc/xdg XDG_DATA_DIRS=/usr/share:$E/share PATH=$PATH:$E/bin "
+                     b"$E/bin/gio open https://example.invalid/")
+    v.until(lambda: any("Chromium" in w["title"] for w in v.windows), "Chromium", 90)
+    print(json.dumps({"windows": [w["title"] for w in v.windows], "notices": v.notices}))
+
+
 def screen(port, token):
     """The machine's own screen: its size stays, typing reaches its programs."""
     v = Viewer(port, token)
@@ -326,6 +350,8 @@ def main():
         return screen(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "full":
         return full(port, token)
+    if len(sys.argv) > 3 and sys.argv[3] == "full_mate":
+        return full_mate(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "xfce":
         return xfce(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "fallback":

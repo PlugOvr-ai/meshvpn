@@ -8,7 +8,25 @@ puts the section at the top of the release notes.
 Sections: **Added**, **Changed**, **Fixed**, **Security**, **Removed**. Security fixes say what an
 attacker needed and what they could do.
 
-## [Unreleased]
+## [0.30.0] - 2026-11-11
+
+### Changed
+- **Networks of 200 nodes at under 50 kB/s per node** (0.29.2: 175 kB/s; 100 nodes 21 kB/s instead of
+  64). A node's details (hardware and load, measurements, shared objects, GPU reservations) are
+  signed and sent apart from its record, and again only when something others act on changes, else
+  every 5 minutes. The record itself goes out every 5 minutes instead of every 30 s; who is online
+  comes with the digests the nodes exchange every 10 s. A new link no longer sends all records
+  (about 4 MB at 200 nodes, once per link): the new node pulls what it lacks, once. Nodes of 0.29.2
+  and older keep getting full records every 30 s and see everything as before.
+
+### Added
+- **MATE without root**: `install.sh | sh -s -- --user --desktop mate` (or `sh meshvpn-full-<arch>.run
+  --desktop mate`). The packed desktop now holds MATE next to Xfce (about 90 MB more: 750 MB to
+  download, 2.3 GB unpacked); `--desktop` picks the one `meshvpn desktop` starts by default.
+
+### Fixed
+- Packed desktop: programs started from the browser bar found no session bus (MATE's terminal
+  exited at once). The session's bus is now also at `$XDG_RUNTIME_DIR/bus`, where they look.
 
 ## [0.29.2] - 2026-11-10
 

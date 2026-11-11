@@ -29,6 +29,19 @@ const SYSTEM: &str = "/var/lib/meshvpn/desktop";
 /// Where `meshvpn desktop setup --desktop` notes the machine's choice.
 pub const DEFAULT_FILE: &str = "/var/lib/meshvpn/desktop/default-session";
 
+/// The desktop chosen when the packed desktop was installed without root (desktop/run-header.sh).
+pub fn user_default_file() -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join(".local/share"))
+        })?;
+    Some(data.join("meshvpn/desktop-full/default-session"))
+}
+
 fn user_base() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(x) => PathBuf::from(x),

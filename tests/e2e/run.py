@@ -2136,7 +2136,7 @@ def test_desktop_full(lab):
     run(["docker", "cp", FULL_RUN, f"{box.c}:/tmp/full.run"])
     # No apt-get update ran in this image: nothing could have come from a package manager.
     out = box.sh(f"sh /tmp/full.run join {invite(hub)} --name box --ssh-allow-all agent", timeout=600)
-    check("with Xfce and Chromium" in out, out[-500:])
+    check("with Xfce, MATE and Chromium" in out, out[-500:])
     box.sh("useradd -m agent")
     wait(lambda: hub.sh("su agent -c 'ssh -o BatchMode=yes -o ConnectTimeout=5 agent@box.mesh true'", ok=False).returncode == 0,
          "ssh from hub to box", 60)
@@ -2186,7 +2186,7 @@ def test_desktop_full_user(lab):
     # A daemon whose PATH doesn't have ~/.local/bin, as is usual.
     home = "export HOME=/home/dev; "
     out = box.sh(home + f"sh /tmp/full.run join {invite(hub)} --name box", user="dev", timeout=600)
-    check("with Xfce and Chromium" in out and "for this user alone" in out, out[-800:])
+    check("with Xfce, MATE and Chromium" in out and "for this user alone" in out, out[-800:])
     check(box.sh("test -e /nix -o -e /usr/local/bin/meshvpn -o -e /opt/meshvpn-desktop-full && echo root || echo clean").strip() == "clean",
           "without root nothing goes in the system's places")
     mv = "/home/dev/.local/bin/meshvpn"
@@ -2221,7 +2221,7 @@ def test_desktop_full_user(lab):
     check(p.returncode != 0 and "not ours" in p.stderr, f"someone else's link: {p.stdout}{p.stderr}")
     # Installing again gets out of the way of it.
     out = box.sh(home + "sh /tmp/full.run", user="dev", timeout=600)
-    check("with Xfce and Chromium" in out, out[-500:])
+    check("with Xfce, MATE and Chromium" in out, out[-500:])
     new = box.sh("cat /home/dev/.local/share/meshvpn/desktop-full/prefix").strip()
     check(new != prefix, "should have taken another name")
     box.sh(home + wrapper, user="dev")
@@ -2270,6 +2270,48 @@ def test_desktop_full_nameless(lab):
     check(p.returncode == 0, f"packed desktop: {p.stdout[-2000:]}{p.stderr[-1000:]}"
           + box.sh("tail -30 /tmp/meshvpn-desktop-*/session.log", ok=False).stdout)
     check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, "a terminal of this desktop runs the machine's programs")
+
+
+@test
+def test_desktop_full_mate(lab):
+    """The one-file installer without root, MATE chosen: the default desktop is MATE, not Xfce."""
+    check(FULL_RUN, "needs --desktop-full (build it with desktop/make-run.sh)")
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    box = lab.node("box", [net], caps=False, install=False, cmd=["sleep", "infinity"], image="debian:12-slim")
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    hub.sh("su agent -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'")
+    box.sh("useradd -m dev")
+    run(["docker", "cp", FULL_RUN, f"{box.c}:/tmp/full.run"])
+    box.sh("chmod 644 /tmp/full.run")
+    home = "export HOME=/home/dev; "
+    out = box.sh(home + f"sh /tmp/full.run --desktop mate join {invite(hub)} --name box", user="dev", timeout=600)
+    check("with Xfce, MATE and Chromium" in out, out[-800:])
+    mv = "/home/dev/.local/bin/meshvpn"
+    box.sh(home + f"{mv} ssh allow agent@hub --as dev", user="dev")
+    wait(lambda: hub.online("box"), "box online at hub")
+    o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+    wait(lambda: hub.sh(f"ssh {o} dev@box.mesh whoami", user="agent", ok=False).stdout.strip() == "dev",
+         "login to the rootless node", 60)
+    # No --desktop here: the node's default, chosen when installing.
+    hub.sh("cd /home/agent && (meshvpn desktop box --user dev --no-browser --port 18089 > /tmp/desktop.out 2>&1 &)", user="agent")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(hub.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 30)
+    token = out.split("#", 1)[1].split()[0]
+    p = hub.sh(f"python3 /usr/local/bin/desktop_client.py 18089 {token} full_mate", user="agent", ok=False, timeout=300)
+    log = box.sh("cat /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
+    check(p.returncode == 0, f"packed MATE: {p.stdout[-2000:]}{p.stderr[-1000:]}{log[-1500:]}")
+    check("dpkg" in box.sh("cat /tmp/full_typed", ok=False).stdout, "a terminal of this desktop runs the machine's programs")
+    check("using the built-in desktop" not in log, f"MATE should have stayed up: {log[-1000:]}")
+    # nixpkgs wraps them: .marco-wrapped (15 characters of it).
+    procs = box.sh("cat /proc/[0-9]*/comm", ok=False).stdout
+    check(".marco-wrapped" in procs and ".mate-panel-wra" in procs and "xfwm4" not in procs,
+          f"MATE's window manager and panel: {procs.split()}")
+    box.sh(home + f"{mv} desktop stop", user="dev", ok=False)
+    # Removing it takes MATE's commands too.
+    box.sh(home + "sh /tmp/full.run --uninstall", user="dev")
+    left = box.sh("ls /home/dev/.local/bin").split()
+    check(left == ["meshvpn"], f"left behind: {left}")
 
 
 def full_user_session(hub, box, port, label):

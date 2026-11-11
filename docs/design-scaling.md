@@ -1,6 +1,7 @@
 # Design: meshvpn for 1000 nodes
 
-Status: proposal, 2026-11-09. Step 0 and parts of step 1 are built (2026-11-10, not released).
+Status: proposal, 2026-11-09. Steps 0 and 1 are built: 1.1 and 1.3 in 0.29.2 (2026-11-10), 1.2 and 1.4
+(2026-11-11) not released yet.
 
 ## Where it breaks today
 
@@ -67,6 +68,34 @@ machine (20 cores, one container per node) can run.
 Mixed versions (`--old-binary`, 60 nodes, half of them on 0.28.2): every node sees every other
 within 7 s and a new node within 7 s; 600 kB/s per node, about what 0.28.2 alone costs. The
 saving comes once the nodes are updated.
+
+## Measured after all of step 1 (2026-11-11)
+
+Built: the details (inventory, perf, measured, objects, leases) apart from the record, signed on
+their own, again only when something others act on changes (reservations, objects, a finished
+measurement, GPUs, LAN paths) or every 5 minutes (1.2); the record every 5 minutes instead of
+30 s, with liveness in the digests (`T_DIGEST2`: how long ago the sender last heard from each
+node), as long as no older node is online (1.4). And one thing the measurements showed: a new
+link no longer sends the whole table (4 MB at 200 nodes, received once per link, so a new node
+got ~800 MB), but the node's own record, the last 5 s of records and a digest; the rest is
+pulled once.
+
+| Nodes | Traffic per node | CPU | Memory | All see all | New node seen |
+|---|---|---|---|---|---|
+| 50 | 9 kB/s (0.29.2: 17) | 0.37 % | 17 MB | 3 s | 3 s |
+| 100 | 21 kB/s (64) | 0.68 % | 28 MB | 3 s | 3 s |
+| 200 | 46 kB/s (175) | 1.5 % | 51 MB | 11 s (24) | 3.5 s (8) |
+
+(50 nodes measured with 1.2 only.) What's left is mostly not gossip: every link sends a TCP ping
+and a UDP keepalive every 10 s in both directions, about 150–200 B/s per peer, so 15–20 kB/s at
+100 nodes and ~40 kB/s at 200. That grows with the number of links, i.e. with N in a full mesh:
+about 200 kB/s at 1000 nodes even with no gossip at all. Step 2 (about 8 permanent links) is
+what removes it.
+
+Mixed versions (60 nodes, half on 0.29.2): all see all within 11 s, 20 kB/s per node (with an
+older node online the record goes out every 30 s, as those decide who is online by fresh
+records). Older nodes get full records from the owner directly and see the new nodes' details;
+records without details never go to them.
 
 ## Goals
 

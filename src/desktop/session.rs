@@ -262,12 +262,16 @@ pub fn resolve_mode(want: &str) -> Result<Mode> {
         }
         bail!(
             "{} is not installed on this machine - install it with `sudo meshvpn desktop setup --desktop {}` \
-             there (Xfce without root: install.sh --user --desktop xfce), or use the built-in desktop (--plain)",
+             there (Xfce or MATE without root: install.sh --user --desktop xfce|mate), or use the built-in desktop (--plain)",
             m.label(),
             m.name()
         );
     }
-    let chosen = std::fs::read_to_string(bundle::DEFAULT_FILE).unwrap_or_default();
+    // The machine's choice, else the one made when installing the packed desktop without root.
+    let chosen = std::fs::read_to_string(bundle::DEFAULT_FILE)
+        .ok()
+        .or_else(|| bundle::user_default_file().and_then(|f| std::fs::read_to_string(f).ok()))
+        .unwrap_or_default();
     Ok(std::iter::once(chosen.trim())
         .chain(DESKTOPS)
         .filter_map(Mode::from_name)
@@ -283,7 +287,12 @@ fn find_user_desktop() {
         return;
     };
     let bin = PathBuf::from(home).join(".local/bin");
-    if has_xfce() || !bin.join("xfce4-session").is_file() {
+    let in_path =
+        |cmd: &str| std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()));
+    if !["xfce4-session", "mate-session"]
+        .iter()
+        .any(|c| bin.join(c).is_file() && !in_path(c))
+    {
         return;
     }
     let mut paths: Vec<PathBuf> = std::env::var_os("PATH")

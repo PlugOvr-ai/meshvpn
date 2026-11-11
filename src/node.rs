@@ -42,8 +42,14 @@ const OVERLAY_PREFIX: u8 = 10;
 
 const TICK: Duration = Duration::from_secs(10);
 const REANNOUNCE: Duration = Duration::from_secs(30);
+/// Our record again this often when every node takes details apart: it changes rarely by
+/// then, and their digests (`T_DIGEST2`) say who is alive.
+const HEARTBEAT: Duration = Duration::from_secs(300);
 /// A node we have not heard a fresh record from within this window is offline.
 const ONLINE_WINDOW: Duration = Duration::from_secs(95);
+/// Details (load, memory, round trips) are signed anew at least this often, and more often
+/// only when something others act on changed (see `update_details`).
+const DETAILS_EVERY: Duration = Duration::from_secs(300);
 /// Links that are silent this long are dead (we ping every TICK).
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
 /// The most test data per peer one measurement sends (requests may come from any node or user).
@@ -143,8 +149,11 @@ fn is_overlay(ip: IpAddr) -> bool {
 }
 
 struct Record {
+    /// The record, with its details put in (from `details`, or in it for older nodes).
     info: NodeInfo,
     signed: SignedInfo,
+    /// Details apart from the record (`info.split`), the newest we have.
+    details: Option<(NodeDetails, SignedDetails)>,
     /// When we last received a *newer* version of the record (None = loaded from disk).
     last_heard: Option<Instant>,
 }
@@ -179,7 +188,15 @@ struct State {
     bootstrap_ids: HashMap<String, NodeId>,
     extra_bootstrap: Vec<String>,
     my_seq: u64,
+    /// Our record without its details (version `my_seq`), for nodes that take details apart.
     my_signed: Option<SignedInfo>,
+    /// Our full record (version `my_seq - 1`), for older nodes.
+    my_full: Option<SignedInfo>,
+    /// Our details, as last signed, and when.
+    my_details: Option<(NodeDetails, SignedDetails)>,
+    my_details_at: Option<Instant>,
+    /// The SSH keys in our record.
+    my_ssh_keys: Vec<SshKey>,
     /// The `neighbors` of `my_signed`.
     my_neighbors: Vec<NodeId>,
     last_announce: Option<Instant>,
@@ -621,6 +638,9 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         for s in saved.peers {
             node.ingest(&mut st, s, false);
         }
+        for d in saved.details {
+            node.ingest_details(&mut st, d);
+        }
         node.resign(&mut st);
         node.rebuild(&mut st);
     }
@@ -903,20 +923,28 @@ impl Node {
         });
     }
 
-    fn resign(&self, st: &mut State) {
+    /// Signs our record anew (both versions), and our details when they changed. Returns
+    /// whether the details are new.
+    fn resign(&self, st: &mut State) -> bool {
         let neighbors = self.neighbor_list(st);
         st.my_neighbors = neighbors.clone();
         st.my_endpoints = self.endpoints(st);
         st.my_udp = self.udp_candidates(st);
         st.my_udp6 = self.udp6_candidates();
-        st.my_seq = now_ms().max(st.my_seq + 1);
+        // Two versions: the full record for older nodes, and the core one after it.
+        st.my_seq = now_ms().max(st.my_seq + 2);
+        st.my_ssh_keys = if self.cfg.publish_ssh_keys {
+            local_ssh_keys()
+        } else {
+            vec![]
+        };
         let info = NodeInfo {
             id: self.ident.id,
             noise_pub: self.ident.noise_pub,
             name: st.my_name.clone(),
             endpoints: st.my_endpoints.clone(),
             neighbors,
-            seq: st.my_seq,
+            seq: st.my_seq - 1,
             net: self.net.clone(),
             version: crate::update::current(),
             tags: st.my_tags.clone(),
@@ -948,13 +976,91 @@ impl Node {
             ipv6: self.my_ip6.is_some(),
             digest: true,
             links: st.links.len() as u64,
-            ssh_keys: if self.cfg.publish_ssh_keys {
-                local_ssh_keys()
-            } else {
-                vec![]
-            },
+            ssh_keys: st.my_ssh_keys.clone(),
+            split: false,
+            details: 0,
         };
-        st.my_signed = Some(SignedInfo::sign(&info, &self.ident));
+        let new_details = self.update_details(st, &info);
+        let details_seq = st.my_details.as_ref().map_or(0, |(d, _)| d.seq);
+        let mut core = info.core(details_seq);
+        core.seq = st.my_seq;
+        st.my_signed = Some(SignedInfo::sign(&core, &self.ident));
+        st.my_full = Some(SignedInfo::sign(&info, &self.ident));
+        new_details
+    }
+
+    /// Signs our details anew when something others act on changed (reservations, shared
+    /// objects, a finished measurement, the GPUs, LAN paths), or every `DETAILS_EVERY` (load,
+    /// memory, round trips). Returns whether it did.
+    fn update_details(&self, st: &mut State, info: &NodeInfo) -> bool {
+        let doc = info.details_doc(0);
+        let gpus = |d: &NodeDetails| {
+            d.inventory
+                .as_ref()
+                .map(|i| i.gpus.iter().map(|g| (g.index, g.name.clone())).collect::<Vec<_>>())
+        };
+        // Which peers we reach over a shared LAN (for NCCL), not how fast.
+        let lans = |d: &NodeDetails| {
+            d.perf
+                .iter()
+                .filter_map(|p| p.lan_ip.as_ref().map(|ip| (p.peer, ip.clone())))
+                .collect::<Vec<_>>()
+        };
+        let due = match &st.my_details {
+            None => true,
+            Some((old, _)) => {
+                old.leases != doc.leases
+                    || old.objects != doc.objects
+                    || old.measured != doc.measured
+                    || gpus(old) != gpus(&doc)
+                    || lans(old) != lans(&doc)
+                    || st.my_details_at.is_none_or(|t| t.elapsed() >= DETAILS_EVERY)
+            }
+        };
+        if !due {
+            return false;
+        }
+        let seq = now_ms().max(st.my_details.as_ref().map_or(0, |(d, _)| d.seq + 1));
+        let doc = info.details_doc(seq);
+        let signed = SignedDetails::sign(&doc, &self.ident);
+        st.my_details = Some((doc, signed));
+        st.my_details_at = Some(Instant::now());
+        true
+    }
+
+    /// How often our record goes out again when nothing changed: every `REANNOUNCE` while an
+    /// older node is online (it decides who is online by fresh records), else `HEARTBEAT`.
+    fn heartbeat(&self, st: &State) -> Duration {
+        if st
+            .records
+            .values()
+            .any(|r| !r.info.split && self.is_online(st, &r.info.id))
+        {
+            REANNOUNCE
+        } else {
+            HEARTBEAT
+        }
+    }
+
+    /// Takes details apart from records (newer than 0.29.2): gets core records and details,
+    /// never older nodes' full records of a node that splits them.
+    fn splits(st: &State, id: &NodeId) -> bool {
+        st.records.get(id).is_some_and(|r| r.info.split)
+    }
+
+    /// Our record as node `to` takes it.
+    fn my_record_for(st: &State, to: &NodeId) -> Option<SignedInfo> {
+        if Self::splits(st, to) {
+            st.my_signed.clone()
+        } else {
+            st.my_full.clone()
+        }
+    }
+
+    /// Another node's record for `to`: none if it is a core record and `to` doesn't take
+    /// details apart (it would lose them; it gets the full record from the owner itself).
+    fn record_for(st: &State, r: &Record, to: &NodeId) -> Option<SignedInfo> {
+        (!r.info.split || Self::splits(st, to)).then(|| r.signed.clone())
     }
 
     /// Re-sign our record and push it to all neighbors.
@@ -963,13 +1069,33 @@ impl Node {
         if self.leaving.load(Ordering::Relaxed) {
             return;
         }
-        self.resign(st);
+        let new_details = self.resign(st);
         st.last_announce = Some(Instant::now());
         st.announce_pending = false;
-        let signed = st.my_signed.clone().unwrap();
-        let f = frame(T_GOSSIP, &serde_json::to_vec(&vec![signed]).unwrap());
-        for l in st.links.values() {
-            Self::send_gossip(l, f.clone());
+        let core = frame(
+            T_GOSSIP,
+            &serde_json::to_vec(&vec![st.my_signed.clone().unwrap()]).unwrap(),
+        );
+        let full = frame(
+            T_GOSSIP,
+            &serde_json::to_vec(&vec![st.my_full.clone().unwrap()]).unwrap(),
+        );
+        let details = new_details
+            .then(|| {
+                st.my_details
+                    .as_ref()
+                    .map(|(_, s)| frame(T_DETAILS, &serde_json::to_vec(&vec![s]).unwrap()))
+            })
+            .flatten();
+        for (id, l) in &st.links {
+            if Self::splits(st, id) {
+                Self::send_gossip(l, core.clone());
+                if let Some(d) = &details {
+                    Self::send_gossip(l, d.clone());
+                }
+            } else {
+                Self::send_gossip(l, full.clone());
+            }
         }
     }
 
@@ -1093,11 +1219,22 @@ impl Node {
         // it only proves the node is alive once a newer version follows (every REANNOUNCE).
         // Directly linked nodes count as online anyway. This does not depend on clocks.
         let seen_before = st.records.contains_key(&id);
+        // The details we have (perhaps of an older version) stay until newer ones come.
+        let details = if info.split {
+            st.records.get(&id).and_then(|r| r.details.clone())
+        } else {
+            None
+        };
+        let mut info = info;
+        if let Some((d, _)) = &details {
+            info.apply(d);
+        }
         st.records.insert(
             id,
             Record {
                 info,
                 signed,
+                details,
                 last_heard: (live && seen_before).then(Instant::now),
             },
         );
@@ -1127,13 +1264,26 @@ impl Node {
             }
             // Onwards to a few nodes (all older ones); the seq check above stops loops.
             let mut out: HashMap<NodeId, Vec<SignedInfo>> = HashMap::new();
+            let mut want = vec![];
             for (id, s) in changed {
-                let Some(info) = st.records.get(&id).map(|r| &r.info) else {
+                let Some(r) = st.records.get(&id) else {
                     continue;
                 };
-                for to in self.gossip_targets(&st, info, from) {
-                    out.entry(to).or_default().push(s.clone());
+                for to in self.gossip_targets(&st, &r.info, from) {
+                    if !r.info.split || Self::splits(&st, &to) {
+                        out.entry(to).or_default().push(s.clone());
+                    }
                 }
+                if Self::details_missing(r) {
+                    want.extend(id.0);
+                }
+            }
+            // Its details come apart: from where the record came, which has them (or soon).
+            if !want.is_empty()
+                && Self::splits(&st, &from)
+                && let Some(l) = st.links.get(&from)
+            {
+                Self::send_gossip(l, frame(T_WANT_DETAILS, &want));
             }
             for (to, recs) in out {
                 if let Some(l) = st.links.get(&to) {
@@ -1162,6 +1312,7 @@ impl Node {
         let r = st.records.get(id)?;
         let mut i = r.info.clone();
         i.seq = 0;
+        i.details = 0;
         i.measured = 0;
         i.links = 0;
         i.perf.clear();
@@ -1171,18 +1322,39 @@ impl Node {
     }
 
     /// Our digest: (id, seq) of every record we have, our own included.
-    fn digest_frame(&self, st: &State) -> Vec<u8> {
-        let mut d = Vec::with_capacity((st.records.len() + 1) * 40);
-        for (id, seq) in st
+    /// With `liveness` (`T_DIGEST2`), also how long ago we last heard from each node.
+    fn digest_frame(&self, st: &State, liveness: bool) -> Vec<u8> {
+        let mut d = Vec::with_capacity((st.records.len() + 1) * 42);
+        for (id, seq, age) in st
             .records
             .values()
-            .map(|r| (r.info.id, r.info.seq))
-            .chain(std::iter::once((self.ident.id, st.my_seq)))
+            .map(|r| (r.info.id, r.info.seq, self.heard_ago(st, r)))
+            .chain(std::iter::once((self.ident.id, st.my_seq, 0)))
         {
             d.extend_from_slice(&id.0);
             d.extend_from_slice(&seq.to_be_bytes());
+            if liveness {
+                d.extend_from_slice(&age.to_be_bytes());
+            }
         }
-        frame(T_DIGEST, &d)
+        frame(if liveness { T_DIGEST2 } else { T_DIGEST }, &d)
+    }
+
+    /// Seconds since we last heard from the node of `r` (0 while linked, `u16::MAX` for never).
+    /// Rounded up: passed from node to node, it never makes a node seem alive for longer.
+    fn heard_ago(&self, st: &State, r: &Record) -> u16 {
+        let id = &r.info.id;
+        if st.links.contains_key(id)
+            || st
+                .udp_paths
+                .get(id)
+                .is_some_and(|p| p.last_rx.elapsed() < udp::PATH_TIMEOUT)
+        {
+            return 0;
+        }
+        r.last_heard.map_or(u16::MAX, |t| {
+            (t.elapsed().as_millis().div_ceil(1000)).min(u16::MAX as u128 - 1) as u16
+        })
     }
 
     /// Sends the digest to one random neighbor that understands it.
@@ -1193,12 +1365,12 @@ impl Node {
             .links
             .iter()
             .filter(|(id, _)| Self::digests(&st, id))
-            .map(|(_, l)| l)
             .choose(&mut rand::thread_rng())
         else {
             return;
         };
-        Self::send_gossip(l, self.digest_frame(&st));
+        let (to, l) = l;
+        Self::send_gossip(l, self.digest_frame(&st, Self::splits(&st, to)));
     }
 
     /// A neighbor's digest: send it what is newer here, ask for what is newer there.
@@ -1214,6 +1386,45 @@ impl Node {
                 )
             })
             .collect();
+        self.digest_reply(from, theirs);
+    }
+
+    /// `T_DIGEST2`: the digest, and when the neighbor last heard from each node. That keeps
+    /// nodes without a link to us online here between their (rare) records.
+    fn handle_digest2(&self, from: NodeId, payload: &[u8]) {
+        let entries: Vec<(NodeId, u64, u16)> = payload
+            .as_chunks::<42>()
+            .0
+            .iter()
+            .map(|c| {
+                (
+                    crate::keys::Key32(c[..32].try_into().unwrap()),
+                    u64::from_be_bytes(c[32..40].try_into().unwrap()),
+                    u16::from_be_bytes(c[40..].try_into().unwrap()),
+                )
+            })
+            .collect();
+        {
+            let mut st = self.state.lock().unwrap();
+            let now = Instant::now();
+            for (id, _, age) in &entries {
+                if *age == u16::MAX {
+                    continue;
+                }
+                let Some(at) = now.checked_sub(Duration::from_secs(u64::from(*age))) else {
+                    continue;
+                };
+                if let Some(r) = st.records.get_mut(id)
+                    && r.last_heard.is_none_or(|t| t < at)
+                {
+                    r.last_heard = Some(at);
+                }
+            }
+        }
+        self.digest_reply(from, entries.into_iter().map(|(id, seq, _)| (id, seq)).collect());
+    }
+
+    fn digest_reply(&self, from: NodeId, theirs: HashMap<NodeId, u64>) {
         let st = self.state.lock().unwrap();
         let Some(l) = st.links.get(&from) else { return };
         let settled = now_ms().saturating_sub(DIGEST_GRACE_MS);
@@ -1221,10 +1432,10 @@ impl Node {
             .records
             .values()
             .filter(|r| r.info.seq < settled && theirs.get(&r.info.id).is_none_or(|s| *s < r.info.seq))
-            .map(|r| r.signed.clone())
+            .filter_map(|r| Self::record_for(&st, r, &from))
             .collect();
         if st.my_seq < settled && theirs.get(&self.ident.id).is_none_or(|s| *s < st.my_seq) {
-            give.extend(st.my_signed.clone());
+            give.extend(Self::my_record_for(&st, &from));
         }
         let want: Vec<u8> = theirs
             .iter()
@@ -1243,6 +1454,18 @@ impl Node {
         if !want.is_empty() {
             Self::send_gossip(l, frame(T_WANT, &want));
         }
+        // Details that went missing on the way: the neighbor may have them.
+        if Self::splits(&st, &from) {
+            let want: Vec<u8> = st
+                .records
+                .values()
+                .filter(|r| Self::details_missing(r))
+                .flat_map(|r| r.info.id.0)
+                .collect();
+            if !want.is_empty() {
+                Self::send_gossip(l, frame(T_WANT_DETAILS, &want));
+            }
+        }
     }
 
     /// A neighbor asks for records after comparing digests.
@@ -1256,9 +1479,9 @@ impl Node {
             .filter_map(|c| {
                 let id = crate::keys::Key32(*c);
                 if id == self.ident.id {
-                    st.my_signed.clone()
+                    Self::my_record_for(&st, &from)
                 } else {
-                    st.records.get(&id).map(|r| r.signed.clone())
+                    st.records.get(&id).and_then(|r| Self::record_for(&st, r, &from))
                 }
             })
             .collect();
@@ -1267,9 +1490,96 @@ impl Node {
         }
     }
 
-    fn full_table(&self, st: &State) -> Vec<Vec<u8>> {
-        let mut all: Vec<SignedInfo> = st.records.values().map(|r| r.signed.clone()).collect();
-        all.extend(st.my_signed.clone());
+    /// The record names details newer than the ones we have.
+    fn details_missing(r: &Record) -> bool {
+        r.info.split && r.details.as_ref().map_or(0, |(d, _)| d.seq) < r.info.details
+    }
+
+    /// Details of nodes: kept with their records, and on to a few nodes, like records.
+    fn handle_details(&self, from: NodeId, payload: &[u8]) {
+        let Ok(list) = serde_json::from_slice::<Vec<SignedDetails>>(payload) else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        let mut out: HashMap<NodeId, Vec<SignedDetails>> = HashMap::new();
+        for s in list {
+            if let Some(id) = self.ingest_details(&mut st, s.clone()) {
+                let info = &st.records[&id].info;
+                for to in self.gossip_targets(&st, info, from) {
+                    if Self::splits(&st, &to) {
+                        out.entry(to).or_default().push(s.clone());
+                    }
+                }
+            }
+        }
+        for (to, list) in out {
+            if let Some(l) = st.links.get(&to) {
+                for f in details_frames(&list) {
+                    Self::send_gossip(l, f);
+                }
+            }
+        }
+    }
+
+    /// Takes details that are newer than the ones we have, of a node whose record splits
+    /// them off. Returns the node.
+    fn ingest_details(&self, st: &mut State, s: SignedDetails) -> Option<NodeId> {
+        let (id, seq) = s.peek()?;
+        let r = st.records.get(&id)?;
+        if !r.info.split || r.details.as_ref().is_some_and(|(d, _)| d.seq >= seq) {
+            return None;
+        }
+        let d = match s.verify(&self.net) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("dropping invalid details: {e}");
+                return None;
+            }
+        };
+        let r = st.records.get_mut(&id)?;
+        r.info.apply(&d);
+        r.details = Some((d, s));
+        Some(id)
+    }
+
+    fn handle_want_details(&self, from: NodeId, payload: &[u8]) {
+        let st = self.state.lock().unwrap();
+        let Some(l) = st.links.get(&from) else { return };
+        let give: Vec<SignedDetails> = payload
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .filter_map(|c| {
+                let id = crate::keys::Key32(*c);
+                if id == self.ident.id {
+                    st.my_details.as_ref().map(|(_, s)| s.clone())
+                } else {
+                    st.records
+                        .get(&id)
+                        .and_then(|r| r.details.as_ref())
+                        .map(|(_, s)| s.clone())
+                }
+            })
+            .collect();
+        for f in details_frames(&give) {
+            Self::send_gossip(l, f);
+        }
+    }
+
+    /// Everything we know, for a new link to `to`.
+    /// For a node that takes details apart, only our own record and a digest instead of all
+    /// records: it pulls what it doesn't have (a new node linking to N nodes would get all
+    /// records N times, about 4 MB each at 200 nodes), and learns from the digest who is alive.
+    fn full_table(&self, st: &State, to: &NodeId) -> Vec<Vec<u8>> {
+        let split = Self::splits(st, to);
+        let mut all: Vec<SignedInfo> = st
+            .records
+            .values()
+            // Digest answers leave out the newest records (`DIGEST_GRACE_MS`): those come now.
+            .filter(|r| !split || r.info.seq >= now_ms().saturating_sub(DIGEST_GRACE_MS))
+            .filter_map(|r| Self::record_for(st, r, to))
+            .collect();
+        all.extend(Self::my_record_for(st, to));
         // Roster and admissions first: the records of invited nodes depend on them.
         let mut frames = self.admin_frames(st);
         frames.extend(self.doc_frames(st));
@@ -1280,6 +1590,14 @@ impl Node {
         let forgotten: Vec<Forget> = st.forgotten.values().cloned().collect();
         for c in forgotten.chunks(256) {
             frames.push(frame(T_FORGET, &serde_json::to_vec(c).unwrap()));
+        }
+        if split {
+            frames.extend(
+                st.my_details
+                    .as_ref()
+                    .map(|(_, s)| frame(T_DETAILS, &serde_json::to_vec(&vec![s]).unwrap())),
+            );
+            frames.push(self.digest_frame(st, true));
         }
         frames
     }
@@ -2675,14 +2993,18 @@ impl Node {
         let mut reader = LinkReader::new(r, cipher.clone());
         let mut writer = LinkWriter::new(w, cipher);
 
-        let my_signed = self.state.lock().unwrap().my_signed.clone().unwrap();
+        let (my_full, my_core) = {
+            let st = self.state.lock().unwrap();
+            (st.my_full.clone().unwrap(), st.my_signed.clone())
+        };
         let my_nonce = rand::rngs::OsRng.next_u64();
         let my_claim = self.state.lock().unwrap().my_claim.clone();
         let hello = Hello {
-            info: my_signed,
+            info: my_full,
             observed,
             nonce: my_nonce,
             claim: my_claim,
+            core: my_core,
         };
         writer.send(&frame(T_HELLO, &serde_json::to_vec(&hello)?)).await?;
         let msg = timeout(HANDSHAKE_TIMEOUT, reader.recv())
@@ -2788,6 +3110,11 @@ impl Node {
             };
             st.links.insert(peer, entry);
             self.ingest(&mut st, hello.info.clone(), true);
+            if let Some(core) = hello.core.clone()
+                && core.peek().is_some_and(|(id, _)| id == peer)
+            {
+                self.ingest(&mut st, core, true);
+            }
             if let Ok(obs) = hello.observed.parse::<SocketAddr>() {
                 let ip = obs.ip();
                 if !ip.is_loopback() && !ip.is_unspecified() && !is_overlay(ip) && !st.observed_ips.contains(&ip) {
@@ -2799,7 +3126,7 @@ impl Node {
             self.rebuild(&mut st);
             // Tell the new neighbor everything we know.
             let link = st.links.get(&peer).unwrap();
-            for f in self.full_table(&st) {
+            for f in self.full_table(&st, &peer) {
                 let _ = link.tx.try_send(f);
             }
         }
@@ -2853,6 +3180,9 @@ impl Node {
                 T_GOSSIP => self.handle_gossip(peer, payload),
                 T_DIGEST => self.handle_digest(peer, payload),
                 T_WANT => self.handle_want(peer, payload),
+                T_DETAILS => self.handle_details(peer, payload),
+                T_DIGEST2 => self.handle_digest2(peer, payload),
+                T_WANT_DETAILS => self.handle_want_details(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
                 T_MEASURE => self.handle_measure(peer, payload),
                 T_WHY => self.handle_why(peer, payload),
@@ -3131,11 +3461,15 @@ impl Node {
         let mut last_announce = Instant::now();
         let mut ticks: u64 = 0;
         loop {
+            // A user's new key reaches the others within 30 s, as when records went out that
+            // often (outside the lock: it reads files).
+            let keys = (ticks.is_multiple_of(3) && self.cfg.publish_ssh_keys).then(local_ssh_keys);
             let dials = {
                 let mut st = self.state.lock().unwrap();
                 let ping = frame(T_PING, &(self.started.elapsed().as_micros() as u64).to_be_bytes());
                 self.broadcast(&st, &ping, None);
-                if last_announce.elapsed() >= REANNOUNCE
+                if last_announce.elapsed() >= self.heartbeat(&st)
+                    || keys.is_some_and(|k| k != st.my_ssh_keys)
                     || self.endpoints(&st) != st.my_endpoints
                     || self.udp_candidates(&st) != st.my_udp
                     || self.udp6_candidates() != st.my_udp6
@@ -3188,6 +3522,11 @@ impl Node {
         let saved = SavedState {
             me: st.my_signed.clone(),
             peers: st.records.values().map(|r| r.signed.clone()).collect(),
+            details: st
+                .records
+                .values()
+                .filter_map(|r| r.details.as_ref().map(|(_, s)| s.clone()))
+                .collect(),
             forgotten: st.forgotten.values().cloned().collect(),
             rotation: st.rotation.as_ref().map(|(r, _)| r.clone()),
             roster: st.roster.as_ref().map(|(r, _)| r.clone()),
@@ -4632,6 +4971,27 @@ pub fn user_ssh_config(dir: &std::path::Path, enable: bool) {
 }
 
 /// Splits records into gossip frames by size (records carry inventory, measurements...).
+/// `gossip_frames` for details.
+fn details_frames(list: &[SignedDetails]) -> Vec<Vec<u8>> {
+    let mut frames = vec![];
+    let mut batch: Vec<&SignedDetails> = vec![];
+    let mut size = 0;
+    for d in list {
+        let len = d.data.len() + d.sig.len() + 32;
+        if !batch.is_empty() && size + len > GOSSIP_BYTES {
+            frames.push(frame(T_DETAILS, &serde_json::to_vec(&batch).unwrap()));
+            batch.clear();
+            size = 0;
+        }
+        batch.push(d);
+        size += len;
+    }
+    if !batch.is_empty() {
+        frames.push(frame(T_DETAILS, &serde_json::to_vec(&batch).unwrap()));
+    }
+    frames
+}
+
 fn gossip_frames(records: &[SignedInfo]) -> Vec<Vec<u8>> {
     let mut frames = vec![];
     let mut batch: Vec<&SignedInfo> = vec![];

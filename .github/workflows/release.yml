@@ -182,8 +182,8 @@ jobs:
           path: desktop-out/*.tar.gz
 
   desktop-full:
-    # Xfce and Chromium packed with meshvpn in one file (desktop/build-full.sh): the desktop for
-    # machines without root (install.sh --user --desktop xfce), tested on a bare image.
+    # Xfce, MATE and Chromium packed with meshvpn in one file (desktop/build-full.sh): the desktop for
+    # machines without root (install.sh --user --desktop xfce|mate), tested on a bare image.
     name: full installer ${{ matrix.arch }}
     needs: [build, desktop]
     runs-on: ${{ matrix.runner }}
@@ -217,7 +217,7 @@ jobs:
         run: |
           sudo modprobe tun || true
           python3 tests/e2e/run.py --binary bin/meshvpn --desktop-bundle in/meshvpn-desktop-${{ matrix.arch }}.tar.gz \
-            --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless desktop_full_container
+            --desktop-full run-out/meshvpn-full-${{ matrix.arch }}.run desktop_full desktop_full_user desktop_full_nameless desktop_full_container desktop_full_mate
       - name: Gather what gets published
         # In one directory: paths from several would arrive as subdirectories, which can't be published.
         run: |
@@ -323,7 +323,7 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- --desktop mate join mesh1-...
           \`\`\`
 
-          **Without root** (for one user, in ~/.local): Xfce and the Chromium browser packed in one download, any Linux distribution, x86_64 and ARM64. Source: \`meshvpn-full-sources-*\`:
+          **Without root** (for one user, in ~/.local): Xfce, MATE and the Chromium browser packed in one download, any Linux distribution, x86_64 and ARM64 (`--desktop mate` for MATE). Source: \`meshvpn-full-sources-*\`:
 
           \`\`\`sh
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh -s -- --user --desktop xfce join mesh1-...

@@ -1,11 +1,12 @@
 #!/bin/sh
-# meshvpn with a full desktop: this one file holds meshvpn, Xfce and the Chromium browser, with
+# meshvpn with a full desktop: this one file holds meshvpn, Xfce, MATE and the Chromium browser, with
 # everything they need. Nothing is downloaded and no package manager is involved, so it works on
 # any Linux distribution of this CPU architecture, in containers too.
 #
 #   sudo sh meshvpn-full-@ARCH@.run                        install
 #   sudo sh meshvpn-full-@ARCH@.run join mesh1-...         install and join a network
 #   sudo sh meshvpn-full-@ARCH@.run init --endpoint h:7870 install and create a network
+#   sudo sh meshvpn-full-@ARCH@.run --desktop mate ...     MATE as the default (else Xfce)
 #   sudo sh meshvpn-full-@ARCH@.run --uninstall            remove the desktop (keeps meshvpn)
 #
 # Without root (sh meshvpn-full-@ARCH@.run ...) it installs for the current user alone: everything
@@ -21,7 +22,7 @@ SMALL=@SMALL_BYTES@
 STORE=/nix/store
 USER_MODE=""
 # Commands the desktop's menu, the browser bar and people's terminals call by name.
-COMMANDS="xfce4-terminal thunar xfce4-appfinder xfce4-session-logout xfce4-settings-manager exo-open"
+COMMANDS="xfce4-terminal thunar xfce4-appfinder xfce4-session-logout xfce4-settings-manager exo-open mate-terminal caja mate-control-center"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -42,6 +43,12 @@ remove_store_paths() { # $1 = file listing paths, $2 = file of paths to keep (ma
 if [ "${1:-}" = "--user" ]; then
     [ "$(id -u)" -ne 0 ] || die "--user is for installing without root - as root, run the installer without it"
     shift
+fi
+# Which of the two `meshvpn desktop` starts by default (else Xfce).
+CHOSEN=""
+if [ "${1:-}" = "--desktop" ]; then
+    case "${2:-}" in xfce | mate) CHOSEN="$2" ;; *) die "--desktop: xfce or mate" ;; esac
+    shift 2
 fi
 [ "$(id -u)" -eq 0 ] || USER_MODE=1
 
@@ -66,7 +73,7 @@ else
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
-    for c in xfce4-session chromium $COMMANDS; do
+    for c in xfce4-session mate-session chromium $COMMANDS; do
         # Only what we put there.
         [ -f "$BIN/$c" ] && grep -q "$HOME_DIR" "$BIN/$c" 2>/dev/null && rm -f "$BIN/$c"
     done
@@ -114,12 +121,13 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
 [ -f "$HOME_DIR/paths" ] && cp "$HOME_DIR/paths" "$TMP/old-paths"
 
-say "Unpacking meshvpn, Xfce and Chromium (about $NEEDS_MB MB, this takes a minute)..."
+say "Unpacking meshvpn, Xfce, MATE and Chromium (about $NEEDS_MB MB, this takes a minute)..."
 # After this script come two archives: meshvpn and the X server, then the desktop.
 tail -n +"$LINES" "$0" | head -c "$SMALL" | tar -xzf - -C "$UNPACK" || die "unpacking failed: is this file complete?"
 tail -n +"$LINES" "$0" | tail -c +"$((SMALL + 1))" | tar -xzf - -C "$UNPACK" || die "unpacking failed: is this file complete?"
 [ -L "$HOME_DIR/env" ] || die "unpacking failed: Xfce is missing"
 [ -n "$USER_MODE" ] || [ -x "$HOME_DIR/env/bin/xfce4-session" ] || die "unpacking failed: Xfce is missing"
+[ -n "$USER_MODE" ] || [ -x "$HOME_DIR/env/bin/mate-session" ] || die "unpacking failed: MATE is missing"
 [ -n "$USER_MODE" ] || [ ! -f "$TMP/old-paths" ] || remove_store_paths "$TMP/old-paths" "$HOME_DIR/paths"
 
 mkdir -p "$BIN"
@@ -169,26 +177,41 @@ EOS
         || die "can't run the desktop's programs from $BASE (is it mounted noexec?)"
 fi
 
-# The session's own environment: the desktop's files come after the system's, so the programs of
+# The sessions' own environment: the desktop's files come after the system's, so the programs of
 # this machine stay first in terminals and in the menu.
-cat > "$BIN/xfce4-session" <<EOS
+for session in xfce4-session mate-session; do
+    case "$session" in
+        # Xfce's panel starts empty without its layout in the user's settings.
+        xfce4-session) FIRST_RUN='panel="${XDG_CONFIG_HOME:-$HOME/.config}/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+if [ ! -e "$panel" ]; then
+    mkdir -p "$(dirname "$panel")"
+    cp "$E/etc/xdg/xfce4/panel/default.xml" "$panel" 2>/dev/null && chmod u+w "$panel"
+fi' ;;
+        *) FIRST_RUN="" ;;
+    esac
+    cat > "$BIN/$session" <<EOS
 #!/bin/sh
-# Installed by meshvpn: starts Xfce from $HOME_DIR
+# Installed by meshvpn: starts $session from $HOME_DIR
 $LINK_LINE
 $KEEP_LINE
 E="$HOME_DIR/env"
 export PATH="\$PATH:\$E/bin"
 export XDG_DATA_DIRS="\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:\$E/share"
 export XDG_CONFIG_DIRS="\$E/etc/xdg:\${XDG_CONFIG_DIRS:-/etc/xdg}"
-panel="\${XDG_CONFIG_HOME:-\$HOME/.config}/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
-if [ ! -e "\$panel" ]; then
-    mkdir -p "\$(dirname "\$panel")"
-    cp "\$E/etc/xdg/xfce4/panel/default.xml" "\$panel" 2>/dev/null && chmod u+w "\$panel"
-fi
-# Its compiled-in configuration is in /etc, which on this machine is not its own.
-exec "\$E/bin/dbus-run-session" --config-file="\$E/share/dbus-1/session.conf" -- "\$E/bin/xfce4-session" "\$@"
+$FIRST_RUN
+# Its compiled-in configuration is in /etc, which on this machine is not its own. Programs that
+# meshvpn starts in the session don't inherit the bus's address: they find it at
+# \$XDG_RUNTIME_DIR/bus, where programs look when no address is set (MATE's need one).
+exec "\$E/bin/dbus-run-session" --config-file="\$E/share/dbus-1/session.conf" -- /bin/sh -c '
+    sock="\${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+    sock="\${sock%%,*}"
+    if [ -n "\${XDG_RUNTIME_DIR:-}" ] && [ -S "\$sock" ] && [ ! -S "\$XDG_RUNTIME_DIR/bus" ]; then
+        ln -sf "\$sock" "\$XDG_RUNTIME_DIR/bus"
+    fi
+    exec "\$0" "\$@"' "\$E/bin/$session" "\$@"
 EOS
-chmod 0755 "$BIN/xfce4-session"
+    chmod 0755 "$BIN/$session"
+done
 
 for c in chromium $COMMANDS; do
     cat > "$BIN/$c" <<EOS
@@ -211,8 +234,15 @@ chmod 644 "$APPS/meshvpn-chromium.desktop"
 "$BIN/meshvpn" desktop setup --from "$HOME_DIR/x-bundle.tar.gz" >/dev/null || die "installing the X server failed"
 # Users without their own copy of the X server use the machine's, set up just now.
 rm -f "$HOME_DIR/x-bundle.tar.gz"
+if [ -n "$CHOSEN" ]; then
+    if [ -n "$USER_MODE" ]; then
+        printf '%s\n' "$CHOSEN" > "$BASE/default-session"
+    else
+        mkdir -p /var/lib/meshvpn/desktop && printf '%s\n' "$CHOSEN" > /var/lib/meshvpn/desktop/default-session
+    fi
+fi
 
-say "Installed $("$BIN/meshvpn" --version) with Xfce and Chromium."
+say "Installed $("$BIN/meshvpn" --version) with Xfce, MATE and Chromium."
 echo "Licences and where to get the source code: $HOME_DIR/README"
 # A note and no more: an old browser is still better than no desktop.
 BUILT="$(sed -n 's/^date=//p' "$HOME_DIR/browser" 2>/dev/null || true)"

@@ -451,11 +451,12 @@ applications you want to run.
   runs on the system's Xvfb with Mesa's software rendering (installed with it): fine for office work, slower than the
   others. Screen lockers don't start in Xfce and MATE sessions (they would lock a desktop only a browser shows);
   Cinnamon starts its own, so an idle Cinnamon session can lock and then needs the account's password.
-* **Xfce without root,** for example in a Docker image where you aren't root:
-  `curl -fsSL .../install.sh | sh -s -- --user --desktop xfce join mesh1-...` (or `sh meshvpn-full-<arch>.run join
-  mesh1-...` from the release, for machines without internet). Without a package manager, Xfce comes packed with the
-  Chromium browser and all their libraries: any distribution, x86_64 and ARM64, about 650 MB to download, 1.9 GB in
-  `~/.local` per user. It needs no privileges, user namespaces or changes to how the container is started. The
+* **Xfce or MATE without root,** for example in a Docker image where you aren't root:
+  `curl -fsSL .../install.sh | sh -s -- --user --desktop xfce join mesh1-...` (or `--desktop mate`; or `sh
+  meshvpn-full-<arch>.run [--desktop mate] join mesh1-...` from the release, for machines without internet). Without a
+  package manager, Xfce and MATE come packed together with the Chromium browser and all their libraries: any
+  distribution, x86_64 and ARM64, about 750 MB to download, 2.3 GB in `~/.local` per user. `--desktop` picks the one
+  `meshvpn desktop <node>` starts by default; the other is there too (`meshvpn desktop <node> --desktop mate`). It needs no privileges, user namespaces or changes to how the container is started. The
   installer changes the path built into the programs to one of the same length, a link like `/tmp/mvx7k` that points to
   your files, so `/tmp` must be writable, and `HOME` must be set and writable. If `/tmp` is emptied the link comes back
   when a desktop program starts; if another user has taken the name, nothing runs and installing again picks a new one.
@@ -470,7 +471,7 @@ applications you want to run.
   is on the release page as `meshvpn-full-sources-<arch>.tar.gz.part*`. `sh meshvpn-full-<arch>.run --uninstall`
   removes the desktop and keeps meshvpn. (With root, `install.sh --full` installs the same for the whole machine, in
   `/nix/store`; the package manager's desktop above is the better choice there.)
-* **Built into a Docker image,** so that nobody has to install it and the 1.9 GB survive new containers (use your
+* **Built into a Docker image,** so that nobody has to install it and the 2.3 GB survive new containers (use your
   image's user in `--chown`: without it, a non-root user can't delete the file from `/tmp`):
   ```dockerfile
   COPY --chown=1000:1000 meshvpn-full-x86_64.run /tmp/full.run
@@ -659,7 +660,7 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
   punched through. Those nodes keep using TCP and relays, which is slower on lossy links (TCP-over-TCP). For the best
   results, allow UDP on port 7870 in front of public nodes, as you do for TCP. Switch it off with `udp = false`.
   `meshvpn net why <node>` tells you which case you're in.
-* Every node keeps a link to every other node. Tested with up to 200 nodes on one machine (about 175 kB/s per
+* Every node keeps a link to every other node. Tested with up to 200 nodes on one machine (about 46 kB/s per
   node at rest, see `docs/design-scaling.md`); much larger networks need links on demand, which isn't built yet.
 * Overlay IPs come from a 22-bit hash. A collision is unlikely in small networks; if one happens, the node with the
   lower id keeps the address.

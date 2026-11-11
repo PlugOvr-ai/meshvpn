@@ -36,6 +36,13 @@ pub const T_WHY_REPLY: u8 = 19;
 pub const T_DIGEST: u8 = 20;
 /// The records of these node ids, please (32 bytes each).
 pub const T_WANT: u8 = 21;
+/// Details of nodes (`SignedDetails`, a JSON list): sent apart from the records, like them.
+pub const T_DETAILS: u8 = 22;
+/// The details of these node ids, please (32 bytes each).
+pub const T_WANT_DETAILS: u8 = 23;
+/// `T_DIGEST` with liveness, to nodes that take details apart: (node id, seq, seconds since
+/// the sender last heard from that node, `u16::MAX` for never), 42 bytes each.
+pub const T_DIGEST2: u8 = 24;
 
 /// A JSON document signed by a node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -240,6 +247,115 @@ pub struct NodeInfo {
     /// How many links this node has; `neighbors` names only some of them in a big mesh.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub links: u64,
+    /// The details (inventory, perf, measured, objects, leases) are not in this record but in
+    /// a `NodeDetails` of version `details`. Nodes without this flag send and get full records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub split: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub details: u64,
+}
+
+impl NodeInfo {
+    /// The details of this record as a document of their own.
+    pub fn details_doc(&self, seq: u64) -> NodeDetails {
+        NodeDetails {
+            kind: DETAILS_KIND.into(),
+            id: self.id,
+            net: self.net.clone(),
+            seq,
+            inventory: self.inventory.clone(),
+            perf: self.perf.clone(),
+            measured: self.measured,
+            objects: self.objects.clone(),
+            leases: self.leases.clone(),
+        }
+    }
+
+    /// This record without its details, which go apart (version `details`).
+    pub fn core(&self, details: u64) -> NodeInfo {
+        NodeInfo {
+            inventory: None,
+            perf: vec![],
+            measured: 0,
+            objects: vec![],
+            leases: vec![],
+            split: true,
+            details,
+            ..self.clone()
+        }
+    }
+
+    /// The details of `d` put into this record.
+    pub fn apply(&mut self, d: &NodeDetails) {
+        self.inventory = d.inventory.clone();
+        self.perf = d.perf.clone();
+        self.measured = d.measured;
+        self.objects = d.objects.clone();
+        self.leases = d.leases.clone();
+    }
+}
+
+const DETAILS_KIND: &str = "details";
+
+/// What changes often and only some commands need (`nodes`, `gpu list`, `net matrix`,
+/// `objects`, reservations): signed apart from the record, so that the record stays small and
+/// these go only when they change.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NodeDetails {
+    /// Always "details": a signature over one kind of document is never one over another.
+    pub kind: String,
+    pub id: NodeId,
+    pub net: String,
+    /// Monotonic version, newer wins (separate from the record's).
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<Inventory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perf: Vec<Perf>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub measured: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<ObjectAd>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leases: Vec<Lease>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SignedDetails {
+    pub data: String,
+    pub sig: String,
+}
+
+impl SignedDetails {
+    pub fn sign(d: &NodeDetails, ident: &Identity) -> Self {
+        let data = serde_json::to_string(d).unwrap();
+        let sig = b64(&ident.sign(data.as_bytes()));
+        SignedDetails { data, sig }
+    }
+
+    /// Node id and seq without checking the signature (see `SignedInfo::peek`).
+    pub fn peek(&self) -> Option<(NodeId, u64)> {
+        #[derive(Deserialize)]
+        struct Peek {
+            id: NodeId,
+            seq: u64,
+        }
+        let p: Peek = serde_json::from_str(&self.data).ok()?;
+        Some((p.id, p.seq))
+    }
+
+    pub fn verify(&self, net: &str) -> Result<NodeDetails> {
+        let d: NodeDetails = serde_json::from_str(&self.data)?;
+        if d.kind != DETAILS_KIND {
+            bail!("not a node's details");
+        }
+        verify(&d.id, self.data.as_bytes(), &unb64(&self.sig)?)?;
+        if d.net != net {
+            bail!("details of a node of another network");
+        }
+        check_details(&d.inventory, &d.perf, &d.leases, &d.objects)?;
+        Ok(d)
+    }
 }
 
 /// GPUs of a node reserved for someone until `expires` (ms since epoch).
@@ -397,6 +513,48 @@ pub struct SignedInfo {
     pub sig: String,
 }
 
+/// What a record's details (in it, or apart: `NodeDetails`) may hold.
+fn check_details(inventory: &Option<Inventory>, perf: &[Perf], leases: &[Lease], objects: &[ObjectAd]) -> Result<()> {
+    if let Some(inv) = inventory {
+        let texts = [
+            &inv.os,
+            &inv.arch,
+            &inv.kernel,
+            &inv.cpu_model,
+            &inv.gpu_driver,
+            &inv.cuda,
+        ];
+        if inv.gpus.len() > 32
+            || !texts
+                .into_iter()
+                .chain(inv.gpus.iter().map(|g| &g.name))
+                .all(|t| clean_text(t))
+        {
+            bail!("invalid inventory");
+        }
+    }
+    if perf.len() > 1024
+        || perf.iter().any(|p| {
+            p.lan_ip
+                .as_ref()
+                .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_err())
+        })
+    {
+        bail!("invalid perf");
+    }
+    if leases.len() > 64
+        || leases
+            .iter()
+            .any(|l| !clean_text(&l.holder) || l.id.len() > 16 || l.gpus.len() > 64)
+    {
+        bail!("invalid leases");
+    }
+    if objects.len() > 256 || objects.iter().any(|o| !valid_object_id(&o.id) || !clean_text(&o.name)) {
+        bail!("invalid objects");
+    }
+    Ok(())
+}
+
 impl SignedInfo {
     pub fn sign(info: &NodeInfo, ident: &Identity) -> Self {
         let data = serde_json::to_string(info).unwrap();
@@ -443,24 +601,6 @@ impl SignedInfo {
         if !info.tags.iter().all(|t| valid_tag(t)) || info.tags.len() > 32 {
             bail!("invalid tags");
         }
-        if let Some(inv) = &info.inventory {
-            let texts = [
-                &inv.os,
-                &inv.arch,
-                &inv.kernel,
-                &inv.cpu_model,
-                &inv.gpu_driver,
-                &inv.cuda,
-            ];
-            if inv.gpus.len() > 32
-                || !texts
-                    .into_iter()
-                    .chain(inv.gpus.iter().map(|g| &g.name))
-                    .all(|t| clean_text(t))
-            {
-                bail!("invalid inventory");
-            }
-        }
         if info.udp.len() > 8 || info.udp.iter().any(|a| a.parse::<std::net::SocketAddrV4>().is_err()) {
             bail!("invalid udp candidates");
         }
@@ -470,31 +610,7 @@ impl SignedInfo {
         if info.lan.len() > 16 || info.lan.iter().any(|l| crate::net::parse_cidr(l).is_none()) {
             bail!("invalid lan");
         }
-        if info.perf.len() > 1024
-            || info.perf.iter().any(|p| {
-                p.lan_ip
-                    .as_ref()
-                    .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_err())
-            })
-        {
-            bail!("invalid perf");
-        }
-        if info.leases.len() > 64
-            || info
-                .leases
-                .iter()
-                .any(|l| !clean_text(&l.holder) || l.id.len() > 16 || l.gpus.len() > 64)
-        {
-            bail!("invalid leases");
-        }
-        if info.objects.len() > 256
-            || info
-                .objects
-                .iter()
-                .any(|o| !valid_object_id(&o.id) || !clean_text(&o.name))
-        {
-            bail!("invalid objects");
-        }
+        check_details(&info.inventory, &info.perf, &info.leases, &info.objects)?;
         // Shown on terminals and compared as a version.
         if info.version.len() > 32
             || !info
@@ -625,6 +741,10 @@ pub struct Hello {
     /// A new node's admission (managed networks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim: Option<ClaimMsg>,
+    /// The record without details (`NodeInfo::split`), newer than `info`, which is the full
+    /// one for older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core: Option<SignedInfo>,
 }
 
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -684,7 +804,56 @@ mod tests {
             digest: false,
             links: 0,
             version: String::new(),
+            split: false,
+            details: 0,
         }
+    }
+
+    #[test]
+    fn details_apart_from_the_record() {
+        let id = ident();
+        let mut full = info(&id, "alpha");
+        full.leases = vec![Lease {
+            id: "r1".into(),
+            gpus: vec![0],
+            holder: "bob".into(),
+            expires: 9,
+            owner: None,
+        }];
+        full.measured = 7;
+        let core = full.core(5);
+        assert!(core.split && core.details == 5 && core.leases.is_empty() && core.measured == 0);
+        let d = SignedDetails::sign(&full.details_doc(5), &id);
+        let got = d.verify("n1").unwrap();
+        let mut merged = SignedInfo::sign(&core, &id).verify("n1").unwrap();
+        merged.apply(&got);
+        assert_eq!(merged.leases, full.leases);
+        assert_eq!(merged.measured, 7);
+        assert_eq!(d.peek(), Some((id.id, 5)));
+        assert!(d.verify("other-network").is_err());
+        // Neither signature stands for the other kind of document.
+        let as_info = SignedInfo {
+            data: d.data.clone(),
+            sig: d.sig.clone(),
+        };
+        assert!(as_info.verify("n1").is_err());
+        let r = SignedInfo::sign(&full, &id);
+        assert!(
+            SignedDetails {
+                data: r.data.clone(),
+                sig: r.sig.clone()
+            }
+            .verify("n1")
+            .is_err()
+        );
+        let tampered = SignedDetails {
+            data: d.data.replace("bob", "eve"),
+            sig: d.sig.clone(),
+        };
+        assert!(tampered.verify("n1").is_err());
+        // Older nodes read a core record as one without details.
+        let old: serde_json::Value = serde_json::from_str(&SignedInfo::sign(&core, &id).data).unwrap();
+        assert_eq!(old["split"], true);
     }
 
     #[test]

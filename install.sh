@@ -22,10 +22,12 @@
 #
 #   curl -fsSL .../install.sh | sudo sh -s -- --desktop mate join mesh1-...
 #
-# Without root (for this user alone, in ~/.local), Xfce comes packed with the Chromium browser
-# (650 MB download, any distribution, x86_64 and ARM64; --full does the same with root):
+# Without root (for this user alone, in ~/.local), Xfce and MATE come packed with the Chromium
+# browser (one download of about 750 MB for both, any distribution, x86_64 and ARM64; --full does
+# the same with root). --desktop says which one `meshvpn desktop` starts by default:
 #
 #   curl -fsSL .../install.sh | sh -s -- --user --desktop xfce join mesh1-...
+#   curl -fsSL .../install.sh | sh -s -- --user --desktop mate join mesh1-...
 #
 # Environment: MESHVPN_VERSION=v0.1.0 to pin a release, MESHVPN_BIN_DIR to change /usr/local/bin,
 # MESHVPN_DOWNLOAD_URL to download the release files from a mirror instead of GitHub,
@@ -81,15 +83,17 @@ if [ "$(id -u)" -ne 0 ] && [ -z "$ROOTLESS" ] && ! command -v sudo >/dev/null 2>
     say "Not root and no sudo here: installing rootless (for the current user only)."
     ROOTLESS=1
 fi
-# Without root there is no package manager: Xfce comes packed instead (with Chromium, about
-# 650 MB, the same on every distribution).
-if [ -n "$ROOTLESS" ] && [ "$DESKTOP" = xfce ]; then
+# Without root there is no package manager: Xfce and MATE come packed instead (with Chromium,
+# the same on every distribution).
+FULL_DESKTOP=""
+if [ -n "$ROOTLESS" ] && { [ "$DESKTOP" = xfce ] || [ "$DESKTOP" = mate ]; }; then
     FULL=1
+    FULL_DESKTOP="$DESKTOP"
     DESKTOP=""
 fi
 if [ -n "$DESKTOP" ] && { [ "$OS" != Linux ] || [ -n "$ROOTLESS" ]; }; then
     # meshvpn itself still installs: the desktop is an extra that can follow later.
-    printf 'warning: no %s desktop: without root only Xfce can be installed (--desktop xfce). Installing meshvpn without a desktop.\n' "$DESKTOP" >&2
+    printf 'warning: no %s desktop: without root only Xfce and MATE can be installed (--desktop xfce or mate). Installing meshvpn without a desktop.\n' "$DESKTOP" >&2
     DESKTOP=""
 fi
 SUDO=""
@@ -184,17 +188,17 @@ fetch() {
 }
 
 if [ -n "$FULL" ]; then
-    [ "$REPO" = "PlugOvr-ai/meshvpn" ] || die "the packed Xfce desktop is for the open source edition - with root, use --desktop xfce"
+    [ "$REPO" = "PlugOvr-ai/meshvpn" ] || die "the packed desktop is for the open source edition - with root, use --desktop xfce or mate"
     case "$TARGET" in
         x86_64-unknown-linux-musl) ARCH=x86_64 ;;
         aarch64-unknown-linux-musl) ARCH=aarch64 ;;
-        *) die "the packed Xfce desktop exists for x86_64 and ARM64 Linux, not $TARGET" ;;
+        *) die "the packed desktop exists for x86_64 and ARM64 Linux, not $TARGET" ;;
     esac
     # /var/tmp: /tmp is often kept in memory, too small for this.
     TMP="$(mktemp -d "${TMPDIR:-/var/tmp}/meshvpn-full.XXXXXX")"
     trap 'rm -rf "$TMP"' EXIT INT TERM
     RUN="meshvpn-full-$ARCH.run"
-    say "Downloading meshvpn with Xfce and Chromium ($VERSION, $ARCH, 650 MB)..."
+    say "Downloading meshvpn with Xfce, MATE and Chromium ($VERSION, $ARCH, about 750 MB)..."
     fetch "$BASE/$RUN" "$TMP/$RUN" || die "download failed: $BASE/$RUN"
     fetch "$BASE/$RUN.sha256" "$TMP/$RUN.sha256" || die "download failed: $BASE/$RUN.sha256"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -204,7 +208,7 @@ if [ -n "$FULL" ]; then
     fi
     # Without root it installs for this user alone, by itself.
     if [ -n "$ROOTLESS" ]; then
-        sh "$TMP/$RUN" "$@"
+        sh "$TMP/$RUN" ${FULL_DESKTOP:+--desktop "$FULL_DESKTOP"} "$@"
     else
         $SUDO sh "$TMP/$RUN" "$@"
     fi

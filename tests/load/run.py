@@ -95,11 +95,28 @@ def counters(c):
     return int(lines[0]), int(lines[1]), (ut + st) / os.sysconf("SC_CLK_TCK"), rss
 
 
-def wait_all_seen(samples, names, timeout):
+def why_missing(c, names):
+    """For a sample that misses nodes: which of them it has no record of, and which it has
+    a record of but not online (with how long ago it last heard of them)."""
+    try:
+        peers = {p["name"]: p for p in status(c)["peers"]}
+    except Exception:  # noqa: BLE001
+        return "no status"
+    me = c.split("-", 1)[1]
+    unknown = sorted(n for n in names if n != me and n not in peers)
+    offline = sorted(f"{n}({peers[n].get('last_seen_secs')})" for n in names if n in peers and not peers[n].get("online"))
+    return f"{me}: no record {len(unknown)} {unknown[:5]}, offline {len(offline)} {offline[:5]}"
+
+
+def wait_all_seen(samples, names, timeout, verbose=False):
     """Seconds until every sample node sees all `names` online, or None; and the last fraction."""
-    t0, frac = time.time(), 0.0
+    t0, frac, told = time.time(), 0.0, 0.0
     with cf.ThreadPoolExecutor(len(samples)) as ex:
         while time.time() - t0 < timeout:
+            if verbose and time.time() - told >= 20:
+                told = time.time()
+                for line in ex.map(lambda c: why_missing(c, names), samples):
+                    print(f"  {time.time() - t0:5.0f}s {line}", flush=True)
             seen = list(ex.map(online_peers, samples))
             frac = min(len(names & (s | {sname})) / len(names) for s, sname in zip(seen, [x.split("-", 1)[1] for x in samples]))
             if frac >= 1.0:
@@ -108,7 +125,7 @@ def wait_all_seen(samples, names, timeout):
     return None, frac
 
 
-def measure(n, binary, window, settle, parallel, old_binary=None, old_share=0.0):
+def measure(n, binary, window, settle, parallel, old_binary=None, old_share=0.0, verbose=False):
     cleanup()
     run(["docker", "network", "create", f"{PREFIX}-net"])
     names = [f"n{i:03d}" for i in range(n)]
@@ -128,7 +145,7 @@ def measure(n, binary, window, settle, parallel, old_binary=None, old_share=0.0)
     if old:  # sample both versions
         samples = [hub] + random.sample([c for c in containers[1:] if c.split("-", 1)[1] in old], min(2, len(old))) \
             + random.sample([c for c in containers[1:] if c.split("-", 1)[1] not in old], min(2, n - 1 - len(old)))
-    t_join, frac = wait_all_seen(samples, set(names), timeout=max(300, 3 * n))
+    t_join, frac = wait_all_seen(samples, set(names), timeout=max(300, 3 * n), verbose=verbose)
     res = {"nodes": n, "old_nodes": len(old), "start_s": round(t_started, 1),
            "converge_s": None if t_join is None else round(t_join, 1), "converged_frac": round(frac, 3)}
 
@@ -172,6 +189,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=16, help="nodes joining at the same time")
     ap.add_argument("--old-binary", help="an older meshvpn binary for some of the nodes")
     ap.add_argument("--old-share", type=float, default=0.5, help="share of nodes running --old-binary")
+    ap.add_argument("-v", "--verbose", action="store_true", help="while joining, say what the samples miss")
     ap.add_argument("sizes", nargs="+", type=int)
     args = ap.parse_args()
     # Linux keeps one ARP table for all containers: a full mesh of N containers needs N*(N-1) entries.
@@ -189,7 +207,7 @@ def main():
         for n in args.sizes:
             print(f"--- {n} nodes", flush=True)
             r = measure(n, os.path.abspath(args.binary), args.window, args.settle, args.parallel,
-                        args.old_binary and os.path.abspath(args.old_binary), args.old_share)
+                        args.old_binary and os.path.abspath(args.old_binary), args.old_share, args.verbose)
             r.update({"version": version, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "window_s": args.window})
             print(json.dumps(r), flush=True)
             with open(os.path.join(HERE, "results.jsonl"), "a") as f:

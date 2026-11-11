@@ -1,9 +1,10 @@
-# The packed desktop: Xfce and a browser with everything they need, down to their own C library.
+# The packed desktop: Xfce, MATE and a browser with everything they need, down to their own C library.
 # Built by desktop/build-full.sh, which also removes what we must not ship (desktop/legal.py).
 { pkgs }:
 let
   # From the xfce set by name: top-level `exo` is an unrelated program.
   x = name: pkgs.xfce.${name};
+  m = name: pkgs.${name}; # MATE packages moved to the top level of nixpkgs
 
   # Chromium as nixpkgs builds it: H.264 and AAC are compiled into the browser itself, so removing
   # the codec packages (desktop/legal.py) doesn't remove those. Its sandbox needs user namespaces,
@@ -50,6 +51,13 @@ let
     TerminalEmulator=xfce4-terminal
     FileManager=thunar
   '';
+  # MATE asks the MIME database which program opens links.
+  mimeApps = pkgs.writeTextDir "etc/xdg/mimeapps.list" ''
+    [Default Applications]
+    text/html=chromium-browser.desktop
+    x-scheme-handler/http=chromium-browser.desktop
+    x-scheme-handler/https=chromium-browser.desktop
+  '';
   browserHelper = pkgs.writeTextDir "share/xfce4/helpers/chromium.desktop" ''
     [Desktop Entry]
     Version=1.0
@@ -71,6 +79,7 @@ pkgs.buildEnv {
     (pkgs.lowPrio launcher)
     helpers
     browserHelper
+    mimeApps
     (x "xfce4-session")
     (x "xfwm4")
     (x "xfce4-panel")
@@ -84,6 +93,23 @@ pkgs.buildEnv {
     (x "libxfce4ui")
     (x "thunar")
     pkgs.xfce4-icon-theme
+    # MATE, as the NixOS module installs it, without the extras (viewers, editor, applets). Its
+    # programs are wrapped by nixpkgs with the paths to their settings schemas.
+    (m "mate-session-manager")
+    (m "marco")
+    (m "mate-panel")
+    (m "mate-desktop")
+    (m "mate-settings-daemon")
+    (m "mate-settings-daemon-wrapped")
+    (m "mate-control-center")
+    (m "mate-menus")
+    (m "mate-terminal")
+    (m "mate-notification-daemon")
+    (m "mate-icon-theme")
+    (m "mate-themes")
+    (m "caja")
+    (m "libmatekbd")
+    pkgs.glib
     pkgs.dbus
     pkgs.dconf
     pkgs.adwaita-icon-theme
@@ -94,5 +120,5 @@ pkgs.buildEnv {
     pkgs.gsettings-desktop-schemas
   ];
   ignoreCollisions = true;
-  pathsToLink = [ "/bin" "/share" "/etc" "/lib/xfce4" ];
+  pathsToLink = [ "/bin" "/share" "/etc" "/lib/xfce4" "/libexec" "/lib/mate-panel" "/lib/caja" ];
 }

@@ -79,13 +79,19 @@ fn packed_browser() -> Option<Check> {
     let b = crate::desktop::bundle::packed_browser()?;
     let detail = format!("Chromium {} of the packed desktop, {} days old", b.version, b.days_old);
     Some(if b.is_old() {
+        // Installed again with the desktop chosen the first time.
+        let chosen = crate::desktop::bundle::user_default_file()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .filter(|d| d.trim() == "mate")
+            .map_or("xfce", |_| "mate");
+        let fix = format!(
+            "install the desktop again to get the newest release's browser: curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sh -s -- --user --desktop {chosen}"
+        );
         check(
             "browser",
             Level::Warn,
             format!("{detail}: it has missed security fixes"),
-            Some(
-                "install the desktop again to get the newest release's browser: curl -fsSL https://github.com/PlugOvr-ai/meshvpn/releases/latest/download/install.sh | sh -s -- --user --desktop xfce",
-            ),
+            Some(&fix),
         )
     } else {
         check("browser", Level::Ok, detail, None)

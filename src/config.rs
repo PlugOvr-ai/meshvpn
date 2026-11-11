@@ -573,6 +573,9 @@ fn permission_hint(e: std::io::Error, path: &Path) -> anyhow::Error {
 pub struct SavedState {
     pub me: Option<SignedInfo>,
     pub peers: Vec<SignedInfo>,
+    /// Details of the peers whose records come without them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<crate::proto::SignedDetails>,
     #[serde(default)]
     pub forgotten: Vec<Forget>,
     /// The latest ban / key rotation, relayed to members that were offline.

@@ -30,7 +30,7 @@ DENY = re.compile(
     re.I,
 )
 # Nothing may refer to a removed path in these, or the desktop wouldn't start.
-NO_DANGLING = re.compile(r"^(xfce4-|xfwm4|xfdesktop|thunar|exo|garcon|libxfce|chromium|glibc|gtk\+3|glib-|dbus)")
+NO_DANGLING = re.compile(r"^(xfce4-|xfwm4|xfdesktop|thunar|exo|garcon|libxfce|mate-|marco|caja|libmate|chromium|glibc|gtk\+3|glib-|dbus)")
 LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|copyright|notice|unlicense|patents|mpl|gpl|lgpl)", re.I)
 # Where those without such a file state their terms: Perl modules in their README, libdrm in its headers.
 STATED_IN = re.compile(r"^(readme|xf86drm\.h|.*\.pod$)", re.I)
