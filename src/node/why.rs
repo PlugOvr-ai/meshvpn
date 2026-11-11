@@ -331,7 +331,7 @@ impl Node {
                     from: self.ident.id,
                     to: peer,
                 };
-                self.broadcast(&st, &frame(T_WHY, &serde_json::to_vec(&req).unwrap()), None);
+                self.send_toward(&st, &req.to, &frame(T_WHY, &serde_json::to_vec(&req).unwrap()));
             }
             (peer, name)
         };
@@ -369,7 +369,7 @@ impl Node {
     }
 
     /// Passes the request on; if it is for this node, tests from this end and answers.
-    pub(super) fn handle_why(self: &Arc<Self>, link: NodeId, payload: &[u8]) {
+    pub(super) fn handle_why(self: &Arc<Self>, _link: NodeId, payload: &[u8]) {
         let Ok(req) = serde_json::from_slice::<WhyReq>(payload) else {
             return;
         };
@@ -380,8 +380,13 @@ impl Node {
         if st.why_seen.len() > 1000 {
             st.why_seen.clear();
         }
-        self.broadcast(&st, &frame(T_WHY, payload), Some(link));
-        if req.to != self.ident.id || st.why_running >= MAX_RUNNING || !st.records.contains_key(&req.from) {
+        // Towards the node it is for, not to everyone (before 0.30.2 it was flooded: one request
+        // went over every link of the network). As parsed, not as received: nothing padded rides along.
+        if req.to != self.ident.id {
+            self.send_toward(&st, &req.to, &frame(T_WHY, &serde_json::to_vec(&req).unwrap()));
+            return;
+        }
+        if st.why_running >= MAX_RUNNING || !st.records.contains_key(&req.from) {
             return;
         }
         st.why_running += 1;
@@ -396,12 +401,12 @@ impl Node {
             st.why_counts.remove(&req.from);
             st.why_seen.insert(req.nonce ^ u64::MAX);
             let f = frame(T_WHY_REPLY, &serde_json::to_vec(&(req.from, side)).unwrap());
-            node.broadcast(&st, &f, None);
+            node.send_toward(&st, &req.from, &f);
         });
     }
 
     /// Passes an answer on towards whoever asked, once each.
-    pub(super) fn handle_why_reply(self: &Arc<Self>, link: NodeId, payload: &[u8]) {
+    pub(super) fn handle_why_reply(self: &Arc<Self>, _link: NodeId, payload: &[u8]) {
         let Ok((asker, side)) = serde_json::from_slice::<(NodeId, WhySide)>(payload) else {
             return;
         };
@@ -416,7 +421,11 @@ impl Node {
         if !st.why_seen.insert(side.nonce ^ u64::MAX) {
             return;
         }
-        self.broadcast(&st, &frame(T_WHY_REPLY, payload), Some(link));
+        self.send_toward(
+            &st,
+            &asker,
+            &frame(T_WHY_REPLY, &serde_json::to_vec(&(asker, side)).unwrap()),
+        );
     }
 }
 

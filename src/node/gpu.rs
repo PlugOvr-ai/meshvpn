@@ -36,7 +36,14 @@ impl Node {
         }
         let reserved: Vec<u32> = st.leases.iter().flat_map(|l| l.gpus.iter().copied()).collect();
         let picked: Vec<u32> = match indices {
-            Some(want) => {
+            Some(mut want) => {
+                // At least one GPU, each once: a reservation of none (or the same GPU twice)
+                // would let anyone fill the record with reservations until others refuse it.
+                want.sort_unstable();
+                want.dedup();
+                if want.is_empty() {
+                    bail!("name at least one GPU to reserve");
+                }
                 for g in &want {
                     if !gpus.iter().any(|x| x.index == *g) {
                         bail!("{} has no GPU {g}", st.my_name);

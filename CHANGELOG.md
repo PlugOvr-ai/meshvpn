@@ -8,6 +8,31 @@ puts the section at the top of the release notes.
 Sections: **Added**, **Changed**, **Fixed**, **Security**, **Removed**. Security fixes say what an
 attacker needed and what they could do.
 
+## [0.30.2] - 2026-11-11
+
+More messages from one node that made others do far more than the sender's own traffic (found by an audit
+after 0.30.1). Each needed a member node or client; items marked *local* also a user without root on a member
+machine. **Upgrade all nodes**: older nodes still act on these messages.
+
+### Security
+- **`meshvpn net why` flooded the network** (*local*): a request and its answer went over every link of every
+  node, as sent (padded to 64 KB: about 128 MB of traffic per request at 200 nodes). Both now go only along
+  the route to the node they are for, re-encoded.
+- **A key rotation could circle the mesh endlessly**: a node that could not open its copy of the new key
+  passed the rotation on without remembering it, so every copy came back as new. In an open network any
+  member could start that; in a managed one a ban could by accident. Such a rotation is no longer passed on.
+- **No limit on new versions of a node's record or details** (*local*, through an empty measurement or GPU
+  reservations): every version was checked and passed on by every node. Each node now takes a burst of 5
+  new versions of another node's record (and of its details), then one per second; the digests bring the
+  newest version a little later. A measurement towards no node no longer re-signs the record.
+- **A node could be hidden from the network for up to 30 days** (*local*): 65 GPU reservations of no GPU made
+  its record too big for the others to accept. A reservation now needs at least one GPU, each once.
+- **Small requests, big answers**: an empty digest made a node send all records, and a request naming one
+  record 2047 times got it 2047 times. Digests are now answered at most every 4 s per link, and each record
+  is sent once per request.
+- **Unbounded memory from throughput-test start markers**: each new test id was kept for 2 minutes. Now at
+  most 16 tests at a time, 2 per sender.
+
 ## [0.30.1] - 2026-11-11
 
 ### Security

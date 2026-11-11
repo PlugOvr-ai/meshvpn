@@ -64,9 +64,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 const FORGET_AFTER_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Gossip messages stay well below the 64 KB link frame limit.
 const GOSSIP_BYTES: usize = 48 * 1024;
+/// New versions of one node's record (or its details) that are taken at once, and per second
+/// after that.
+const RECORD_BURST: f32 = 5.0;
+const RECORD_RATE: f32 = 1.0;
 /// Links a new record is passed on to, besides older nodes (which get every record from
 /// everyone). Digests (`DIGEST_EVERY`) catch what this misses.
 const FANOUT: usize = 4;
+/// A link's digests are answered at most this often: an answer can be all records (to an empty
+/// digest), so a peer sending digests in a loop would keep us sending them.
+const DIGEST_REPLY_GAP: Duration = Duration::from_secs(4);
 /// A digest to one random neighbor this often.
 const DIGEST_EVERY: Duration = Duration::from_secs(10);
 /// Gossip waits for nothing: when this many frames are queued for a link (a slow or stuck
@@ -144,6 +151,13 @@ pub fn range_conflicts(dir: &std::path::Path, own_iface: &str) -> Vec<String> {
     out
 }
 
+/// Tokens left in a bucket of `RECORD_BURST`, refilled at `RECORD_RATE` per second.
+fn tokens(map: &HashMap<NodeId, (f32, Instant)>, id: &NodeId) -> f32 {
+    map.get(id).map_or(RECORD_BURST, |(t, at)| {
+        (t + at.elapsed().as_secs_f32() * RECORD_RATE).min(RECORD_BURST)
+    })
+}
+
 fn is_overlay(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => u32::from(v4) & u32::from(OVERLAY_NETMASK) == 0x6440_0000,
@@ -169,6 +183,8 @@ struct LinkEntry {
     kill: Arc<Notify>,
     addr: String,
     rtt: Option<Duration>,
+    /// When we last answered a digest from this link (`DIGEST_REPLY_GAP`).
+    digest_at: Option<Instant>,
 }
 
 struct Backoff {
@@ -249,8 +265,8 @@ struct State {
     exit_via: Option<NodeId>,
     /// Mesh addresses claimed by more than one node (see rebuild).
     ip_conflicts: Vec<(Ipv4Addr, Vec<NodeId>)>,
-    /// Throughput tests over the data path being received: id -> (first, bytes, last).
-    bench_ip_rx: HashMap<u64, (Instant, u64, Instant)>,
+    /// Throughput tests over the data path being received: id -> (first, bytes, last, from).
+    bench_ip_rx: HashMap<u64, (Instant, u64, Instant, Ipv4Addr)>,
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
     bench_ip_done: HashMap<u64, (f32, Instant)>,
     why_seen: HashSet<u64>,
@@ -260,6 +276,9 @@ struct State {
     /// A measurement of ours is running (one at a time, whoever asks).
     measuring: bool,
     measured: u64,
+    /// New versions of each node's record we take (see `record_tokens`): tokens left, when.
+    record_rate: HashMap<NodeId, (f32, Instant)>,
+    details_rate: HashMap<NodeId, (f32, Instant)>,
     udp_paths: HashMap<NodeId, udp::UdpPath>,
     udp_probing: HashMap<NodeId, udp::Probing>,
     /// Datagrams split because a path can't carry full-size ones, being put back together.
@@ -1173,6 +1192,16 @@ impl Node {
         {
             return None;
         }
+        // A node announcing new versions faster than `RECORD_RATE` (any member could, each
+        // version checked and passed on by every node): the excess is dropped; the digests
+        // bring the newest version a little later.
+        if live
+            && let Some((id, _)) = signed.peek()
+            && Self::record_tokens(st, &id) < 1.0
+        {
+            debug!("dropping a record of {id}: too many new versions");
+            return None;
+        }
         let info = match signed.verify(&self.net) {
             Ok(i) => i,
             Err(e) => {
@@ -1239,7 +1268,16 @@ impl Node {
                 last_heard: (live && seen_before).then(Instant::now),
             },
         );
+        if live {
+            let t = Self::record_tokens(st, &id);
+            st.record_rate.insert(id, (t - 1.0, Instant::now()));
+        }
         Some(id)
+    }
+
+    /// New versions of `id`'s record we would still take now (`RECORD_BURST`, `RECORD_RATE`).
+    fn record_tokens(st: &State, id: &NodeId) -> f32 {
+        tokens(&st.record_rate, id)
     }
 
     fn handle_gossip(&self, from: NodeId, payload: &[u8]) {
@@ -1375,7 +1413,21 @@ impl Node {
     }
 
     /// A neighbor's digest: send it what is newer here, ask for what is newer there.
+    /// Whether a digest from `from` is answered now (`DIGEST_REPLY_GAP`).
+    fn digest_due(&self, from: &NodeId) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let Some(l) = st.links.get_mut(from) else { return false };
+        if l.digest_at.is_some_and(|t| t.elapsed() < DIGEST_REPLY_GAP) {
+            return false;
+        }
+        l.digest_at = Some(Instant::now());
+        true
+    }
+
     fn handle_digest(&self, from: NodeId, payload: &[u8]) {
+        if !self.digest_due(&from) {
+            return;
+        }
         let theirs: HashMap<NodeId, u64> = payload
             .as_chunks::<40>()
             .0
@@ -1393,6 +1445,9 @@ impl Node {
     /// `T_DIGEST2`: the digest, and when the neighbor last heard from each node. That keeps
     /// nodes without a link to us online here between their (rare) records.
     fn handle_digest2(&self, from: NodeId, payload: &[u8]) {
+        if !self.digest_due(&from) {
+            return;
+        }
         let entries: Vec<(NodeId, u64, u16)> = payload
             .as_chunks::<42>()
             .0
@@ -1473,10 +1528,13 @@ impl Node {
     fn handle_want(&self, from: NodeId, payload: &[u8]) {
         let st = self.state.lock().unwrap();
         let Some(l) = st.links.get(&from) else { return };
+        let mut asked = HashSet::new();
         let give: Vec<SignedInfo> = payload
             .as_chunks::<32>()
             .0
             .iter()
+            // Each node once, however often the request names it.
+            .filter(|c| asked.insert(**c))
             .filter_map(|c| {
                 let id = crate::keys::Key32(*c);
                 if id == self.ident.id {
@@ -1530,6 +1588,10 @@ impl Node {
         if !r.info.split || r.details.as_ref().is_some_and(|(d, _)| d.seq >= seq) {
             return None;
         }
+        if tokens(&st.details_rate, &id) < 1.0 {
+            debug!("dropping details of {id}: too many new versions");
+            return None;
+        }
         let d = match s.verify(&self.net) {
             Ok(d) => d,
             Err(e) => {
@@ -1537,6 +1599,8 @@ impl Node {
                 return None;
             }
         };
+        let t = tokens(&st.details_rate, &id);
+        st.details_rate.insert(id, (t - 1.0, Instant::now()));
         let r = st.records.get_mut(&id)?;
         r.info.apply(&d);
         r.details = Some((d, s));
@@ -1546,10 +1610,13 @@ impl Node {
     fn handle_want_details(&self, from: NodeId, payload: &[u8]) {
         let st = self.state.lock().unwrap();
         let Some(l) = st.links.get(&from) else { return };
+        let mut asked = HashSet::new();
         let give: Vec<SignedDetails> = payload
             .as_chunks::<32>()
             .0
             .iter()
+            // Each node once, however often the request names it.
+            .filter(|c| asked.insert(**c))
             .filter_map(|c| {
                 let id = crate::keys::Key32(*c);
                 if id == self.ident.id {
@@ -2195,9 +2262,12 @@ impl Node {
             self.ban_local(st, *id, name);
         }
         if r.issuer != self.ident.id {
+            // Not passed on (false) when we can't open it: we wouldn't remember it either, so
+            // every copy coming back would look new and go round the mesh again. The nodes that
+            // got their key pass it on.
             let Some(env) = r.envelopes.iter().find(|e| e.to == self.ident.id) else {
                 warn!("the network key was changed and this node did not get the new one (banned?)");
-                return true;
+                return false;
             };
             match self.unseal(&r, env) {
                 Some(key) => {
@@ -2207,7 +2277,7 @@ impl Node {
                 }
                 None => {
                     warn!("could not open the new network key");
-                    return true;
+                    return false;
                 }
             }
         }
@@ -2548,6 +2618,18 @@ impl Node {
             let names = self.forget_ids(st, &stale);
             info!("forgot replaced node(s): {}", names.join(", "));
         }
+    }
+
+    /// Sends a link frame towards `to`: over the link to it, or to the first hop of its route.
+    /// One copy per hop, whatever the size of the network.
+    fn send_toward(&self, st: &State, to: &NodeId, f: &[u8]) -> bool {
+        let hop = if st.links.contains_key(to) {
+            Some(*to)
+        } else {
+            st.routes.get(to).copied()
+        };
+        hop.and_then(|h| st.links.get(&h))
+            .is_some_and(|l| l.tx.try_send(f.to_vec()).is_ok())
     }
 
     /// A link or a working UDP path to `id`.
@@ -3113,6 +3195,7 @@ impl Node {
                 kill: kill.clone(),
                 addr: addr.clone(),
                 rtt: None,
+                digest_at: None,
             };
             st.links.insert(peer, entry);
             self.ingest(&mut st, hello.info.clone(), true);
@@ -3503,6 +3586,14 @@ impl Node {
                     info!("forgot {} long-gone node(s)", before - st.records.len());
                 }
                 st.forgotten.retain(|_, f| f.at > cutoff);
+                let State {
+                    records,
+                    record_rate,
+                    details_rate,
+                    ..
+                } = &mut *st;
+                record_rate.retain(|id, _| records.contains_key(id));
+                details_rate.retain(|id, _| records.contains_key(id));
                 self.expire_leases(&mut st);
                 self.expire_clients(&mut st);
                 self.auto_forget(&mut st);
@@ -4199,26 +4290,32 @@ impl Node {
         let mut st = self.state.lock().unwrap();
         match kind {
             BENCH_START => {
-                if st.bench_ip_rx.len() > 64 {
-                    st.bench_ip_rx.retain(|_, b| b.2.elapsed() < Duration::from_secs(120));
+                // A few tests at a time, two per sender: anyone can send start markers, and
+                // each would otherwise be kept (and looked through) for minutes.
+                st.bench_ip_rx.retain(|_, b| b.2.elapsed() < Duration::from_secs(120));
+                let from_src = st.bench_ip_rx.values().filter(|b| b.3 == src).count();
+                if st.bench_ip_rx.contains_key(&id) || from_src >= 2 || st.bench_ip_rx.len() >= 16 {
+                    return;
                 }
                 let now = Instant::now();
-                st.bench_ip_rx.entry(id).or_insert((now, 0, now));
+                st.bench_ip_rx.insert(id, (now, 0, now, src));
             }
             BENCH_DATA => {
-                if let Some(b) = st.bench_ip_rx.get_mut(&id) {
+                if let Some(b) = st.bench_ip_rx.get_mut(&id).filter(|b| b.3 == src) {
                     b.1 += p.len() as u64;
                     b.2 = Instant::now();
                 }
             }
             BENCH_END => {
                 let mbps = match st.bench_ip_rx.remove(&id) {
-                    Some((first, got, last)) => {
+                    Some((first, got, last, _)) => {
                         let secs = last.duration_since(first).as_secs_f64().max(1e-4);
                         let mbps = (got as f64 * 8.0 / secs / 1e6) as f32;
                         debug!("throughput test from {src}: {got} of {value} bytes, {mbps:.0} Mbit/s");
                         st.bench_ip_done.retain(|_, d| d.1.elapsed() < Duration::from_secs(60));
-                        st.bench_ip_done.insert(id, (mbps, Instant::now()));
+                        if st.bench_ip_done.len() < 64 {
+                            st.bench_ip_done.insert(id, (mbps, Instant::now()));
+                        }
                         mbps
                     }
                     // A repeated end marker: the answer got lost, send it again.
@@ -4390,6 +4487,9 @@ impl Node {
                 .map(|r| r.info.clone())
                 .collect()
         };
+        if peers.is_empty() {
+            return; // nothing measured: no new details to sign and send
+        }
         // Round trips first: during throughput tests pings queue behind the test data.
         let mut rtts = HashMap::new();
         for info in &peers {
@@ -4464,6 +4564,10 @@ impl Node {
     pub fn start_measure(self: &Arc<Self>, nodes: Vec<NodeId>, bytes: u64) -> Result<()> {
         let mut st = self.state.lock().unwrap();
         let others: Vec<NodeId> = nodes.into_iter().filter(|n| *n != self.ident.id).collect();
+        // Nothing to measure would still re-sign and send our record: anyone could loop it.
+        if others.is_empty() {
+            bail!("name the nodes to measure towards");
+        }
         if others.len() > MAX_MEASURE_NODES {
             bail!(
                 "at most {MAX_MEASURE_NODES} nodes per measurement ({} asked)",
@@ -5126,6 +5230,25 @@ fn per_source(ip: IpAddr) -> IpAddr {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn records_rate_limited_per_node() {
+        let id = crate::keys::Key32([7; 32]);
+        let mut map = HashMap::new();
+        assert_eq!(tokens(&map, &id), RECORD_BURST);
+        // A burst is taken, then the bucket is empty...
+        for _ in 0..RECORD_BURST as usize {
+            let t = tokens(&map, &id);
+            assert!(t >= 1.0);
+            map.insert(id, (t - 1.0, Instant::now()));
+        }
+        assert!(tokens(&map, &id) < 1.0);
+        // ...and refills at RECORD_RATE per second, up to the burst.
+        map.insert(id, (0.0, Instant::now() - Duration::from_secs(2)));
+        assert!((tokens(&map, &id) - 2.0 * RECORD_RATE).abs() < 0.1);
+        map.insert(id, (0.0, Instant::now() - Duration::from_secs(3600)));
+        assert_eq!(tokens(&map, &id), RECORD_BURST);
+    }
+
     use super::*;
 
     #[test]
