@@ -372,10 +372,11 @@ enum NetCmd {
     Matrix {
         /// Which nodes (default: all).
         selectors: Vec<String>,
-        /// Measure now (sends test data between the nodes) instead of showing the last results.
+        /// Measure now from this node to the named nodes (at most 16; test data over direct
+        /// paths only, needs root) instead of showing the last results.
         #[arg(long)]
         measure: bool,
-        /// Test data per pair in MB, with --measure.
+        /// Test data per node in MB, with --measure (at most 64; a test stops after 3 s).
         #[arg(long, default_value_t = 16)]
         mb: u64,
     },
@@ -1167,8 +1168,20 @@ fn real_main(cli: Cli) -> Result<i32> {
                     };
                     let mut group = agent::select(&all, &sel)?;
                     if measure {
+                        // Only from this node: a request that made every node send test data
+                        // to every other could flood the network.
+                        if sel == ["all"] {
+                            bail!(
+                                "name the nodes to measure towards (at most {}): meshvpn net matrix --measure <node>...",
+                                node::MAX_MEASURE_NODES
+                            );
+                        }
+                        let mb = mb.min(node::MAX_MEASURE_BYTES / 1_000_000);
                         if !json {
-                            eprintln!("measuring between {} nodes ({mb} MB per pair)...", group.len());
+                            eprintln!(
+                                "measuring from this node to {} node(s) ({mb} MB or 3 s each, direct paths only)...",
+                                group.iter().filter(|n| !n.is_self).count()
+                            );
                         }
                         group = agent::measure(&dir, &group, mb)?;
                     }

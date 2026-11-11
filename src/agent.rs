@@ -735,38 +735,35 @@ pub fn matrix(nodes: &[NodeView]) -> Vec<Edge> {
     edges
 }
 
-/// Asks the nodes to measure towards each other and waits until all rows are fresh.
+/// Measures from this node to `nodes` (test data only over direct paths, at most 16 nodes and
+/// 64 MB or 3 s each) and waits for the result. Returns this node and `nodes`, fresh.
 pub fn measure(dir: &Path, nodes: &[NodeView], mb: u64) -> Result<Vec<NodeView>> {
-    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let ids: Vec<String> = nodes.iter().filter(|n| !n.is_self).map(|n| n.id.clone()).collect();
     let started = now_ms();
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(control::request(
+    let resp = rt.block_on(control::request(
         dir,
         &Request::Measure {
             nodes: ids.clone(),
             bytes: mb * 1_000_000,
         },
     ))?;
-    // Each node measures towards the others one after another.
-    // Per peer: the mesh test, and a few seconds over a LAN path.
-    let deadline = Instant::now() + Duration::from_secs(30 + nodes.len() as u64 * (mb / 2 + 14));
+    if let control::Response::Error { message } = resp {
+        bail!("{message}");
+    }
+    // One node after another: a round trip, the mesh test, a few seconds over a LAN path.
+    let deadline = Instant::now() + Duration::from_secs(30 + ids.len() as u64 * 12);
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        let fresh: Vec<NodeView> = select(&self::nodes(&status(dir)?), &ids)?;
-        let pending: Vec<&str> = fresh
-            .iter()
-            .filter(|n| n.online && n.measured < started)
-            .map(|n| n.name.as_str())
-            .collect();
-        if pending.is_empty() {
-            return Ok(fresh);
-        }
-        if Instant::now() > deadline {
-            eprintln!(
-                "note: no fresh results from {} yet - showing what is there",
-                pending.join(", ")
-            );
-            return Ok(fresh);
+        let all = self::nodes(&status(dir)?);
+        let me = all[0].clone();
+        if me.measured >= started || Instant::now() > deadline {
+            if me.measured < started {
+                eprintln!("note: the measurement isn't finished yet - showing what is there");
+            }
+            let mut out = vec![me];
+            out.extend(select(&all, &ids)?.into_iter().filter(|n| !n.is_self));
+            return Ok(out);
         }
     }
 }

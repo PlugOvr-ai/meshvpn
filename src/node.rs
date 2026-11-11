@@ -52,8 +52,11 @@ const ONLINE_WINDOW: Duration = Duration::from_secs(95);
 const DETAILS_EVERY: Duration = Duration::from_secs(300);
 /// Links that are silent this long are dead (we ping every TICK).
 const LINK_TIMEOUT: Duration = Duration::from_secs(45);
-/// The most test data per peer one measurement sends (requests may come from any node or user).
-const MAX_MEASURE_BYTES: u64 = 256 << 20;
+/// The most test data one measurement sends to each node, and for how long at most.
+pub const MAX_MEASURE_BYTES: u64 = 64 << 20;
+const MAX_MEASURE_TIME: Duration = Duration::from_secs(3);
+/// The most nodes one measurement sends test data to.
+pub const MAX_MEASURE_NODES: usize = 16;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -250,8 +253,6 @@ struct State {
     bench_ip_rx: HashMap<u64, (Instant, u64, Instant)>,
     /// Finished tests (id -> result, when), to answer a repeated end marker the same way.
     bench_ip_done: HashMap<u64, (f32, Instant)>,
-    measure_seen: HashSet<u64>,
-    measure_last: Option<Instant>,
     why_seen: HashSet<u64>,
     why_counts: HashMap<NodeId, why::WhyCount>,
     why_replies: HashMap<u64, WhySide>,
@@ -2549,6 +2550,11 @@ impl Node {
         }
     }
 
+    /// A link or a working UDP path to `id`.
+    fn direct(&self, st: &State, id: &NodeId) -> bool {
+        st.links.contains_key(id) || st.udp_paths.get(id).is_some_and(|p| p.usable())
+    }
+
     fn is_online(&self, st: &State, id: &NodeId) -> bool {
         st.links.contains_key(id)
             || st
@@ -3184,7 +3190,10 @@ impl Node {
                 T_DIGEST2 => self.handle_digest2(peer, payload),
                 T_WANT_DETAILS => self.handle_want_details(peer, payload),
                 T_FORGET => self.handle_forget(peer, payload),
-                T_MEASURE => self.handle_measure(peer, payload),
+                // Measurement requests of other nodes (before 0.30.1: every node in the request
+                // sent test data to every other) are ignored: a node measures only when asked
+                // by its own owner, and only from itself (`start_measure`).
+                T_MEASURE => {}
                 T_WHY => self.handle_why(peer, payload),
                 T_WHY_REPLY => self.handle_why_reply(peer, payload),
                 T_ROSTER | T_CLAIM => {
@@ -4113,7 +4122,8 @@ impl Node {
             let data = self.bench_packet(dst, BENCH_DATA, id, 0, size);
             let mut sent = 0u64;
             let mut n = 0u32;
-            while sent < bytes {
+            let stop = Instant::now() + MAX_MEASURE_TIME;
+            while sent < bytes && Instant::now() < stop {
                 self.send_packet_waiting(dst, &data).await;
                 sent += size as u64;
                 n += 1;
@@ -4252,7 +4262,8 @@ impl Node {
         let run = async {
             tx.send(frame(T_BENCH_START, &msg)).await.ok()?;
             let mut sent = 0u64;
-            while sent < bytes {
+            let stop = Instant::now() + MAX_MEASURE_TIME;
+            while sent < bytes && Instant::now() < stop {
                 tx.send(data.clone()).await.ok()?;
                 sent += 60_000;
             }
@@ -4370,7 +4381,12 @@ impl Node {
             st.records
                 .values()
                 .filter(|r| self.is_online(&st, &r.info.id))
-                .filter(|r| only.as_ref().is_none_or(|o| o.contains(&r.info.id)))
+                // On its own, a node measures only the direct paths it has: no relayed
+                // pings, which in a big network would be many.
+                .filter(|r| match &only {
+                    Some(o) => o.contains(&r.info.id),
+                    None => self.direct(&st, &r.info.id),
+                })
                 .map(|r| r.info.clone())
                 .collect()
         };
@@ -4394,7 +4410,10 @@ impl Node {
         }
         for info in peers {
             let rtt = rtts.remove(&info.id).flatten();
-            let mbps = if bytes > 0 {
+            // Test data only over a direct path: through relays it would load other nodes'
+            // links (and the gossip and pings on them).
+            let direct = self.direct(&self.state.lock().unwrap(), &info.id);
+            let mbps = if bytes > 0 && direct {
                 self.bench(info.id, bytes).await
             } else {
                 None
@@ -4405,7 +4424,7 @@ impl Node {
             };
             // Several streams, as NCCL uses it: one TCP stream doesn't fill a fast link.
             let lan_mbps = match lan_ip {
-                Some(ip) if bytes > 0 => crate::share::lan_throughput(&self, ip, 4, 1.5).await,
+                Some(ip) if bytes > 0 && direct => crate::share::lan_throughput(&self, ip, 4, 1.5).await,
                 _ => None,
             };
             let mut st = self.state.lock().unwrap();
@@ -4439,43 +4458,28 @@ impl Node {
         self.announce(&mut st);
     }
 
-    fn handle_measure(self: &Arc<Self>, from: NodeId, payload: &[u8]) {
-        let Ok(req) = serde_json::from_slice::<MeasureReq>(payload) else {
-            return;
-        };
-        self.start_measure(req, Some(from));
-    }
-
-    /// Floods a measurement request; nodes in it measure towards the others in it.
-    pub fn start_measure(self: &Arc<Self>, req: MeasureReq, from: Option<NodeId>) {
+    /// `meshvpn net matrix --measure`: measures from this node to `nodes` (at most
+    /// `MAX_MEASURE_NODES`), with test data only over direct paths. Never on another node's
+    /// request: one request making many nodes send would let a single user flood the network.
+    pub fn start_measure(self: &Arc<Self>, nodes: Vec<NodeId>, bytes: u64) -> Result<()> {
         let mut st = self.state.lock().unwrap();
-        // Clients don't start measurements of the whole network.
-        if from.is_some_and(|f| Self::client_of(&st, &f).is_some()) {
-            return;
+        let others: Vec<NodeId> = nodes.into_iter().filter(|n| *n != self.ident.id).collect();
+        if others.len() > MAX_MEASURE_NODES {
+            bail!(
+                "at most {MAX_MEASURE_NODES} nodes per measurement ({} asked)",
+                others.len()
+            );
         }
-        if !st.measure_seen.insert(req.nonce) {
-            return;
+        if st.measuring {
+            bail!("a measurement is already running on this node");
         }
-        if st.measure_seen.len() > 1000 {
-            st.measure_seen.clear();
-        }
-        // One every 20 s at most, whoever asks (each moves up to 256 MB between every pair).
-        if st.measure_last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
-            return;
-        }
-        st.measure_last = Some(Instant::now());
-        self.broadcast(&st, &frame(T_MEASURE, &serde_json::to_vec(&req).unwrap()), from);
-        if req.nodes.contains(&self.ident.id) && !st.measuring {
-            st.measuring = true;
-            let others: Vec<NodeId> = req.nodes.iter().copied().filter(|n| *n != self.ident.id).collect();
-            let node = self.clone();
-            tokio::spawn(async move {
-                node.clone()
-                    .measure(Some(others), req.bytes.min(MAX_MEASURE_BYTES))
-                    .await;
-                node.state.lock().unwrap().measuring = false;
-            });
-        }
+        st.measuring = true;
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.clone().measure(Some(others), bytes.min(MAX_MEASURE_BYTES)).await;
+            node.state.lock().unwrap().measuring = false;
+        });
+        Ok(())
     }
 
     // ----------------------------------------------------------------------------- sharing

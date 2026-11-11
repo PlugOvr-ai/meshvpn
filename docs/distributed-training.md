@@ -65,7 +65,7 @@ The machine you start the job from can be any node, also one without GPUs (your 
 ```sh
 meshvpn nodes tag:gpu                   # online? CPUs, memory, GPUs
 meshvpn gpu list tag:gpu                # which GPUs are free, busy or reserved
-meshvpn net matrix --measure tag:gpu    # latency, throughput and shared LANs between them
+meshvpn net matrix tag:gpu              # latency, throughput and shared LANs between them
 ```
 
 The matrix tells you how the job will communicate:
@@ -237,7 +237,7 @@ read their logs by itself.
 ## 9. Performance
 
 * **A shared LAN is best.** Within a lab or a data center, all nodes on one network: the job runs over it at full
-  speed, meshvpn only does the setup. `meshvpn net matrix --measure` shows whether every pair shares a LAN.
+  speed, meshvpn only does the setup. `meshvpn net matrix tag:gpu` shows whether every pair shares a LAN.
 * **Over the mesh**, the job's traffic is encrypted and takes the mesh's paths (direct UDP where possible). That is
   fine for experiments, smaller models and data-parallel jobs with modest gradient traffic across sites; for large
   models across the internet, expect the network to be the bottleneck. The matrix's `MESH` column shows the
@@ -254,6 +254,6 @@ read their logs by itself.
 | `RuntimeError: Numpy is not available` | Install numpy in the environment (`pip install numpy`); CPU builds of PyTorch need it. |
 | The job hangs at the start (rendezvous) | A firewall blocks port 29500 (or NCCL's ports) on the master: `sudo meshvpn doctor` on the master checks the mesh interface; on a LAN, allow the nodes to reach each other. |
 | `no LAN path between all nodes, and … runs in userspace mode` | That node has no network interface for NCCL: give its container `--cap-add=NET_ADMIN --device /dev/net/tun`, or use nodes that share a LAN. |
-| The job goes over the mesh although the nodes share a LAN | No measurement yet: run `meshvpn net matrix --measure tag:gpu` once. |
+| The job goes over the mesh although the nodes share a LAN | Not measured yet: each node checks its paths a minute after it starts and every 5 minutes. To check now, on every node: `meshvpn exec tag:gpu -- meshvpn net matrix --measure --mb 0 tag:gpu`. |
 | `could not reserve GPUs: …` | They are taken: `meshvpn gpu list` shows who reserved them and until when. |
 | One node fails, all stop | Intended (one failed rank stalls the others). The log of the failed node is in `meshvpn jobs show <id>`; `--keep-going` if you really want the rest to continue. |

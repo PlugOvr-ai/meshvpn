@@ -18,6 +18,7 @@ pub const T_BENCH_DATA: u8 = 9;
 pub const T_BENCH_END: u8 = 10;
 pub const T_BENCH_RESULT: u8 = 11;
 /// "Please measure now" for a set of nodes (flooded).
+/// Measurement requests of other nodes: ignored since 0.30.1 (`Node::start_measure`).
 pub const T_MEASURE: u8 = 12;
 /// The admin roster (managed networks), and admissions of new nodes (flooded).
 pub const T_ROSTER: u8 = 13;
@@ -138,13 +139,6 @@ pub struct BenchMsg {
     pub id: u64,
     #[serde(default)]
     pub mbps: f32,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct MeasureReq {
-    pub nonce: u64,
-    pub nodes: Vec<NodeId>,
-    pub bytes: u64,
 }
 
 /// `meshvpn net why`, flooded: `to` tests its direct path to `from` together with it.

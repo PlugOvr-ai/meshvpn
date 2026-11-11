@@ -8,6 +8,23 @@ puts the section at the top of the release notes.
 Sections: **Added**, **Changed**, **Fixed**, **Security**, **Removed**. Security fixes say what an
 attacker needed and what they could do.
 
+## [0.30.1] - 2026-11-11
+
+### Security
+- **`meshvpn net matrix --measure` could flood the whole network.** Any user on any member machine (no root
+  needed) or any member node could ask every node to send up to 256 MB of test data to every other node, also
+  through relays, and repeat that every 20 s: enough to make links time out and nodes drop out (at 50 nodes,
+  about 600 GB per request). Outsiders and clients could not. Now a node measures only from itself and only when
+  its own owner asks: requests from other nodes are ignored and not passed on, test data needs root or the
+  node's owner and named nodes (at most 16), goes only over direct paths (never through a relay) and stops at
+  64 MB or 3 s per node. **Upgrade all nodes**: older nodes still act on such requests.
+
+### Changed
+- `meshvpn net matrix` shows what every node measured itself; `--measure` measures from this node to the
+  named nodes. Each node checks round trips and LAN paths to the nodes it has a direct path to every 5
+  minutes (before: to every node, also through relays). `--measure --mb 0` (round trips and LAN paths only)
+  needs no root.
+
 ## [0.30.0] - 2026-11-11
 
 ### Changed

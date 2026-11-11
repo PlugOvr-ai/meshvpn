@@ -330,19 +330,21 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
             text: node.admin_status().to_string(),
         },
         Ok(Request::SshOverview) => Response::SshOverview(Box::new(node.ssh_overview())),
-        // Allowed for everyone: it only measures (agents usually run unprivileged).
+        // Test data only for the node's owner (it loads the paths to the nodes measured).
+        Ok(Request::Measure { bytes, .. }) if bytes > 0 && !privileged => Response::Error {
+            message: "measuring with test data needs root (sudo) or the node's owner".into(),
+        },
         Ok(Request::Measure { nodes, bytes }) => {
-            use rand::RngCore;
-            let req = crate::proto::MeasureReq {
-                nonce: rand::rngs::OsRng.next_u64(),
-                nodes: nodes
-                    .iter()
-                    .filter_map(|n| crate::keys::Key32::from_hex(n).ok())
-                    .collect(),
-                bytes,
-            };
-            node.start_measure(req, None);
-            Response::Ok
+            let ids = nodes
+                .iter()
+                .filter_map(|n| crate::keys::Key32::from_hex(n).ok())
+                .collect();
+            match node.start_measure(ids, bytes) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
         }
         Ok(_) if !privileged => Response::Error {
             message: "permission denied - try again with sudo".into(),

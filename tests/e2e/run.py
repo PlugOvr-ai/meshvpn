@@ -1302,7 +1302,10 @@ def test_net_env(lab):
     for g in ("g1", "g2", "g3"):
         wait(lambda g=g: ctl.online(g), f"{g} online", 60)
     time.sleep(25)
-    edges = ctl.mvj("net matrix --measure --mb 4", timeout=120)
+    # Each node measures only from itself (0.30.1: no node measures on another's request).
+    edges = []
+    for g, to in ((g1, "g2 g3"), (g2, "g1"), (g3, "g1")):
+        edges += [e for e in g.mvj(f"net matrix --measure --mb 4 {to}", timeout=120) if e["from"] == g.name]
     pair = lambda a, b: next((e for e in edges if e["from"] == a and e["to"] == b), None)  # noqa: E731
     check(pair("g1", "g2") and pair("g1", "g2")["lan_ip"], f"g1-g2 share a LAN: {pair('g1', 'g2')}")
     check(not (pair("g1", "g3") or {}).get("lan_ip"), "g1-g3 share no LAN")
@@ -1310,12 +1313,20 @@ def test_net_env(lab):
     e = pair("g1", "g2")
     check((e.get("lan_mbps") or 0) > 1000 and e["lan_mbps"] > (e["mesh_mbps"] or 0), f"LAN path throughput: {e}")
     check(not (pair("g1", "g3") or {}).get("lan_mbps"), "no LAN throughput without a LAN path")
-    table = ctl.mv("net matrix")
+    table = g1.mv("net matrix g1 g2 g3")
     check("LAN PATH" in table and "Gbit/s" in table, f"matrix shows LAN throughput: {table}")
-    # Throughput for every pair, also those talking only over UDP or through a relay (g1-g3).
-    for x, y in (("g1", "g2"), ("g2", "g1"), ("g1", "g3"), ("g3", "g1")):
+    # Throughput over direct paths; through a relay (g1-g3, via ctl) only the round trip.
+    for x, y in (("g1", "g2"), ("g2", "g1")):
         e = pair(x, y)
         check(e and (e["mesh_mbps"] or 0) > 1 and e["rtt_ms"] is not None, f"{x} -> {y} measured: {e}")
+    for x, y in (("g1", "g3"), ("g3", "g1")):
+        e = pair(x, y)
+        check(e and e["rtt_ms"] is not None and not e["mesh_mbps"], f"{x} -> {y}: round trip, no test data through the relay: {e}")
+    # Test data needs root, and named nodes.
+    p = g1.sh("meshvpn net matrix --measure g2", user="agent", ok=False)
+    check(p.returncode != 0 and "root" in p.stdout + p.stderr, f"unprivileged measurement: {p.stdout}{p.stderr}")
+    p = g1.mv("net matrix --measure", ok=False)
+    check(p.returncode != 0 and "name the nodes" in p.stdout + p.stderr, f"measurement of all nodes: {p.stdout}{p.stderr}")
     e12 = g2.mvj("net env --master g1 g1 g2")
     check(e12["NCCL_SOCKET_IFNAME"] == "eth0" and e12["NODE_RANK"] == "1", f"LAN env: {e12}")
     e13 = g3.mvj("net env --master g1 g1 g3")
@@ -1341,10 +1352,11 @@ def test_routed_lan(lab):
         wait(lambda n=n: hub.online(n.name), f"{n.name} online", 60)
     p2_ip = p2.net_ip(net_b)
     wait(lambda: (p1.peer("p2") or {}).get("path", "").startswith(f"direct UDP {p2_ip}"), "p1-p2 direct over the route", 60)
-    edges = p1.mvj("net matrix --measure --mb 2", timeout=120)
+    edges = p1.mvj("net matrix --measure --mb 2 p2", timeout=120)
     e = next((e for e in edges if e["from"] == "p1" and e["to"] == "p2"), None)
     check(e and e["lan_ip"] == p2_ip, f"routed path counts as LAN path: {e}")
     check((e.get("lan_mbps") or 0) > 100, f"routed LAN path throughput: {e}")
+    p2.mvj("net matrix --measure --mb 0 p1", timeout=120)  # p2's own row: each node measures only itself
     env = p1.mvj("net env --master p1 p1 p2")
     check(env["NCCL_SOCKET_IFNAME"] == "eth0", f"NCCL over the routed path: {env}")
 

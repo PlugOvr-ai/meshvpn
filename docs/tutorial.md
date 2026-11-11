@@ -348,13 +348,14 @@ The [distributed training tutorial](distributed-training.md) walks through all o
 ## 11. Measuring the network
 
 ```sh
-meshvpn net matrix --measure          # latency and throughput between every pair of nodes
-meshvpn net matrix --measure gpu1 gpu2 --mb 100   # selected nodes, more test data for fast links
-meshvpn net matrix                    # the last results again
+meshvpn net matrix                    # what every node measured towards the others
+sudo meshvpn net matrix --measure gpu1 gpu2 --mb 64   # from this node to gpu1 and gpu2, now
+meshvpn net matrix --measure --mb 0 gpu1   # round trip and LAN path only (no root needed)
 ```
 
-The matrix measures the mesh's real paths (UDP, TCP or relay, with encryption) and shows where two nodes share a
-LAN. It also works in rootless containers.
+The matrix measures the mesh's real paths (UDP or TCP, with encryption) and shows where two nodes share a LAN. A
+node measures only from itself and only when its owner asks; test data goes only over direct paths (through a
+relay, only the round trip). It also works in rootless containers.
 
 For a classic TCP test between two nodes (needs the mesh interface, i.e. not from a rootless container):
 

@@ -70,7 +70,7 @@ reservations; don't use GPUs reserved by someone else.
 ## Distributed training
 
 ```sh
-meshvpn --json net matrix --measure tag:gpu        # latency, throughput, shared LANs between nodes
+meshvpn --json net matrix tag:gpu                  # latency, throughput, shared LANs between nodes
 meshvpn launch tag:gpu --gpus 4 --detach -- torchrun train.py   # prints the job id
 meshvpn --json jobs list
 meshvpn --json jobs show <id>                      # state, environment, end of each node's log

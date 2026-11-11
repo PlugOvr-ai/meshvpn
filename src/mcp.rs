@@ -62,11 +62,11 @@ fn tools() -> Value {
         },
         {
             "name": "network_matrix",
-            "description": "Latency (RTT), mesh throughput and direct LAN paths between nodes. With measure=true the nodes run fresh tests first (sends `mb` MB per pair). Use it to decide where to run communication-heavy jobs and whether nodes share a fast LAN.",
+            "description": "Latency (RTT), mesh throughput and direct LAN paths between nodes. With measure=true this node measures towards the selected nodes first (at most 16; test data only over direct paths and only as root; mb=0 for round trips and LAN paths only). Other nodes' rows are what they measured themselves, every 5 minutes. Use it to decide where to run communication-heavy jobs and whether nodes share a fast LAN.",
             "inputSchema": {"type": "object", "properties": {
                 "selectors": selectors,
                 "measure": {"type": "boolean"},
-                "mb": {"type": "integer", "description": "Test data per pair in MB (default 16)."}
+                "mb": {"type": "integer", "description": "Test data per node in MB (default 16, at most 64; 0 without root)."}
             }}
         },
         {
