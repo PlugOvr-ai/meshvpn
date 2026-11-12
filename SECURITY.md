@@ -6,7 +6,7 @@ meshvpn connects machines and carries their traffic, so we treat vulnerabilities
 
 Please **don't open a public issue**. Report privately:
 
-- through GitHub: **Security → Report a vulnerability** on this repository, or
+- through GitHub (preferred): **Security → Report a vulnerability** on this repository, or
 - by e-mail to **security@plugovr.ai**.
 
 Please include the version (`meshvpn --version`), the platform, what an attacker needs (network

@@ -1888,7 +1888,13 @@ fn real_main(cli: Cli) -> Result<i32> {
                     desktop::bundle::install_gpu()?;
                     say(
                         json,
-                        "GPU support installed: 3D programs in `meshvpn desktop` sessions render on the GPU, and the GPU encodes the picture",
+                        if desktop::bundle::user_virtualgl_dir().is_some_and(|d| d.join("lib/libvglfaker.so").is_file())
+                            && (!sys::is_root() || config::rootless())
+                        {
+                            "GPU support installed for this user: 3D programs in your `meshvpn desktop` sessions render on the GPU (new sessions)"
+                        } else {
+                            "GPU support installed: 3D programs in `meshvpn desktop` sessions render on the GPU, and the GPU encodes the picture"
+                        },
                     );
                 }
                 if let Some(name) = which.or(xfce.then(|| "xfce".to_string())) {

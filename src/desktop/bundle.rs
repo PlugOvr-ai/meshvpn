@@ -94,12 +94,60 @@ const VIRTUALGL_SHA256: &[(&str, &str)] = &[
     ),
 ];
 
+/// VirtualGL's package `file`, from MESHVPN_VIRTUALGL_DIR or GitHub, checked against its checksum.
+fn virtualgl_package(file: &str) -> Result<Vec<u8>> {
+    let url = format!("https://github.com/VirtualGL/virtualgl/releases/download/{VIRTUALGL}/{file}");
+    // A copy at hand (machines without internet, tests): MESHVPN_VIRTUALGL_DIR/<file>. Checked
+    // against the same checksum as a download.
+    let local = std::env::var_os("MESHVPN_VIRTUALGL_DIR")
+        .map(|d| std::path::PathBuf::from(d).join(file))
+        .filter(|p| p.is_file());
+    let data: Vec<u8> = if let Some(p) = local {
+        println!("VirtualGL {VIRTUALGL} from {}", p.display());
+        std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?
+    } else {
+        println!("Downloading VirtualGL {VIRTUALGL} ({file})...");
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let c = crate::update::client(None)?;
+            // GitHub's download servers answer 5xx now and then: a few tries.
+            let mut tries = 0;
+            loop {
+                tries += 1;
+                match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
+                    Ok(r) => break anyhow::Ok(r.bytes().await?.to_vec()),
+                    Err(e) if tries < 4 && e.status().is_none_or(|s| s.is_server_error()) => {
+                        eprintln!("  {e} - trying again");
+                        tokio::time::sleep(std::time::Duration::from_secs(5 * tries)).await;
+                    }
+                    Err(e) => break Err(e.into()),
+                }
+            }
+        })
+        .with_context(|| {
+            format!(
+                "downloading {url} (without internet: put {file} into a directory and set MESHVPN_VIRTUALGL_DIR to it)"
+            )
+        })?
+    };
+    let want = VIRTUALGL_SHA256
+        .iter()
+        .find(|(f, _)| *f == file)
+        .map(|(_, h)| *h)
+        .with_context(|| format!("no checksum known for {file}"))?;
+    let got = crate::update::sha256_hex(&data);
+    if got != want {
+        bail!("{url}: checksum {got}, expected {want} - not installed");
+    }
+    Ok(data)
+}
+
 /// `meshvpn desktop setup --gpu`: 3D on the GPU in desktop sessions (VirtualGL: OpenGL programs
 /// render on the GPU, the picture goes into the session's X server) and the picture to the
 /// browser encoded by the GPU (ffmpeg with NVENC or VA-API, and the VA-API drivers).
 pub fn install_gpu() -> Result<()> {
-    if !crate::sys::is_root() {
-        bail!("installing the GPU support needs root (the system's package manager) - try again with sudo");
+    if !crate::sys::is_root() || crate::config::rootless() {
+        return install_gpu_user();
     }
     let has = |c: &str| {
         std::env::var_os("PATH")
@@ -130,51 +178,7 @@ pub fn install_gpu() -> Result<()> {
     } else {
         bail!("no supported package manager (apt, dnf, zypper) for VirtualGL - install it yourself");
     };
-    let url = format!("https://github.com/VirtualGL/virtualgl/releases/download/{VIRTUALGL}/{file}");
-    // A copy at hand (machines without internet, tests): MESHVPN_VIRTUALGL_DIR/<file>. Checked
-    // against the same checksum as a download.
-    let local = std::env::var_os("MESHVPN_VIRTUALGL_DIR")
-        .map(|d| std::path::PathBuf::from(d).join(&file))
-        .filter(|p| p.is_file());
-    let data = if let Some(p) = local {
-        println!("VirtualGL {VIRTUALGL} from {}", p.display());
-        std::fs::read(&p)
-            .with_context(|| format!("reading {}", p.display()))?
-            .into()
-    } else {
-        println!("Downloading VirtualGL {VIRTUALGL} ({file})...");
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            let c = crate::update::client(None)?;
-            // GitHub's download servers answer 5xx now and then: a few tries.
-            let mut tries = 0;
-            loop {
-                tries += 1;
-                match c.get(&url).send().await.and_then(|r| r.error_for_status()) {
-                    Ok(r) => break anyhow::Ok(r.bytes().await?),
-                    Err(e) if tries < 4 && e.status().is_none_or(|s| s.is_server_error()) => {
-                        eprintln!("  {e} - trying again");
-                        tokio::time::sleep(std::time::Duration::from_secs(5 * tries)).await;
-                    }
-                    Err(e) => break Err(e.into()),
-                }
-            }
-        })
-        .with_context(|| {
-            format!(
-                "downloading {url} (without internet: put {file} into a directory and set MESHVPN_VIRTUALGL_DIR to it)"
-            )
-        })?
-    };
-    let want = VIRTUALGL_SHA256
-        .iter()
-        .find(|(f, _)| *f == file)
-        .map(|(_, h)| *h)
-        .with_context(|| format!("no checksum known for {file}"))?;
-    let got = crate::update::sha256_hex(&data);
-    if got != want {
-        bail!("{url}: checksum {got}, expected {want} - not installed");
-    }
+    let data = virtualgl_package(&file)?;
     // In a new directory of root's alone: nobody can put something else in its place before
     // the package manager reads it.
     let dir = std::env::temp_dir().join(format!("meshvpn-gpu-{:016x}", rand::random::<u64>()));
@@ -200,6 +204,126 @@ pub fn install_gpu() -> Result<()> {
         bail!("installing the GPU support failed (see above)");
     }
     Ok(())
+}
+
+/// The packed desktop is installed here (for this user, or for the machine): its programs bring
+/// their own libraries.
+pub fn packed_installed() -> bool {
+    user_base()
+        .map(|b| b.with_file_name("desktop-full/opt/meshvpn-desktop-full"))
+        .into_iter()
+        .chain([PathBuf::from("/opt/meshvpn-desktop-full")])
+        .any(|p| p.is_dir())
+}
+
+/// Where `setup --gpu` puts VirtualGL without root: `lib/` (the libraries sessions preload),
+/// `bin/` (glxinfo, eglinfo, glxspheres64, to check it), `doc/` (its licence).
+pub fn user_virtualgl_dir() -> Option<PathBuf> {
+    user_base().map(|b| b.with_file_name("virtualgl"))
+}
+
+/// VirtualGL in the session's own libraries, if installed (the user's own, else the machine's).
+pub fn virtualgl_lib() -> Option<PathBuf> {
+    user_virtualgl_dir()
+        .map(|d| d.join("lib"))
+        .into_iter()
+        .chain(["/usr/lib", "/usr/lib64", "/opt/VirtualGL/lib", "/opt/VirtualGL/lib64"].map(PathBuf::from))
+        .find(|d| d.join("libvglfaker.so").is_file() && d.join("libdlfaker.so").is_file())
+}
+
+/// `setup --gpu` without root: VirtualGL's libraries from its Debian package (for any
+/// distribution of this architecture: they need only the system's OpenGL and X libraries) into
+/// the user's own directory. On NVIDIA that's all: VirtualGL drives its EGL without GLX in the
+/// session's X server, so the bundled Xvfb will do. Mesa's EGL (Intel, AMD) needs GLX: the
+/// system's Xvfb, which takes root to install. Not ffmpeg: the picture is encoded by an ffmpeg
+/// found in the PATH, if there is one (see desktop::video).
+fn install_gpu_user() -> Result<()> {
+    let a = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => bail!("VirtualGL has no package for {other}"),
+    };
+    let dir = user_virtualgl_dir().ok_or_else(|| anyhow!("HOME is not set"))?;
+    let deb = virtualgl_package(&format!("virtualgl_{VIRTUALGL}_{a}.deb"))?;
+    let tmp = dir.with_extension(format!("new-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    for sub in ["lib", "bin", "doc"] {
+        std::fs::create_dir_all(tmp.join(sub))?;
+    }
+    let xz = ar_member(&deb, "data.tar.xz").context("VirtualGL's package has no data.tar.xz")?;
+    let mut tar_bytes = Vec::new();
+    lzma_rs::xz_decompress(&mut std::io::Cursor::new(xz), &mut tar_bytes)
+        .map_err(|e| anyhow!("unpacking VirtualGL's package: {e:?}"))?;
+    let mut n = 0;
+    for entry in tar::Archive::new(std::io::Cursor::new(tar_bytes)).entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().trim_start_matches("./").to_string();
+        let name = path.rsplit('/').next().unwrap_or_default().to_string();
+        let dest = if path.starts_with("usr/lib/") && name.ends_with(".so") {
+            tmp.join("lib").join(&name)
+        } else if ["glxinfo", "eglinfo", "glxspheres64", "eglxspheres64"]
+            .map(|b| format!("opt/VirtualGL/bin/{b}"))
+            .contains(&path)
+        {
+            tmp.join("bin").join(&name)
+        } else if path.starts_with("usr/share/doc/") && name.ends_with(".txt") {
+            tmp.join("doc").join(&name)
+        } else {
+            continue;
+        };
+        if entry.header().entry_type().is_file() {
+            entry.unpack(&dest)?;
+            n += 1;
+        }
+    }
+    if !tmp.join("lib/libvglfaker.so").is_file() || !tmp.join("lib/libdlfaker.so").is_file() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!("VirtualGL's package has no libvglfaker.so ({n} files)");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&tmp, &dir)?;
+    println!(
+        "VirtualGL {VIRTUALGL} installed in {} (without root: for this user)",
+        dir.display()
+    );
+    let has =
+        |c: &str| std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(c).is_file()));
+    let nvidia = unsafe { libc::access(c"/dev/nvidia0".as_ptr(), libc::R_OK | libc::W_OK) } == 0;
+    if !nvidia
+        && !["/usr/bin/Xvfb", "/usr/local/bin/Xvfb"]
+            .iter()
+            .any(|p| Path::new(p).is_file())
+    {
+        println!(
+            "No NVIDIA GPU here: VirtualGL on other GPUs also needs the system's Xvfb (an admin: \
+             sudo meshvpn desktop setup --gpu). Until then OpenGL runs on the CPU."
+        );
+    }
+    if !has("ffmpeg") {
+        println!(
+            "No ffmpeg here: the picture is encoded on the CPU. An ffmpeg with NVENC or VA-API in the PATH \
+             (e.g. ~/.local/bin) lets the GPU encode it too."
+        );
+    }
+    Ok(())
+}
+
+/// The member `name` of an ar archive (a .deb is one).
+fn ar_member<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let mut rest = data.strip_prefix(b"!<arch>\n")?;
+    while rest.len() >= 60 {
+        let (head, body) = rest.split_at(60);
+        let member = std::str::from_utf8(&head[..16]).ok()?.trim_end().trim_end_matches('/');
+        let size: usize = std::str::from_utf8(&head[48..58]).ok()?.trim().parse().ok()?;
+        if body.len() < size {
+            return None;
+        }
+        if member == name {
+            return Some(&body[..size]);
+        }
+        rest = &body[(size + size % 2).min(body.len())..];
+    }
+    None
 }
 
 /// `meshvpn desktop setup --login`: "meshvpn desktop" in the login screen. Logging in with it
@@ -231,8 +355,20 @@ pub fn install_login_entry() -> Result<std::path::PathBuf> {
 /// `meshvpn desktop <node>` from then on. Lean: the desktop, a terminal and D-Bus; no display
 /// manager. Cinnamon draws with OpenGL: it also gets the system's Xvfb and Mesa (on the CPU).
 pub fn install_desktop(name: &str) -> Result<()> {
-    if !crate::sys::is_root() {
-        bail!("installing a desktop needs root (the system's package manager) - try again with sudo, or ask an admin");
+    if !crate::sys::is_root() || crate::config::rootless() {
+        // The packed desktop (installed without root) has Xfce and MATE: choosing is all there is.
+        let packed = user_base().map(|b| b.with_file_name("desktop-full/opt/meshvpn-desktop-full"));
+        if ["xfce", "mate"].contains(&name)
+            && let (Some(p), Some(f)) = (packed.filter(|p| p.is_dir()), user_default_file())
+        {
+            std::fs::write(&f, name)?;
+            println!("{name} from the packed desktop in {}", p.display());
+            return Ok(());
+        }
+        bail!(
+            "installing a desktop needs root (the system's package manager) - try again with sudo, or ask an admin. \
+             Without root: install.sh --user --desktop xfce|mate (the packed desktop)"
+        );
     }
     let has = |c: &str| {
         std::env::var_os("PATH")

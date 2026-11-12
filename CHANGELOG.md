@@ -10,6 +10,22 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-11-12
+
+3D on the GPU in desktop sessions without root.
+
+### Added
+- **3D on the GPU without root:** `meshvpn desktop setup --gpu` as a normal user installs VirtualGL for that user
+  (in `~/.local/share/meshvpn/virtualgl`), and their desktop sessions render OpenGL on the GPU. On NVIDIA no system
+  Xvfb is needed any more (VirtualGL drives NVIDIA's EGL without GLX in the session's X server), also in containers
+  with only `/dev/nvidia*`. With the packed desktop (Xfce or MATE without root) OpenGL programs are started with
+  `vglrun <program>`, since the desktop's own programs can't load VirtualGL. Tested on an RTX 3090 in Docker as a
+  normal user.
+- `meshvpn desktop setup --desktop xfce|mate` without root picks the desktop of the packed one instead of failing.
+
+### Changed
+- Private vulnerability reporting through GitHub is the preferred channel (`SECURITY.md`).
+
 ## [0.31.1] - 2026-11-11
 
 Addresses without collisions and the rest of the scaling plan (1000 nodes: about 20 kB/s per node, computed).

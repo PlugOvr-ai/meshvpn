@@ -2004,6 +2004,40 @@ def test_desktop_gpu(lab):
 
 
 @test
+def test_desktop_gpu_user(lab):
+    """setup --gpu without root: VirtualGL into the user's home, and the session renders through it.
+    Mesa's software EGL device stands in for a GPU; Mesa needs GLX in the session's X server, so the
+    machine has the system's Xvfb here (on NVIDIA the bundled one does: checked by hand on an RTX 3090)."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    box = lab.node("box", [lab.network("net")], caps=False, cmd=["sleep", "infinity"])
+    # The system's OpenGL, as on any machine with a GPU, and its Xvfb; no VirtualGL.
+    box.sh("apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "
+           "libgl1 libegl1 libegl-mesa0 libgl1-mesa-dri libxv1 mesa-utils xvfb >/dev/null", timeout=900)
+    check(box.sh("test -e /usr/lib/libvglfaker.so && echo yes || echo no").strip() == "no", "no VirtualGL on the machine")
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("mkdir -p /tmp/vgl && chmod 755 /tmp/vgl")
+    run(["docker", "cp", str(virtualgl_deb()), f"{box.c}:/tmp/vgl/"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz /tmp/vgl/*")
+    box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent")
+    out = box.sh("MESHVPN_VIRTUALGL_DIR=/tmp/vgl meshvpn desktop setup --gpu", user="agent", timeout=300)
+    check("for this user" in out and "No ffmpeg here" in out, out[-800:])
+    check(box.sh("test -f /home/agent/.local/share/meshvpn/virtualgl/lib/libvglfaker.so && test ! -e /usr/lib/libvglfaker.so "
+                 "&& echo ok || echo no").strip() == "ok", "VirtualGL in the home, nowhere else")
+    attach = "MESHVPN_DESKTOP_GPU=egl meshvpn desktop attach --session plain"
+    env = f"MESHVPN_DESKTOP_BRIDGE='su agent -c \"{attach}\"'"
+    box.sh(f"cd /tmp && ({env} meshvpn desktop box --no-browser --port 18094 > /tmp/desktop.out 2>&1 &)")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop.out", ok=False).stdout), "viewer link", 10)
+    token = out.split("#", 1)[1].split()[0]
+    p = box.sh(f"python3 /usr/local/bin/desktop_client.py 18094 {token} gl", ok=False, timeout=180)
+    sess = "/tmp/meshvpn-desktop-" + box.sh("id -u agent").strip()
+    log = box.sh(f"tail -c 2000 {sess}/session.log", ok=False).stdout
+    check(p.returncode == 0, f"gl: {p.stdout[-1500:]}{p.stderr[-500:]}\nsession log: {log}")
+    check("VirtualGL on egl" in log, f"the session log: {log}")
+    glx = wait(lambda: (lambda t: t if "renderer" in t else None)(box.sh("cat /tmp/glx", ok=False).stdout), "glxinfo", 15)
+    check("VirtualGL" in glx, f"OpenGL through VirtualGL: {glx[:1500]}")
+
+
+@test
 def test_console(lab):
     """meshvpn console: node list, shells as tabs with each node's default user (or the one last used), desktop link."""
     net = lab.network("net")

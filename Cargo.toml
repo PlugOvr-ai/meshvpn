@@ -39,6 +39,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tun = { version = "0.8.14", features = ["async"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+lzma-rs = "0.3"
 
 # The desktop and SSH servers (Unix only).
 [target.'cfg(unix)'.dependencies]

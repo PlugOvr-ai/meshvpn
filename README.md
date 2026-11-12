@@ -490,6 +490,14 @@ applications you want to run.
   `MESHVPN_DESKTOP_GPU=/dev/dri/card1` (or `off`) and `MESHVPN_DESKTOP_ENCODER=nvenc|vaapi|off` in the node's
   environment; in the browser `localStorage["meshvpn.video"] = "off"` keeps tiles. The session log says what it uses
   (`3D: VirtualGL on …`, `video: NVENC`). Fedora's own ffmpeg has no H.264 encoder: there use RPM Fusion's.
+  **Without root,** `meshvpn desktop setup --gpu` installs VirtualGL for your user alone (in
+  `~/.local/share/meshvpn/virtualgl`, from VirtualGL's package, checked against its checksum). It needs the machine's
+  OpenGL libraries (`libGL`, `libEGL`, as any machine with a GPU driver has). On NVIDIA that's all: the bundled X server
+  will do, also in a container with only `/dev/nvidia*` (`docker run --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all`).
+  Intel and AMD GPUs (Mesa) also need the system's Xvfb, which an admin installs. With the packed desktop (Xfce or MATE
+  without root) its own programs can't load VirtualGL, so it isn't used for the whole session: start OpenGL programs with
+  `vglrun <program>` there (the session has its own `vglrun`). ffmpeg isn't installed without root: with an ffmpeg that
+  has NVENC or VA-API in the PATH (e.g. `~/.local/bin`) the GPU encodes the picture too, otherwise it's tiles.
 * **The machine's own screen:** `meshvpn desktop <node> --screen` shows the desktop you are logged in to at that
   machine, with its windows and programs as they are (your Chrome included), instead of a desktop of its own. It keeps the
   monitor's size (the browser scales it); with several monitors the bar shows *Screen 1*, *Screen 2*, … and *All*,

@@ -307,6 +307,16 @@ def video(port, token):
                       "tiles_after": sum(v.tiles.values()) - tiles_before, "notices": v.notices}))
 
 
+def gl(port, token, prefix=""):
+    """OpenGL in the session: glxinfo's answer in /tmp/glx, then a window (prefix: e.g. vglrun)."""
+    v = Viewer(port, token)
+    v.send(C_RESIZE, struct.pack("<HH", 1000, 640))
+    v.until(lambda: v.frames >= 1, "first frame", 90)
+    v.send(C_LAUNCH, f"{prefix} glxinfo > /tmp/glx 2>&1; xlogo".strip().encode())
+    v.until(lambda: any(w["title"] == "xlogo" for w in v.windows), "xlogo", 30)
+    print(json.dumps({"notices": v.notices}))
+
+
 def session(port, link_token):
     """What the page does first: the link's token (good once) for a session token (kept, as
     the page keeps it, for the next run of this script with the same link)."""
@@ -354,6 +364,8 @@ def main():
         return full_mate(port, token)
     if len(sys.argv) > 3 and sys.argv[3] == "xfce":
         return xfce(port, token)
+    if len(sys.argv) > 3 and sys.argv[3] == "gl":
+        return gl(port, token, " ".join(sys.argv[4:]))
     if len(sys.argv) > 3 and sys.argv[3] == "fallback":
         return fallback(port, token)
     v = Viewer(port, token)

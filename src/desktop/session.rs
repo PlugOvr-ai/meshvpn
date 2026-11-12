@@ -503,14 +503,20 @@ pub fn run(want: &str) -> Result<()> {
     let font_cache = dir.join("fontcache");
     write_fonts_conf(&fonts_conf, &bundle, &font_cache)?;
 
-    // VirtualGL needs an X server with GLX, as Cinnamon does: then the system's Xvfb.
+    // VirtualGL needs an X server with GLX, as Cinnamon does: then the system's Xvfb. Not on
+    // NVIDIA's EGL, which VirtualGL drives without it: there the bundled one will do (machines
+    // where no one may install the system's Xvfb).
     let mut gpu = gl_on_gpu();
-    let system = (mode == Mode::Cinnamon || !gpu.is_empty()).then(system_xvfb).flatten();
-    if !gpu.is_empty() && system.is_none() {
+    let glx = mode == Mode::Cinnamon || (!gpu.is_empty() && !nvidia_egl(&gpu));
+    let system = glx.then(system_xvfb).flatten();
+    if !gpu.is_empty() && system.is_none() && !nvidia_egl(&gpu) {
         warn!(
-            "3D: VirtualGL needs the system's Xvfb (install it, or `meshvpn desktop setup --gpu`) - OpenGL on the CPU"
+            "3D: VirtualGL on this GPU needs the system's Xvfb (install it, or `sudo meshvpn desktop setup --gpu`) - OpenGL on the CPU"
         );
         gpu.clear();
+    }
+    if !gpu.is_empty() && bundle::packed_installed() {
+        gpu = per_program(&dir, gpu);
     }
     let (mut xvfb, dpy) = start_xvfb(&bundle, &xauth, system.as_deref())?;
     info!("Xvfb running as display :{dpy}");
@@ -837,16 +843,67 @@ fn which(cmd: &str) -> bool {
 /// The GPU: MESHVPN_DESKTOP_GPU (a /dev/dri/card* device, "egl" for EGL's own choice, or "off"),
 /// else the first GPU this user may use (its device is accessible: with bookings, the booked
 /// one). Nothing without VirtualGL (`meshvpn desktop setup --gpu`).
+/// VirtualGL only for the programs started with `vglrun`, not for the whole session: the packed
+/// desktop's programs bring their own libraries, and VirtualGL (built for the system's) can't
+/// load into them, which stops them from starting at all. The session's own `vglrun` (in
+/// `dir/bin`, first in the PATH) adds it to the program it starts.
+fn per_program(dir: &Path, gpu: Vec<(String, String)>) -> Vec<(String, String)> {
+    let Some(lib) = bundle::virtualgl_lib() else {
+        return vec![];
+    };
+    let bin = dir.join("bin");
+    let script = "#!/bin/sh\n\
+        # meshvpn: this program's OpenGL on the GPU (VirtualGL), in a meshvpn desktop session.\n\
+        [ $# -gt 0 ] || { echo \"usage: vglrun <program> [args]\" >&2; exit 2; }\n\
+        [ -n \"$MESHVPN_VGL_PRELOAD\" ] || { echo \"vglrun: no GPU support in this session\" >&2; exec \"$@\"; }\n\
+        LD_PRELOAD=\"$MESHVPN_VGL_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}\" exec \"$@\"\n";
+    let write = || -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&bin)?;
+        std::fs::write(bin.join("vglrun"), script)?;
+        std::fs::set_permissions(bin.join("vglrun"), std::fs::Permissions::from_mode(0o755))
+    };
+    if let Err(e) = write() {
+        warn!("3D: writing vglrun: {e} - OpenGL on the CPU");
+        return vec![];
+    }
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+    info!("3D: the packed desktop's programs can't load VirtualGL: start OpenGL programs with `vglrun <program>`");
+    gpu.into_iter()
+        .filter(|(k, _)| k == "VGL_DISPLAY")
+        .chain([
+            (
+                "MESHVPN_VGL_PRELOAD".to_string(),
+                format!(
+                    "{}:{}",
+                    lib.join("libdlfaker.so").display(),
+                    lib.join("libvglfaker.so").display()
+                ),
+            ),
+            ("PATH".to_string(), format!("{}:{path}", bin.display())),
+        ])
+        .collect()
+}
+
+/// VirtualGL renders on NVIDIA's EGL (which needs no GLX in the session's X server; Mesa's does).
+fn nvidia_egl(gpu: &[(String, String)]) -> bool {
+    let Some((_, device)) = gpu.iter().find(|(k, _)| k == "VGL_DISPLAY") else {
+        return false;
+    };
+    if let Some(card) = device.strip_prefix("/dev/dri/") {
+        return std::fs::read_link(format!("/sys/class/drm/{card}/device/driver"))
+            .is_ok_and(|d| d.file_name().is_some_and(|f| f == "nvidia"));
+    }
+    // "egl" (the first EGL device): NVIDIA's where its device is ours to use.
+    device.starts_with("egl") && unsafe { libc::access(c"/dev/nvidia0".as_ptr(), libc::R_OK | libc::W_OK) } == 0
+}
+
 fn gl_on_gpu() -> Vec<(String, String)> {
     let want = std::env::var("MESHVPN_DESKTOP_GPU").unwrap_or_default();
     if want == "off" {
         return vec![];
     }
-    let Some(lib) = ["/usr/lib", "/usr/lib64", "/opt/VirtualGL/lib", "/opt/VirtualGL/lib64"]
-        .into_iter()
-        .map(Path::new)
-        .find(|d| d.join("libvglfaker.so").is_file() && d.join("libdlfaker.so").is_file())
-    else {
+    let Some(lib) = bundle::virtualgl_lib() else {
         return vec![];
     };
     let device = if !want.is_empty() {
@@ -871,6 +928,11 @@ fn gl_on_gpu() -> Vec<(String, String)> {
                 ok && unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) } == 0
             })
             .map(|p| p.display().to_string())
+            // No DRM device (containers get only /dev/nvidia*): NVIDIA's EGL device by itself.
+            .or_else(|| {
+                let c = c"/dev/nvidia0";
+                (unsafe { libc::access(c.as_ptr(), libc::R_OK | libc::W_OK) } == 0).then(|| "egl".to_string())
+            })
     };
     let Some(device) = device else {
         info!("3D: VirtualGL is installed, but no GPU here is this user's to use - OpenGL on the CPU");
