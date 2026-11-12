@@ -288,7 +288,10 @@ fn install_gpu_user() -> Result<()> {
     );
     let has =
         |c: &str| std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(c).is_file()));
+    #[cfg(unix)]
     let nvidia = unsafe { libc::access(c"/dev/nvidia0".as_ptr(), libc::R_OK | libc::W_OK) } == 0;
+    #[cfg(not(unix))]
+    let nvidia = false;
     if !nvidia
         && !["/usr/bin/Xvfb", "/usr/local/bin/Xvfb"]
             .iter()
