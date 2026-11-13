@@ -385,6 +385,8 @@ struct State {
     /// Hashes of the claims checked already (`accept_claim`).
     claims_seen: HashSet<[u8; 32]>,
     trusted_admins: Vec<NodeId>,
+    /// Open network: rosters of other nodes not confirmed here yet (signer -> roster).
+    pending_rosters: HashMap<NodeId, (SignedDoc, Roster, Instant)>,
     my_claim: Option<ClaimMsg>,
     /// Why another node turned us away (name of that node, reason), until we are admitted.
     rejected: Option<(String, String)>,
@@ -726,7 +728,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         st.join_slots = saved.join_slots.clone();
         st.my_claim = node.own_claim();
         if let Some(r) = saved.roster.clone() {
-            node.apply_roster(&mut st, r);
+            node.restore_roster(&mut st, r);
         }
         for c in saved.claims.clone() {
             if let Err(e) = node.accept_claim(&mut st, c) {
@@ -4252,6 +4254,13 @@ impl Node {
             },
             warnings: {
                 let mut w = range_conflicts(&self.dir, &self.cfg.interface);
+                for (_, r, _) in st.pending_rosters.values() {
+                    let n = st.records.get(&r.issuer).map_or_else(|| r.issuer.short(), |x| x.info.name.clone());
+                    w.push(format!(
+                        "{n} wants to make this network managed with itself as admin; if that's right: \
+                         sudo meshvpn admin trust {n}"
+                    ));
+                }
                 for (ip, owners) in &st.ip_conflicts {
                     let names: Vec<String> = owners
                         .iter()

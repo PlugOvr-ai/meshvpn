@@ -10,6 +10,23 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-11-13
+
+Open networks: no admin without confirmation; saved rosters kept across restarts.
+
+### Security
+- **No admin takeover in open networks:** in a network created with `init --open` (or before 0.7), any member could
+  run `admin enable` (or send a self-signed roster) and every node accepted it: that member became everyone's only
+  admin and could leave out nodes, which then dropped out. Needed: the network key. Now a first roster from another
+  node only applies once the owner of each machine confirms its signer with `sudo meshvpn admin trust <node>`;
+  until then the node stays open and `status` / `admin status` show who wants to be admin. Networks created managed
+  (the default since 0.7) were not affected: their invites name the admins.
+
+### Fixed
+- A restarted node could lose its saved roster and act as if the network were open: the node that created the network
+  after any `admin add`/`rm`, and other nodes once a roster was signed by an admin their invite didn't name. The saved
+  roster was checked against the first admins again; now it is restored as accepted before.
+
 ## [0.32.0] - 2026-11-12
 
 3D on the GPU in desktop sessions without root.

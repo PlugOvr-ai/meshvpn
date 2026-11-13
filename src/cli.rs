@@ -573,6 +573,9 @@ enum AdminCmd {
     /// Make an existing open network managed, with this node as its admin. Every node known
     /// now stays a member; new nodes then need an invite from an admin.
     Enable,
+    /// Open network: accept the admin another node set up with admin enable. Until then this
+    /// node stays open (no member can make itself everyone's admin on its own).
+    Trust { node: String },
     /// Make a node an admin.
     Add { node: String },
     /// Take admin rights away.
@@ -1072,6 +1075,10 @@ fn real_main(cli: Cli) -> Result<i32> {
                     require_owner()?;
                     control::Request::AdminEnable
                 }
+                AdminCmd::Trust { node } => {
+                    require_owner()?;
+                    control::Request::AdminTrust { who: node }
+                }
                 AdminCmd::Add { node } => {
                     require_owner()?;
                     control::Request::AdminChange { who: node, add: true }
@@ -1118,6 +1125,20 @@ fn real_main(cli: Cli) -> Result<i32> {
                         }
                     } else {
                         println!("open network: everybody with the network key may invite and ban.");
+                        for w in v["waiting"].as_array().into_iter().flatten() {
+                            let from = w["from"].as_str().unwrap_or("?");
+                            println!(
+                                "  {from} made it managed (admins: {}) - not accepted here yet: {}",
+                                w["admins"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|a| a.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                config::hint(&format!("sudo meshvpn admin trust {from}"))
+                            );
+                        }
                         println!(
                             "{}",
                             config::hint("make it managed (this node becomes admin): sudo meshvpn admin enable")

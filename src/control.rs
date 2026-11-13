@@ -95,6 +95,10 @@ pub enum Request {
         ttl_ms: u64,
     },
     AdminEnable,
+    /// Open network: accept a node as admin (its roster applies here).
+    AdminTrust {
+        who: String,
+    },
     AdminChange {
         who: String,
         add: bool,
@@ -448,6 +452,12 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
             }
         }
         Ok(Request::AdminEnable) => match node.admin_enable() {
+            Ok(text) => Response::Message { text },
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
+        Ok(Request::AdminTrust { who }) => match node.admin_trust(&who) {
             Ok(text) => Response::Message { text },
             Err(e) => Response::Error {
                 message: format!("{e:#}"),

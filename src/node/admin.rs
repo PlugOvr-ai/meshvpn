@@ -17,6 +17,8 @@ use super::*;
 
 /// A claim must reach its first member within this time of being made.
 const FRESH_MS: u64 = 3600 * 1000;
+/// Open network: unconfirmed rosters kept, one per signer.
+const MAX_PENDING_ROSTERS: usize = 16;
 
 pub(super) struct Admitted {
     pub msg: ClaimMsg,
@@ -99,7 +101,10 @@ impl Node {
         }
     }
 
-    /// Accepts a (newer) roster signed by an admin we already trust.
+    /// Accepts a (newer) roster signed by an admin we already trust. In an open network nobody
+    /// is trusted yet: a first roster from another node waits until the owner of this machine
+    /// confirms its signer (`meshvpn admin trust`), so no member can make itself the admin of
+    /// everyone on its own.
     pub(super) fn apply_roster(&self, st: &mut State, signed: SignedDoc) -> bool {
         let Ok(r) = signed.open::<Roster>(|r| r.issuer) else {
             return false;
@@ -114,10 +119,14 @@ impl Node {
                 }
                 cur.admins.contains(&r.issuer) && !st.banned.contains_key(&r.issuer)
             }
-            // First roster: the admins our invite named, or (networks that became managed
-            // later) a roster that names its own signer as admin.
-            None if !st.trusted_admins.is_empty() => st.trusted_admins.contains(&r.issuer),
-            None => r.version == 1 && r.admins.contains(&r.issuer),
+            // First roster: the admins our invite named (or confirmed with admin trust), or our
+            // own (admin enable here).
+            None if st.trusted_admins.contains(&r.issuer) => true,
+            None if r.issuer == self.ident.id => r.admins.contains(&r.issuer),
+            None => {
+                self.keep_pending_roster(st, &r, signed);
+                return false;
+            }
         };
         if !trusted {
             debug!(
@@ -133,7 +142,106 @@ impl Node {
             r.members.len()
         );
         st.roster = Some((signed, r));
+        st.pending_rosters.clear();
         true
+    }
+
+    /// A roster read back from our own saved state: we accepted it before (its signers may
+    /// have changed since, so the chain isn't checked again), only the signature is.
+    pub(super) fn restore_roster(&self, st: &mut State, signed: SignedDoc) {
+        if let Ok(r) = signed.open::<Roster>(|r| r.issuer)
+            && r.net == self.net
+            && !r.admins.is_empty()
+        {
+            st.roster = Some((signed, r));
+        }
+    }
+
+    /// An open network: a roster nobody here confirmed yet. Kept (newest per signer, signers
+    /// we know only) for `admin status` and `admin trust`, and passed on once per version.
+    fn keep_pending_roster(&self, st: &mut State, r: &Roster, signed: SignedDoc) {
+        if !st.records.contains_key(&r.issuer) {
+            return;
+        }
+        if let Some((_, have, _)) = st.pending_rosters.get(&r.issuer)
+            && have.version >= r.version
+        {
+            return;
+        }
+        if !st.pending_rosters.contains_key(&r.issuer) && st.pending_rosters.len() >= MAX_PENDING_ROSTERS {
+            return;
+        }
+        let forward = st
+            .pending_rosters
+            .get(&r.issuer)
+            .is_none_or(|(_, _, at)| at.elapsed() >= Duration::from_secs(10));
+        if !st.pending_rosters.contains_key(&r.issuer) {
+            let name = st.records.get(&r.issuer).map(|x| x.info.name.clone()).unwrap_or_default();
+            warn!(
+                "{name} wants to make this network managed (admins: {}); this node stays open until \
+                 you confirm it: sudo meshvpn admin trust {name}",
+                self.names(st, &r.admins).join(", ")
+            );
+        }
+        let frame_bytes = frame(T_ROSTER, &serde_json::to_vec(&signed).unwrap());
+        st.pending_rosters.insert(r.issuer, (signed, r.clone(), Instant::now()));
+        if forward {
+            self.broadcast(st, &frame_bytes, None);
+        }
+    }
+
+    fn names(&self, st: &State, ids: &[NodeId]) -> Vec<String> {
+        ids.iter()
+            .map(|id| {
+                if *id == self.ident.id {
+                    st.my_name.clone()
+                } else {
+                    st.records.get(id).map_or_else(|| id.short(), |r| r.info.name.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// `meshvpn admin trust <node>`: open network, the owner of this machine accepts that node
+    /// as admin. Its roster (if here already) applies now, a later one when it arrives.
+    pub fn admin_trust(&self, who: &str) -> Result<String> {
+        let mut st = self.state.lock().unwrap();
+        if Self::managed(&st) {
+            bail!("this network is managed already (see meshvpn admin status)");
+        }
+        let (id, name) = self.resolve_node(&st, who)?;
+        if !st.trusted_admins.contains(&id) {
+            st.trusted_admins.push(id);
+            let mut cfg = Config::load(&self.dir)?;
+            if !cfg.trusted_admins.contains(&id) {
+                cfg.trusted_admins.push(id);
+            }
+            cfg.save(&self.dir)?;
+        }
+        let mut pending: Vec<SignedDoc> = {
+            let mut v: Vec<(u32, SignedDoc)> =
+                st.pending_rosters.values().map(|(s, r, _)| (r.version, s.clone())).collect();
+            v.sort_by_key(|(v, _)| *v);
+            v.into_iter().map(|(_, s)| s).collect()
+        };
+        let mut applied = false;
+        for s in pending.drain(..) {
+            if self.apply_roster(&mut st, s.clone()) {
+                applied = true;
+                self.broadcast(&st, &frame(T_ROSTER, &serde_json::to_vec(&s).unwrap()), None);
+            }
+        }
+        if !applied {
+            return Ok(format!(
+                "{name} is trusted as admin here; this node becomes managed when its roster arrives \
+                 (sudo meshvpn admin enable on {name})"
+            ));
+        }
+        self.drop_unadmitted(&mut st);
+        let admins = st.roster.as_ref().map(|(_, r)| self.names(&st, &r.admins)).unwrap_or_default();
+        drop(st);
+        self.save_state();
+        Ok(format!("the network is managed here now, admins: {}", admins.join(", ")))
     }
 
     fn handle_roster(&self, from: NodeId, payload: &[u8]) {
@@ -417,8 +525,10 @@ impl Node {
         self.save_state();
         Ok(format!(
             "the network is now managed: {} is its admin, the {n} node(s) known now stay members. \
-             New nodes need an invite from an admin (meshvpn invite), and only admins can ban.",
-            self.cfg.name
+             New nodes need an invite from an admin (meshvpn invite), and only admins can ban.\n\
+             Each other node applies this once its owner confirms it there: sudo meshvpn admin trust {}\n\
+             (nodes older than 0.32.1 apply it right away)",
+            self.cfg.name, self.cfg.name
         ))
     }
 
@@ -504,6 +614,9 @@ impl Node {
             None => serde_json::json!({
                 "managed": false,
                 "note": "open network: everybody with the network key is a member and may invite and ban",
+                "waiting": st.pending_rosters.values().map(|(_, r, _)| serde_json::json!({
+                    "from": name(&r.issuer), "admins": r.admins.iter().map(name).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
             }),
             Some((_, r)) => serde_json::json!({
                 "managed": true,

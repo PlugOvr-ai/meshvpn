@@ -611,8 +611,9 @@ too. Rejected attempts show up as warnings in the admins' logs.
 
 Networks created before v0.7 (or with `init --open`) are **open**: everybody with the network key may invite and ban.
 Make one managed with `sudo meshvpn admin enable` on your main node. That node becomes the admin, every node known at
-that moment stays a member, and old invites stop working. Do it soon after updating: until then any member could run it
-first.
+that moment stays a member, and old invites stop working. Each other node applies this only once its owner confirms it
+there with `sudo meshvpn admin trust <main node>`; until then it stays open, and `meshvpn status` says that a node
+wants to be admin. So no member can make itself everyone's admin on its own. Nodes before 0.32.1 apply it without asking.
 
 ### Banning a node
 

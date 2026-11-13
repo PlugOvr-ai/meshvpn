@@ -493,6 +493,53 @@ def test_admin_invites(lab):
 
 
 @test
+def test_admin_trust(lab):
+    """Open network: admin enable on one node doesn't make it everyone's admin; each other node
+    applies it once its owner confirms (admin trust). A restarted node keeps a roster that
+    another admin changed since."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    hub.mv(f"init --open --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    a, b = lab.node("a", [net]), lab.node("b", [net])
+    for n in (a, b):
+        n.mv(f"join {invite(hub)} --name {n.name}")
+        n.up()
+        wait(lambda n=n: hub.online(n.name), f"{n.name} online")
+    wait(lambda: a.online("b"), "a sees b")
+    check(not hub.mvj("admin status")["managed"], "init --open should be open")
+    out = a.mv("admin enable")
+    check("admin trust a" in out, out)
+    wait(lambda: any("admin trust a" in w for w in hub.status().get("warnings") or []), "hub sees the waiting roster", 30)
+    check(not hub.mvj("admin status")["managed"] and not b.mvj("admin status")["managed"],
+          "a node made itself admin of the others without their confirmation")
+    check("admin trust a" in hub.mv("admin status"), "admin status names the waiting roster")
+    check("trusted as admin" in b.mv("admin trust hub"), "trusting a node without a roster yet")
+    check(not b.mvj("admin status")["managed"], "b managed without a's roster")
+    out = hub.mv("admin trust a")
+    check("managed here now" in out and "admins: a" in out, out)
+    b.mv("admin trust a")
+    wait(lambda: b.mvj("admin status")["managed"], "b managed after confirming", 20)
+    check(b.status()["admins"] == ["a"] and hub.online("b") and a.online("hub"), "all still in")
+    # Changes signed by another admin; b keeps the newest roster across a restart.
+    a.mv("admin add hub")
+    wait(lambda: hub.status()["is_admin"], "hub is an admin", 30)
+    hub.mv("admin add b")
+    wait(lambda: set(b.status()["admins"]) == {"a", "hub", "b"}, "b sees three admins", 30)
+    b.stop()
+    b.up()
+    wait(lambda: hub.online("b"), "b back", 60)
+    st = b.mvj("admin status")
+    check(st["managed"] and st["version"] == 3 and st["this_node_is_admin"], f"b after a restart: {st}")
+    # a has no trusted admins (it made the network managed, like the node that ran init).
+    a.stop()
+    a.up()
+    wait(lambda: hub.online("a"), "a back", 60)
+    st = a.mvj("admin status")
+    check(st["managed"] and st["version"] == 3, f"a after a restart: {st}")
+
+
+@test
 def test_leave(lab):
     """Leaving a network: the others forget the node; leaving the first network makes the next
     one the first; the last admin has to make another node admin first; status names the admins."""
