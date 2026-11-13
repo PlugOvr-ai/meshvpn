@@ -540,6 +540,53 @@ def test_admin_trust(lab):
 
 
 @test
+def test_dial_limits(lab):
+    """A record naming somebody else's addresses: the other nodes connect to a few of them, once
+    each (no handshake there: not dialed again for a long time), not to all of them again and
+    again while the node is offline."""
+    net = lab.network("net")
+    victim = lab.node("victim", [net], caps=False, install=False)
+    victim.sh("""cat > /tmp/v.py <<'PY'
+import socket, selectors, sys
+sel = selectors.DefaultSelector()
+for p in range(9001, 9011):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", p)); s.listen(64); sel.register(s, selectors.EVENT_READ, p)
+log = open("/tmp/hits", "a", buffering=1)
+while True:
+    for key, _ in sel.select():
+        c, a = key.fileobj.accept()
+        log.write(f"{a[0]} {key.data}\\n")
+        try: c.sendall(b"HTTP/1.0 400 nope\\r\\n\\r\\n")
+        except OSError: pass
+        c.close()
+PY
+nohup python3 /tmp/v.py >/dev/null 2>&1 &""")
+    vip = victim.sh("hostname -i").strip().split()[0]
+    hub = lab.node("hub", [net])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    a, b = lab.node("a", [net]), lab.node("b", [net])
+    eps = " ".join(f"--endpoint {vip}:{p}" for p in range(9001, 9011))
+    a.mv(f"join {invite(hub)} --name a {eps}")
+    b.mv(f"join {invite(hub)} --name b")
+    for n in (a, b):
+        n.up()
+        wait(lambda n=n: hub.online(n.name), f"{n.name} online")
+    wait(lambda: b.online("a"), "b sees a")
+    a.stop()
+    time.sleep(80)
+    hits = victim.sh("cat /tmp/hits 2>/dev/null; true").split("\n")
+    hits = [h for h in hits if h.strip()]
+    per = {}
+    for h in hits:
+        per[h] = per.get(h, 0) + 1
+    check(hits, "the nodes should still try a's addresses")
+    check(len(hits) <= 16, f"{len(hits)} connections to the addresses in a's record: {sorted(per.items())}")
+    check(all(v == 1 for v in per.values()), f"an address dialed again after it answered without a handshake: {per}")
+
+
+@test
 def test_leave(lab):
     """Leaving a network: the others forget the node; leaving the first network makes the next
     one the first; the last admin has to make another node admin first; status names the admins."""

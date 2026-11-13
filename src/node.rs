@@ -60,6 +60,15 @@ pub const MAX_MEASURE_NODES: usize = 16;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// Addresses of one node's record dialed at most (records may name up to 32): a member can't
+/// make every node connect to a long list of somebody else's addresses.
+const DIAL_PER_NODE: usize = 8;
+/// An address from a record that answered but isn't one of our nodes (no handshake with the
+/// network key): not dialed again for this long, whichever records name it.
+const NOT_A_NODE_BACKOFF: Duration = Duration::from_secs(1800);
+const NOT_A_NODE: &str = "not a node of this network";
+/// Addresses with a backoff remembered at most.
+const MAX_ADDR_BACKOFF: usize = 4096;
 /// Forget nodes we have not heard of for a week.
 const FORGET_AFTER_MS: u64 = 7 * 24 * 3600 * 1000;
 /// Gossip messages stay well below the 64 KB link frame limit.
@@ -267,6 +276,10 @@ struct State {
     observed_ips: Vec<IpAddr>,
     backoff: HashMap<String, Backoff>,
     dialing: HashSet<String>,
+    /// Record addresses: their own backoff (shared by all records naming them), and those
+    /// being dialed now.
+    addr_backoff: HashMap<String, Backoff>,
+    dialing_addrs: HashSet<String>,
     bootstrap_ids: HashMap<String, NodeId>,
     extra_bootstrap: Vec<String>,
     my_seq: u64,
@@ -2385,6 +2398,8 @@ impl Node {
                 Some(key) => {
                     st.keys.insert(r.version, key);
                     st.key_version = r.version;
+                    // Handshakes that failed with the old key may work now.
+                    st.addr_backoff.clear();
                     info!("network key changed to version {} (after a ban)", r.version);
                 }
                 None => {
@@ -2511,6 +2526,7 @@ impl Node {
         let signed = SignedRotation::sign(&rotation, &self.ident);
         st.keys.insert(version, new_key);
         st.key_version = version;
+        st.addr_backoff.clear();
         st.rotation = Some((signed.clone(), rotation));
         self.save_keys(&st);
         self.rebuild(&mut st);
@@ -3295,9 +3311,11 @@ impl Node {
                 None => {
                     // Never run a link through the mesh itself: a name like `hub` may resolve to
                     // a mesh address via the /etc/hosts entries meshvpn maintains.
+                    // A name may stand for many addresses: a few are enough.
                     let targets: Vec<SocketAddr> = tokio::net::lookup_host(addr)
                         .await?
                         .filter(|a| !is_overlay(a.ip()))
+                        .take(4)
                         .collect();
                     if targets.is_empty() {
                         bail!("{addr} only resolves to mesh addresses");
@@ -3331,12 +3349,16 @@ impl Node {
             let st = self.state.lock().unwrap();
             (st.key_version, st.keys.clone())
         };
-        let (transport, remote_static, version) = timeout(
+        let (transport, remote_static, version) = match timeout(
             HANDSHAKE_TIMEOUT,
             link::handshake(&mut stream, initiator, &self.ident.noise_secret, my_version, &keys),
         )
         .await
-        .map_err(|_| anyhow!("handshake timed out"))??;
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e.context(NOT_A_NODE)),
+            Err(_) => bail!("{NOT_A_NODE}: handshake timed out"),
+        };
         let cipher = Cipher::new(transport);
         let (r, w) = stream.into_split();
         let mut reader = LinkReader::new(r, cipher.clone());
@@ -3729,16 +3751,25 @@ impl Node {
             // Addresses found through the rendezvous first: they are newer than the record.
             let hinted = st.dht_hints.get(id).map(|(e, _)| e.as_slice()).unwrap_or_default();
             // A node's word for where it listens: never this machine itself or the link-local
-            // range (cloud metadata services), which would make every node connect there.
+            // range (cloud metadata services), which would make every node connect there. A few
+            // only, each with its own backoff, so a record naming other people's addresses costs
+            // them a connection now and then, not one per node and minute.
             let mut eps: Vec<String> = vec![];
             for e in hinted.iter().chain(&rec.info.endpoints) {
+                if eps.len() >= DIAL_PER_NODE {
+                    break;
+                }
                 if dialable(e) && !eps.contains(e) {
                     eps.push(e.clone());
                 }
             }
+            eps.retain(|e| !st.dialing_addrs.contains(e) && st.addr_backoff.get(e).is_none_or(|b| b.next <= now));
             if !eps.is_empty() {
                 out.push((key, eps, None));
             }
+        }
+        if st.addr_backoff.len() > MAX_ADDR_BACKOFF {
+            st.addr_backoff.retain(|_, b| b.next > now);
         }
         let boots: Vec<String> = self.cfg.bootstrap.iter().chain(&st.extra_bootstrap).cloned().collect();
         let known: HashSet<&String> = st.records.values().flat_map(|r| &r.info.endpoints).collect();
@@ -3757,10 +3788,27 @@ impl Node {
                 out.push((key, vec![addr.clone()], Some(addr)));
             }
         }
-        for (key, _, _) in &out {
+        for (key, addrs, boot) in &out {
             st.dialing.insert(key.clone());
+            if boot.is_none() {
+                st.dialing_addrs.extend(addrs.iter().cloned());
+            }
         }
         out
+    }
+
+    /// A record address failed: its own backoff (long when it answered without being a node).
+    fn addr_failed(st: &mut State, addr: &str, e: &anyhow::Error) {
+        let not_ours = e.chain().any(|c| c.to_string().starts_with(NOT_A_NODE));
+        let b = st.addr_backoff.entry(addr.to_string()).or_insert(Backoff {
+            next: Instant::now(),
+            delay: Duration::from_secs(5),
+        });
+        if not_ours {
+            b.delay = NOT_A_NODE_BACKOFF;
+        }
+        b.next = Instant::now() + b.delay;
+        b.delay = (b.delay * 2).min(if not_ours { NOT_A_NODE_BACKOFF } else { MAX_BACKOFF });
     }
 
     async fn dial(self: Arc<Self>, key: String, addrs: Vec<String>, bootstrap: Option<String>) {
@@ -3776,6 +3824,10 @@ impl Node {
                         let mut st = self.state.lock().unwrap();
                         st.dialing.remove(&key);
                         st.backoff.remove(&key);
+                        for a in &addrs {
+                            st.dialing_addrs.remove(a);
+                        }
+                        st.addr_backoff.remove(addr);
                         if let Some(b) = &bootstrap {
                             st.bootstrap_ids.insert(b.clone(), est.peer);
                         }
@@ -3791,12 +3843,18 @@ impl Node {
                         st.bootstrap_ids.insert(b.clone(), self.ident.id);
                     }
                     debug!("dial {addr}: {e:#}");
+                    if bootstrap.is_none() {
+                        Self::addr_failed(&mut self.state.lock().unwrap(), addr, &e);
+                    }
                     last_err = Some(e);
                 }
             }
         }
         let mut st = self.state.lock().unwrap();
         st.dialing.remove(&key);
+        for a in &addrs {
+            st.dialing_addrs.remove(a);
+        }
         let b = st.backoff.entry(key.clone()).or_insert(Backoff {
             next: Instant::now(),
             delay: Duration::from_secs(5),

@@ -10,6 +10,18 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.32.2] - 2026-11-13
+
+Records can no longer make every node connect to other people's addresses.
+
+### Security
+- **Records can't make the network flood other people's addresses:** every node dialed every address a record named
+  (up to 32), again and again while that node was offline, for up to a week. A member could list somebody else's
+  server and the whole network kept connecting to it (here 4 connections per address and node within 90 s). Needed:
+  membership. Now a node dials at most 8 addresses per record, each with its own backoff shared by all records that
+  name it, and an address that answers without a meshvpn handshake isn't dialed again for 30 minutes. A host name
+  counts with at most 4 of its addresses.
+
 ## [0.32.1] - 2026-11-13
 
 Open networks: no admin without confirmation; saved rosters kept across restarts.
