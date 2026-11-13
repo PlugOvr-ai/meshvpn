@@ -1147,6 +1147,16 @@ def test_exec_cp(lab):
     ctl.mv("cp tag:gpu:/home/agent/runs/proj/host.txt ./out", user="agent")
     for g in ("g1", "g2"):
         check(ctl.sh(f"cat out/{g}/host.txt", user="agent").strip() == g, f"download from {g}")
+    # On a terminal: a progress bar and a summary on stderr; without one (above) none.
+    ctl.sh("head -c 60000000 /dev/urandom > big.bin", user="agent")
+    out = ctl.sh("script -qec 'meshvpn cp ./big.bin tag:gpu:/home/agent/big/' /dev/null", user="agent")
+    check("to 2 nodes: 120.0 MB in" in out and "copied on 2/2" in out, f"progress on a terminal: {out[-600:]!r}")
+    out = ctl.sh("script -qec 'meshvpn cp g1:/home/agent/big/big.bin ./back' /dev/null", user="agent")
+    check("from g1: 60.0 MB in" in out, f"download progress: {out[-600:]!r}")
+    sums = ctl.sh("sha256sum < back/big.bin; sha256sum < big.bin", user="agent").split("\n")
+    check(sums[0] == sums[1], "download with progress corrupted")
+    p = ctl.mv("cp ./big.bin g2:/home/agent/big2/", user="agent", ok=False)
+    check(p.returncode == 0 and "\r" not in p.stderr and "MB in" not in p.stderr, f"progress without a terminal: {p.stderr!r}")
 
 
 @test

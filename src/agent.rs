@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::control::{self, Request, Response};
@@ -511,6 +513,167 @@ pub fn exec(targets: &[NodeView], remote: &Remote, command: &[String]) -> Vec<Ru
     })
 }
 
+const SIZE_MARK: &str = "meshvpn-size";
+
+/// About what `tar -cf` makes of a path: a 512-byte header per entry, contents padded to 512.
+fn tar_size(p: &Path) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
+    let mut n = 512;
+    if m.is_file() {
+        n += m.len().div_ceil(512) * 512;
+    } else if m.is_dir()
+        && let Ok(rd) = std::fs::read_dir(p)
+    {
+        n += rd.flatten().map(|e| tar_size(&e.path())).sum::<u64>();
+    }
+    n
+}
+
+/// A progress bar on stderr for `meshvpn cp`: bytes through all transfers against the expected
+/// total, the rate over the last seconds and the time left.
+pub struct Progress {
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Progress {
+    /// Only on a terminal.
+    pub fn start(label: String) -> Option<Progress> {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let done = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (d, t, s) = (done.clone(), total.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut samples: std::collections::VecDeque<(Instant, u64)> = [(started, 0)].into();
+            while !s.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                let now = Instant::now();
+                let done = d.load(Ordering::Relaxed);
+                samples.push_back((now, done));
+                while samples.len() > 2 && now - samples[0].0 > Duration::from_secs(3) {
+                    samples.pop_front();
+                }
+                let (t0, b0) = samples[0];
+                let secs = (now - t0).as_secs_f64();
+                let rate = if secs > 0.1 { (done - b0) as f64 / secs } else { 0.0 };
+                let line = progress_line(&label, done, t.load(Ordering::Relaxed), rate, started.elapsed());
+                eprint!("\r\x1b[K{line}");
+            }
+            let done = d.load(Ordering::Relaxed);
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            eprintln!(
+                "\r\x1b[K{label}: {} in {} ({}/s)",
+                human_bytes(done as f64),
+                clock(secs.round() as u64),
+                human_bytes(done as f64 / secs)
+            );
+        });
+        Some(Progress {
+            done,
+            total,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn add_total(&self, n: u64) {
+        self.total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn count<R: Read>(&self, inner: R) -> Counting<R> {
+        Counting {
+            inner,
+            n: self.done.clone(),
+        }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+struct Counting<R> {
+    inner: R,
+    n: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let k = self.inner.read(buf)?;
+        self.n.fetch_add(k as u64, Ordering::Relaxed);
+        Ok(k)
+    }
+}
+
+fn human_bytes(b: f64) -> String {
+    let units = ["B", "kB", "MB", "GB", "TB"];
+    let mut v = b;
+    let mut i = 0;
+    while v >= 1000.0 && i < units.len() - 1 {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0} B")
+    } else {
+        format!("{v:.1} {}", units[i])
+    }
+}
+
+fn clock(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+/// `label [#####-----]  45%  120.0 MB / 260.0 MB  35.2 MB/s  0:04 left`; without a known total
+/// only the bytes, the rate and the time so far.
+fn progress_line(label: &str, done: u64, total: u64, rate: f64, elapsed: Duration) -> String {
+    const W: usize = 24;
+    if total == 0 {
+        return format!(
+            "{label}  {}  {}/s  {}",
+            human_bytes(done as f64),
+            human_bytes(rate),
+            clock(elapsed.as_secs())
+        );
+    }
+    // Estimates (du, tar headers) may be a bit off: never past 99% before the end.
+    let total = total.max(done);
+    let frac = (done as f64 / total as f64).min(0.99);
+    let fill = (frac * W as f64).round() as usize;
+    let left = if rate > 0.0 {
+        format!("{} left", clock(((total - done) as f64 / rate) as u64))
+    } else {
+        "-:-- left".into()
+    };
+    format!(
+        "{label} [{}{}] {:>3}%  {} / {}  {}/s  {left}",
+        "#".repeat(fill),
+        "-".repeat(W - fill),
+        (frac * 100.0) as u32,
+        human_bytes(done as f64),
+        human_bytes(total as f64),
+        human_bytes(rate)
+    )
+}
+
 /// `meshvpn cp`: where a path lives.
 pub enum Place {
     Local(String),
@@ -554,11 +717,20 @@ fn split_path(p: &str) -> (String, String) {
 
 /// Copies local `sources` into directory `dest` on every target (tar over ssh, so
 /// directories, permissions and many small files work well).
-pub fn upload(targets: &[NodeView], remote: &Remote, sources: &[String], dest: &str) -> Result<Vec<RunResult>> {
+pub fn upload(
+    targets: &[NodeView],
+    remote: &Remote,
+    sources: &[String],
+    dest: &str,
+    progress: Option<&Progress>,
+) -> Result<Vec<RunResult>> {
     for s in sources {
         if !Path::new(s).exists() {
             bail!("{s}: no such file or directory");
         }
+    }
+    if let Some(p) = progress {
+        p.add_total(sources.iter().map(|s| tar_size(Path::new(s))).sum::<u64>() * targets.len() as u64);
     }
     let script = format!("mkdir -p {d} && tar -C {d} -xf -", d = sh_quote(dest));
     Ok(parallel(targets, |n| {
@@ -571,7 +743,11 @@ pub fn upload(targets: &[NodeView], remote: &Remote, sources: &[String], dest: &
         let child = tar.stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
         match child {
             Ok(mut tar) => {
-                let input = Box::new(tar.stdout.take().unwrap());
+                let out = tar.stdout.take().unwrap();
+                let input: Box<dyn Read + Send> = match progress {
+                    Some(p) => Box::new(p.count(out)),
+                    None => Box::new(out),
+                };
                 let r = run_one(&n.name, remote.command(n, &script), Some(input), remote.timeout);
                 let _ = tar.wait();
                 r
@@ -590,9 +766,20 @@ pub fn upload(targets: &[NodeView], remote: &Remote, sources: &[String], dest: &
 
 /// Copies `source` from every target into local directory `dest` (into `dest/<node>/` when
 /// there are several targets).
-pub fn download(targets: &[NodeView], remote: &Remote, source: &str, dest: &str) -> Result<Vec<RunResult>> {
+pub fn download(
+    targets: &[NodeView],
+    remote: &Remote,
+    source: &str,
+    dest: &str,
+    progress: Option<&Progress>,
+) -> Result<Vec<RunResult>> {
     let (parent, name) = split_path(source);
-    let script = format!("tar -C {} -cf - {}", sh_quote(&parent), sh_quote(&name));
+    // The size first (on stderr, for the progress bar; du -k works on Linux and macOS).
+    let script = format!(
+        "printf '{SIZE_MARK} %s\\n' \"$(cd {p} 2>/dev/null && du -sk {n} 2>/dev/null | cut -f1)\" >&2; tar -C {p} -cf - {n}",
+        p = sh_quote(&parent),
+        n = sh_quote(&name)
+    );
     let several = targets.len() > 1;
     Ok(parallel(targets, |n| {
         let dir = if several {
@@ -617,14 +804,30 @@ pub fn download(targets: &[NodeView], remote: &Remote, source: &str, dest: &str)
             let mut child = fetch.spawn()?;
             let out = child.stdout.take().ok_or_else(|| anyhow!("no output"))?;
             let err = child.stderr.take();
+            let total = progress.map(|p| p.total.clone());
             let remote_err = std::thread::spawn(move || {
                 let mut s = String::new();
-                if let Some(mut e) = err {
+                if let Some(e) = err {
+                    let mut e = std::io::BufReader::new(e);
+                    let mut first = String::new();
+                    let _ = std::io::BufRead::read_line(&mut e, &mut first);
+                    match first.strip_prefix(SIZE_MARK) {
+                        Some(kb) => {
+                            if let (Some(t), Ok(kb)) = (&total, kb.trim().parse::<u64>()) {
+                                t.fetch_add(kb * 1024, Ordering::Relaxed);
+                            }
+                        }
+                        None => s = first,
+                    }
                     let _ = e.by_ref().take(MAX_OUTPUT as u64).read_to_string(&mut s);
                     let _ = std::io::copy(&mut e, &mut std::io::sink());
                 }
                 s
             });
+            let out: Box<dyn Read + Send> = match progress {
+                Some(p) => Box::new(p.count(out)),
+                None => Box::new(out),
+            };
             // Unpacked here rather than by the system tar: nothing outside `dir`, and no owners or
             // setuid bits from the other node, also when this runs as root.
             let mut archive = tar::Archive::new(out);
@@ -933,5 +1136,42 @@ mod age_tests {
         assert_eq!(super::age(7200), "2h");
         assert_eq!(super::age(164_493), "1d");
         assert_eq!(super::age(1_000_000), "11d");
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_lines() {
+        let l = progress_line(
+            "to 2 nodes",
+            50_000_000,
+            100_000_000,
+            10_000_000.0,
+            Duration::from_secs(5),
+        );
+        assert!(l.contains("[############------------]  50%"), "{l}");
+        assert!(
+            l.contains("50.0 MB / 100.0 MB") && l.contains("10.0 MB/s") && l.contains("0:05 left"),
+            "{l}"
+        );
+        // past the estimate: 99% until the end
+        let l = progress_line("x", 120, 100, 0.0, Duration::ZERO);
+        assert!(l.contains(" 99%") && l.contains("-:-- left"), "{l}");
+        let l = progress_line("x", 2048, 0, 1024.0, Duration::from_secs(65));
+        assert!(l.contains("2.0 kB") && l.contains("1:05"), "{l}");
+    }
+
+    #[test]
+    fn tar_size_counts_headers_and_padding() {
+        let d = std::env::temp_dir().join(format!("meshvpn-tarsize-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("a"), vec![0u8; 1000]).unwrap();
+        std::fs::write(d.join("sub/b"), b"x").unwrap();
+        // dir + sub + a (512 + 1024) + b (512 + 512)
+        assert_eq!(tar_size(&d), 512 + 512 + 1536 + 1024);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

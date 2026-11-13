@@ -1696,14 +1696,24 @@ fn real_main(cli: Cli) -> Result<i32> {
                             agent::Place::Remote(..) => bail!("copy either to nodes or from nodes, not between them"),
                         }
                     }
-                    agent::upload(&pick(&sel)?, &remote, &sources, &dir_there)?
+                    let targets = pick(&sel)?;
+                    let bar = (!json)
+                        .then(|| agent::Progress::start(cp_label("to", &targets)))
+                        .flatten();
+                    agent::upload(&targets, &remote, &sources, &dir_there, bar.as_ref())?
                 }
                 agent::Place::Local(local) => {
                     if paths.len() != 1 {
                         bail!("download one remote path at a time");
                     }
                     match agent::parse_place(&paths[0]) {
-                        agent::Place::Remote(sel, src) => agent::download(&pick(&sel)?, &remote, &src, &local)?,
+                        agent::Place::Remote(sel, src) => {
+                            let targets = pick(&sel)?;
+                            let bar = (!json)
+                                .then(|| agent::Progress::start(cp_label("from", &targets)))
+                                .flatten();
+                            agent::download(&targets, &remote, &src, &local, bar.as_ref())?
+                        }
                         agent::Place::Local(_) => bail!("both paths are local - use cp"),
                     }
                 }
@@ -4214,6 +4224,14 @@ fn uninstall_user(dir: &Path) -> Result<()> {
         dir.display()
     );
     Ok(())
+}
+
+/// `meshvpn cp`'s progress label: "to gpu1", "from 3 nodes".
+fn cp_label(dir: &str, targets: &[agent::NodeView]) -> String {
+    match targets {
+        [one] => format!("{dir} {}", one.name),
+        _ => format!("{dir} {} nodes", targets.len()),
+    }
 }
 
 #[cfg(test)]

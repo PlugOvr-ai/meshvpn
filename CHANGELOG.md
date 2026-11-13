@@ -10,6 +10,16 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-11-13
+
+A progress bar for meshvpn cp.
+
+### Added
+- **Progress bar for `meshvpn cp`:** on a terminal, `cp` shows how much of the copy is done, the rate and the time
+  left, over all nodes at once (`to 2 nodes [########--------]  45%  54.0 MB / 120.0 MB  35.2 MB/s  0:02 left`),
+  then a summary line. Uploads estimate the size from the files, downloads ask the other node first. Without a
+  terminal, with `--json` and through MCP, nothing changes.
+
 ## [0.32.2] - 2026-11-13
 
 Records can no longer make every node connect to other people's addresses.

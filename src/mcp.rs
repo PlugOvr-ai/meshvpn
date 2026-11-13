@@ -242,6 +242,7 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
                 &remote(&st, args, 3600),
                 &strings(args, "sources"),
                 text(args, "dest_dir")?,
+                None,
             )?;
             Ok(agent::results_json(&results))
         }
@@ -252,6 +253,7 @@ fn call(dir: &Path, name: &str, args: &Value) -> Result<Value> {
                 &remote(&st, args, 3600),
                 text(args, "source")?,
                 text(args, "dest_dir")?,
+                None,
             )?;
             Ok(agent::results_json(&results))
         }
