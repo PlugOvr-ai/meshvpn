@@ -4255,7 +4255,10 @@ impl Node {
             warnings: {
                 let mut w = range_conflicts(&self.dir, &self.cfg.interface);
                 for (_, r, _) in st.pending_rosters.values() {
-                    let n = st.records.get(&r.issuer).map_or_else(|| r.issuer.short(), |x| x.info.name.clone());
+                    let n = st
+                        .records
+                        .get(&r.issuer)
+                        .map_or_else(|| r.issuer.short(), |x| x.info.name.clone());
                     w.push(format!(
                         "{n} wants to make this network managed with itself as admin; if that's right: \
                          sudo meshvpn admin trust {n}"

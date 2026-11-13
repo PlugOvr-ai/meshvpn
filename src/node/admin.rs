@@ -176,7 +176,11 @@ impl Node {
             .get(&r.issuer)
             .is_none_or(|(_, _, at)| at.elapsed() >= Duration::from_secs(10));
         if !st.pending_rosters.contains_key(&r.issuer) {
-            let name = st.records.get(&r.issuer).map(|x| x.info.name.clone()).unwrap_or_default();
+            let name = st
+                .records
+                .get(&r.issuer)
+                .map(|x| x.info.name.clone())
+                .unwrap_or_default();
             warn!(
                 "{name} wants to make this network managed (admins: {}); this node stays open until \
                  you confirm it: sudo meshvpn admin trust {name}",
@@ -219,8 +223,11 @@ impl Node {
             cfg.save(&self.dir)?;
         }
         let mut pending: Vec<SignedDoc> = {
-            let mut v: Vec<(u32, SignedDoc)> =
-                st.pending_rosters.values().map(|(s, r, _)| (r.version, s.clone())).collect();
+            let mut v: Vec<(u32, SignedDoc)> = st
+                .pending_rosters
+                .values()
+                .map(|(s, r, _)| (r.version, s.clone()))
+                .collect();
             v.sort_by_key(|(v, _)| *v);
             v.into_iter().map(|(_, s)| s).collect()
         };
@@ -238,10 +245,17 @@ impl Node {
             ));
         }
         self.drop_unadmitted(&mut st);
-        let admins = st.roster.as_ref().map(|(_, r)| self.names(&st, &r.admins)).unwrap_or_default();
+        let admins = st
+            .roster
+            .as_ref()
+            .map(|(_, r)| self.names(&st, &r.admins))
+            .unwrap_or_default();
         drop(st);
         self.save_state();
-        Ok(format!("the network is managed here now, admins: {}", admins.join(", ")))
+        Ok(format!(
+            "the network is managed here now, admins: {}",
+            admins.join(", ")
+        ))
     }
 
     fn handle_roster(&self, from: NodeId, payload: &[u8]) {
