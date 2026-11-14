@@ -124,6 +124,7 @@ impl Identity {
         self.shared_key(peer_noise_pub, "meshvpn e2e packet key v2", network_id.as_bytes())
     }
 
+    #[cfg(target_os = "linux")]
     /// Key of a share connection with `peer` (kernel TLS on a LAN path), bound to `context`.
     pub fn share_key(&self, peer_noise_pub: &Key32, context: &[u8]) -> [u8; 32] {
         self.shared_key(peer_noise_pub, "meshvpn share tls v1", context)

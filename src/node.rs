@@ -5284,6 +5284,7 @@ impl Node {
         )
     }
 
+    #[cfg(target_os = "linux")]
     /// The key of a share connection with `peer`: of both nodes' own keys (X25519), so only
     /// the two know it, and bound to `context`. None: no record of `peer`.
     pub fn share_link_key(&self, peer: &NodeId, context: &[u8]) -> Option<[u8; 32]> {
