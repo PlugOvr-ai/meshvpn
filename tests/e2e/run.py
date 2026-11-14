@@ -145,7 +145,8 @@ class Lab:
         self.networks.append(full)
         return full
 
-    def node(self, name, networks, caps=True, sysctls=(), ip=None, install=True, net_admin=False, cmd=None, image=IMAGE):
+    def node(self, name, networks, caps=True, sysctls=(), ip=None, install=True, net_admin=False, cmd=None, image=IMAGE,
+             extra=()):
         c = f"{self.prefix}-{name}"
         args = ["docker", "run", "-d", "--name", c, "--hostname", name, "--network", networks[0]]
         if ip:
@@ -156,7 +157,7 @@ class Lab:
             args += ["--cap-add", "NET_ADMIN"]
         for s in sysctls:
             args += ["--sysctl", s]
-        run(args + [image] + (cmd or []))
+        run(args + list(extra) + [image] + (cmd or []))
         self.containers.append(c)
         for n in networks[1:]:
             run(["docker", "network", "connect", n, c])
@@ -177,10 +178,10 @@ def invite(admin, args=""):
     return admin.mvj(f"invite {args}")["invite"]
 
 
-def mesh(lab, names, net=None, tags=None, join_args="", admin_args="", env=""):
+def mesh(lab, names, net=None, tags=None, join_args="", admin_args="", env="", extra=()):
     """A managed network: the first name is the admin (endpoint = its container name)."""
     net = net or lab.network("net")
-    nodes = [lab.node(n, [net]) for n in names]
+    nodes = [lab.node(n, [net], extra=extra) for n in names]
     hub = nodes[0]
     hub.mv(f"init --name {hub.name} --endpoint {hub.c}:7870 {admin_args}")
     hub.up(env)
@@ -191,6 +192,29 @@ def mesh(lab, names, net=None, tags=None, join_args="", admin_args="", env=""):
     for n in nodes[1:]:
         wait(lambda n=n: hub.online(n.name), f"{n.name} online at {hub.name}")
     return net, nodes
+
+
+# What a container needs to mount FUSE file systems (sshfs, the datasets).
+FUSE = ["--device", "/dev/fuse", "--cap-add", "SYS_ADMIN", "--security-opt", "apparmor:unconfined"]
+
+
+def storage_cluster(lab, names, export=None, rate=None, node_extra=()):
+    """Network storage - a container serving /export over SSH (`export`: a host directory mounted
+    there read-only), its link limited to `rate` (e.g. 1gbit) - and a managed mesh of `names`,
+    each with the storage at /mnt/storage (sshfs)."""
+    net = lab.network("net")
+    storage = lab.node("storage", [net], caps=False, install=False,
+                       extra=["--cap-add", "NET_ADMIN"] + (["-v", f"{export}:/export:ro"] if export else []))
+    if rate:
+        storage.sh(f"tc qdisc add dev eth0 root netem delay 1ms rate {rate}")
+    key = storage.sh("mkdir -p /root/.ssh /export && chmod 700 /root/.ssh && ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/sim "
+                     "&& cat /root/.ssh/sim.pub >> /root/.ssh/authorized_keys && cat /root/.ssh/sim")
+    _, nodes = mesh(lab, names, net=net, extra=FUSE + list(node_extra))
+    for n in nodes:
+        n.sh("mkdir -p /root/.ssh /mnt/storage && umask 077 && cat > /root/.ssh/sim", input=key)
+        n.sh(f"sshfs root@{storage.c}:/export /mnt/storage -o ro,allow_other,IdentityFile=/root/.ssh/sim,"
+             "StrictHostKeyChecking=no,max_conns=4")
+    return net, storage, nodes
 
 
 def tab(node, line, user=None, mv="meshvpn"):
@@ -551,6 +575,144 @@ def test_admin_changes(lab):
     # c is a new node now; the one it was counts as online for a moment longer.
     wait(lambda: "another list" not in str(hub.status()["warnings"]) and "another list" not in str(c.status()["warnings"]),
          "no warning any more", 150)
+
+
+@test
+def test_volume(lab):
+    """A volume on three nodes, filled from network storage, read at /volumes/NAME on each: the
+    same bytes - while copying, from the other nodes, with a node gone, after a restart; files
+    copied in and out from a node outside the group, by a user with SSH access to the nodes
+    only, owned by its account there, with their own permissions; removed; read-only."""
+    _, storage, (a, b, c, pc) = storage_cluster(lab, ["a", "b", "c", "pc"])
+    storage.sh("mkdir -p /export/ds/sub && cd /export/ds && for i in $(seq 1 300); do "
+               "head -c $((i * 1000)) /dev/urandom > sub/f$i.bin; done && head -c 50000000 /dev/urandom > big.bin "
+               "&& ln -s big.bin link && chmod 600 sub/f1.bin")
+    total = 50_000_000 + sum(i * 1000 for i in range(1, 301))
+    want = storage.sh("cd /export/ds && find . -type f | sort | xargs sha256sum")
+    # Users: agent on pc may log in to a, b and c as agent; carol on pc may not.
+    pc.sh("useradd -m carol")
+    for u in ("agent", "carol"):
+        pc.sh("ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519", user=u)
+    for n in (a, b, c):
+        n.mv("ssh allow agent@pc --as agent")
+    a.sh("useradd -m bob")
+    p = b.mv("volume create ds --nodes a,b,c --from /mnt/storage/ds", ok=False)
+    check(p.returncode != 0, "a member made a volume")
+    p = a.mv("volume create local --nodes a,b,c --from /root", ok=False)
+    check(p.returncode != 0 and "network file system" in p.stderr, f"a local directory as source: {p.stderr}")
+    out = a.mv("volume create ds --nodes a,b,c --from /mnt/storage/ds")
+    check("/volumes/ds" in out, out)
+
+    def sums(n, d="/volumes/ds"):
+        return n.sh(f"cd {d} && find . -type f | sort | xargs sha256sum", timeout=300)
+
+    def here(n, name="ds"):
+        for d in n.mvj("volume list")["volumes"]:
+            if d["name"] == name:
+                return d["here"]
+        return None
+
+    for n in (a, b, c):
+        wait(lambda n=n: n.sh("test -f /volumes/ds/big.bin && echo y", ok=False).stdout.strip() == "y",
+             f"{n.name}: /volumes/ds", 60)
+    check(pc.sh("test -e /volumes/ds && echo y || echo n").strip() == "n", "mounted outside the group")
+    check(sums(b) == want, "b reads other bytes while copying")
+    for n in (a, b, c):
+        wait(lambda n=n: (here(n) or {}).get("staged"), f"{n.name} copied its share", 120)
+    shares = [here(n)["owned_bytes"] for n in (a, b, c)]
+    check(sum(shares) == total and min(shares) > 0, f"shares {shares} of {total}")
+    check(sums(c) == want, "c reads other bytes")
+    check(here(c)["read_remote_bytes"] > 0, f"c read nothing from the others: {here(c)}")
+    # The storage's owners and modes: a user reads what the storage would let it.
+    check(a.sh("wc -c < /volumes/ds/sub/f7.bin", user="agent").strip() == "7000", "a user can't read it")
+    check(a.sh("cat /volumes/ds/sub/f1.bin > /dev/null", user="agent", ok=False).returncode != 0,
+          "a user reads root's private file")
+    check(a.sh("touch /volumes/ds/x", ok=False).returncode != 0, "the volume is writable through the mount")
+    # Copied in from a node outside the group, by agent, two copies: on every node at once.
+    pc.sh("mkdir -p up/run1 && head -c 9000000 /dev/urandom > up/run1/ckpt.bin && chmod 600 up/run1/ckpt.bin "
+          "&& echo hi > up/run1/log.txt", user="agent")
+    # (pc publishes agent's key within half a minute)
+    wait(lambda: pc.sh("meshvpn volume cp up/run1 ds:results", user="agent", ok=False).returncode == 0,
+         "agent copies in", 90)
+    up = pc.sh("cd up && sha256sum run1/ckpt.bin run1/log.txt", user="agent")
+    for n in (a, b, c):
+        wait(lambda n=n: n.sh("test -f /volumes/ds/results/run1/log.txt && echo y", ok=False).stdout.strip() == "y",
+             f"{n.name} sees the files copied in", 30)
+        check(n.sh("cd /volumes/ds/results && sha256sum run1/ckpt.bin run1/log.txt", user="agent") == up,
+              f"{n.name}: other bytes")
+        check(n.sh("stat -c '%U %a' /volumes/ds/results/run1/ckpt.bin").strip() == "agent 600", f"{n.name}: owner, mode")
+    check(a.sh("cat /volumes/ds/results/run1/ckpt.bin > /dev/null", user="bob", ok=False).returncode != 0,
+          "bob reads agent's private file")
+    check(a.sh("wc -c < /volumes/ds/results/run1/log.txt", user="bob").strip() == "3", "bob can't read a public file")
+    # Without SSH access to the nodes: nothing.
+    p = pc.sh("meshvpn volume cp /etc/hostname ds:x", user="carol", ok=False)
+    check(p.returncode != 0 and "SSH access" in p.stderr, f"carol copied in: {p.stdout}{p.stderr}")
+    p = pc.sh("meshvpn volume cp ds:results /tmp/c", user="carol", ok=False)
+    check(p.returncode != 0, "carol copied out")
+    # A user copies in only what it can read, and replaces and removes only its own files.
+    p = pc.sh("meshvpn volume cp /etc/shadow ds:", user="agent", ok=False)
+    check(p.returncode != 0, "agent copied root's /etc/shadow in")
+    p = pc.sh("meshvpn volume rm ds:big.bin", user="agent", ok=False)
+    check(p.returncode != 0 and "not yours" in p.stderr, f"agent removed root's file: {p.stderr}")
+    # Replaced: the new content everywhere.
+    pc.sh("echo again > up/run1/log.txt", user="agent")
+    pc.sh("meshvpn volume cp up/run1/log.txt ds:results/run1", user="agent")
+    wait(lambda: a.sh("cat /volumes/ds/results/run1/log.txt").strip() == "again", "a sees the new file", 30)
+    # Out again, onto a node outside the group: the user's files, only what it may read.
+    pc.sh("meshvpn volume cp ds:results down", user="agent")
+    check(pc.sh("cd down && sha256sum results/run1/ckpt.bin", user="agent").split()[0] == up.split()[0],
+          "copied out: other bytes")
+    check(pc.sh("stat -c %U down/results/run1/ckpt.bin", user="agent").strip() == "agent", "copied out as root")
+    p = pc.sh("meshvpn volume cp ds:sub down", user="agent", ok=False)
+    check(p.returncode != 0 and "permission denied" in p.stderr, f"agent copied root's private file out: {p.stderr}")
+    # b gone: its share of the storage's files comes from the storage, the copied-in files from
+    # their second copy.
+    b.stop()
+    check(a.sh("cd /volumes/ds && find . -type f ! -path './results/*' | sort | xargs sha256sum", timeout=300) == want,
+          "a reads other bytes with b gone")
+    check(a.sh("sha256sum < /volumes/ds/results/run1/ckpt.bin").split()[0] == up.split()[0],
+          "a: copied-in file with b gone")
+    check(here(a)["read_source_bytes"] > 0, f"a read nothing from the storage: {here(a)}")
+    # b again: what it had is still on its disk.
+    b.up()
+    wait(lambda: (here(b) or {}).get("staged"), "b back", 60)
+    check(here(b)["staged_bytes"] == here(b)["owned_bytes"], f"b: {here(b)}")
+    check(sums(b) == sums(c), "b reads other bytes after a restart")
+    pc.sh("meshvpn volume rm ds:results", user="agent")
+    wait(lambda: a.sh("test -e /volumes/ds/results && echo y || echo n").strip() == "n", "results removed", 30)
+    a.mv("volume delete ds")
+    for n in (a, b, c):
+        wait(lambda n=n: n.sh("mountpoint -q /volumes/ds && echo y || echo n").strip() == "n"
+             and n.sh("ls /var/lib/meshvpn/volumes 2>/dev/null | wc -l").strip() == "0", f"{n.name}: removed", 30)
+
+
+@test
+def test_volume_rootless(lab):
+    """A volume on a rootless node too (mounted with fusermount3 at ~/volumes), and files copied
+    in by a rootless node."""
+    net, (hub, a) = mesh(lab, ["hub", "a"], extra=FUSE)
+    pc = lab.node("pc", [net], caps=False, extra=FUSE)
+    pc.sh("chmod 666 /dev/fuse")
+    pc.sh("ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519", user="agent")
+    pc.mv(f"join {invite(hub)} --name pc", user="agent")
+    run(["docker", "exec", "-d", "-u", "agent", "-w", "/home/agent", pc.c, "sh", "-c", "meshvpn up >> /tmp/meshvpn.log 2>&1"])
+    wait(lambda: hub.online("pc") and a.online("pc"), "pc online")
+    for n in (hub, a):
+        n.mv("ssh allow agent@pc --as agent")
+    hub.mv("volume create scratch --nodes hub,pc,a --copies 2")
+    wait(lambda: pc.sh("test -d /home/agent/volumes/scratch && mountpoint -q /home/agent/volumes/scratch && echo y",
+                       user="agent", ok=False).stdout.strip() == "y", "mounted on the rootless node", 60)
+    pc.sh("mkdir -p data && for i in 1 2 3 4 5; do head -c 6000000 /dev/urandom > data/p$i.bin; done", user="agent")
+    wait(lambda: pc.mv("volume cp data scratch:", user="agent", ok=False).returncode == 0, "copied in", 90)
+    want = pc.sh("cd data && sha256sum p*.bin", user="agent")
+    wait(lambda: hub.sh("cd /volumes/scratch/data 2>/dev/null && sha256sum p*.bin", ok=False).stdout == want,
+         "hub reads what the rootless node copied in", 60)
+    # pc follows the list hub keeps (within seconds).
+    wait(lambda: pc.sh("cd volumes/scratch/data 2>/dev/null && sha256sum p*.bin", user="agent", ok=False).stdout == want,
+         "pc reads what it copied in", 30)
+    # pc gone: every chunk has a second copy on hub or a.
+    pc.sh("pkill -u agent -x meshvpn; true")
+    check(a.sh("cd /volumes/scratch/data && sha256sum p*.bin", timeout=120) == want, "a: other bytes with pc gone")
 
 
 @test

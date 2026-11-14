@@ -104,6 +104,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
+    /// Storage made of the disks of a group of nodes, mounted at /volumes/NAME on each of them
+    /// (Linux); filled from network storage, or by copying files in from any node.
+    Volume {
+        #[command(subcommand)]
+        cmd: VolumeCmd,
+    },
     /// Run the VPN in the foreground (needs root).
     Up {
         /// Write the log to FILE instead of the terminal (services without one, e.g. on Windows).
@@ -580,6 +586,38 @@ enum AdminCmd {
     Add { node: String },
     /// Take admin rights away.
     Rm { node: String },
+}
+
+#[derive(Subcommand)]
+enum VolumeCmd {
+    /// A volume on the disks of NODES (admins). With --from, filled from that directory on
+    /// network storage (the same path on every node of the group).
+    Create {
+        name: String,
+        /// The nodes, e.g. gpu1,gpu2,gpu3; the first keeps the file list.
+        #[arg(long, value_delimiter = ',', required = true)]
+        nodes: Vec<String>,
+        #[arg(long)]
+        from: Option<String>,
+        /// Copies of each chunk of the files copied in.
+        #[arg(long, default_value_t = 2)]
+        copies: u8,
+    },
+    /// The volumes, and how this node is doing with its own.
+    List,
+    /// Copy into a volume (`cp LOCAL... NAME:DIR`) or out of one (`cp NAME:PATH LOCALDIR`), from
+    /// any node of the network.
+    Cp {
+        #[arg(required = true, num_args = 2..)]
+        paths: Vec<String>,
+    },
+    /// Remove files or directories from a volume: NAME:PATH...
+    Rm {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Delete a volume: every node unmounts it and deletes its chunks (the source stays).
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1068,6 +1106,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Gpu { cmd } => return gpu_cmd(&dir, cmd, json),
         Cmd::Exit { cmd } => return exit_cmd(&dir, cmd, json),
+        Cmd::Volume { cmd } => return volume_cmd(&dir, cmd, json),
         Cmd::Admin { cmd } => {
             let req = match cmd {
                 AdminCmd::Status => control::Request::AdminStatus,
@@ -2458,7 +2497,189 @@ fn load_proxy_env(dir: &Path) {
     }
 }
 
-fn human_bytes(b: u64) -> String {
+/// `NAME:PATH` of a volume (a local path has no colon before its first slash).
+fn volume_path(s: &str) -> Option<(String, String)> {
+    let (name, path) = s.split_once(':')?;
+    (!name.is_empty() && !name.contains('/')).then(|| (name.to_string(), path.to_string()))
+}
+
+fn volume_cmd(dir: &Path, cmd: VolumeCmd, json: bool) -> Result<i32> {
+    let req = match &cmd {
+        VolumeCmd::Create {
+            name,
+            nodes,
+            from,
+            copies,
+        } => {
+            require_owner()?;
+            control::Request::VolumeCreate {
+                name: name.clone(),
+                nodes: nodes.clone(),
+                from: from
+                    .as_ref()
+                    .map(|f| std::path::absolute(f).map(|p| p.to_string_lossy().into_owned()))
+                    .transpose()?,
+                copies: *copies,
+            }
+        }
+        VolumeCmd::List => control::Request::VolumeList,
+        VolumeCmd::Delete { name } => {
+            require_owner()?;
+            control::Request::VolumeDelete { name: name.clone() }
+        }
+        // As the user itself: with SSH access to the volume's nodes, its own files.
+        VolumeCmd::Rm { paths } => {
+            let mut name = None;
+            let mut list = vec![];
+            for p in paths {
+                let (n, path) = volume_path(p).ok_or_else(|| anyhow::anyhow!("{p}: give NAME:PATH"))?;
+                if name.get_or_insert(n.clone()) != &n {
+                    bail!("one volume at a time");
+                }
+                list.push(path);
+            }
+            control::Request::VolumeRm {
+                name: name.unwrap_or_default(),
+                paths: list,
+            }
+        }
+        VolumeCmd::Cp { paths } => {
+            let (last, sources) = paths.split_last().unwrap();
+            match volume_path(last) {
+                // Into a volume.
+                Some((name, dir)) => {
+                    if sources.iter().any(|s| volume_path(s).is_some()) {
+                        bail!("from a volume into a volume: copy out first");
+                    }
+                    control::Request::VolumeUpload {
+                        name,
+                        dir,
+                        local: sources
+                            .iter()
+                            .map(|s| std::path::absolute(s).map(|p| p.to_string_lossy().into_owned()))
+                            .collect::<std::io::Result<_>>()?,
+                    }
+                }
+                None => {
+                    let [one] = sources else {
+                        bail!("out of a volume: cp NAME:PATH LOCALDIR");
+                    };
+                    let (name, path) = volume_path(one).ok_or_else(|| anyhow::anyhow!("one side must be NAME:PATH"))?;
+                    control::Request::VolumeDownload {
+                        name,
+                        path,
+                        dest: std::path::absolute(last)?.to_string_lossy().into_owned(),
+                    }
+                }
+            }
+        }
+    };
+    let resp = tokio::runtime::Runtime::new()?.block_on(control::request(dir, &req))?;
+    let control::Response::Message { text } = resp else {
+        if let VolumeCmd::Delete { name } = &cmd {
+            say(
+                json,
+                &format!("volume {name} deleted: every node unmounts it and deletes its chunks"),
+            );
+        }
+        return Ok(0);
+    };
+    if json {
+        println!("{text}");
+        return Ok(0);
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    let list = |a: &serde_json::Value| -> String {
+        a.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match cmd {
+        VolumeCmd::Create { .. } => {
+            println!(
+                "volume {} on {} ({} copies of what is copied in), at {} on each of them{}",
+                v["name"].as_str().unwrap_or(""),
+                list(&v["nodes"]),
+                v["copies"],
+                v["mount"].as_str().unwrap_or(""),
+                match v["source"].as_str() {
+                    Some(s) => format!(
+                        ".\nThey copy their shares of {s} now; readable right away (from the storage until then).\n\
+                         Progress: meshvpn volume list (on those nodes)"
+                    ),
+                    None => ".\nCopy files in from any node: meshvpn volume cp <files> NAME:<dir>".into(),
+                }
+            );
+        }
+        VolumeCmd::Cp { .. } => println!(
+            "{} files, {} in {:.1} s ({:.0} MB/s)",
+            v["files"],
+            human_bytes(v["bytes"].as_u64().unwrap_or(0)),
+            v["seconds"].as_f64().unwrap_or(0.0),
+            v["mb_s"].as_f64().unwrap_or(0.0)
+        ),
+        VolumeCmd::Rm { .. } => println!("removed (version {})", v["version"]),
+        VolumeCmd::List => {
+            let all = v["volumes"].as_array().cloned().unwrap_or_default();
+            if all.is_empty() {
+                println!(
+                    "no volumes - make one: sudo meshvpn volume create NAME --nodes a,b,c [--from /path/on/storage]"
+                );
+            }
+            for d in all {
+                println!(
+                    "{}  on {}{}",
+                    d["name"].as_str().unwrap_or(""),
+                    list(&d["nodes"]),
+                    d["source"].as_str().map(|s| format!(", from {s}")).unwrap_or_default()
+                );
+                let h = &d["here"];
+                if h.is_object() {
+                    println!(
+                        "  here: {} - {} files, {} (version {}); {} on this disk",
+                        d["mount"].as_str().unwrap_or(""),
+                        h["files"],
+                        human_bytes(h["bytes"].as_u64().unwrap_or(0)),
+                        h["version"],
+                        human_bytes(h["stored_bytes"].as_u64().unwrap_or(0))
+                    );
+                    if d["source"].is_string() {
+                        println!(
+                            "  from the storage: {} of this node's {}{}",
+                            human_bytes(h["staged_bytes"].as_u64().unwrap_or(0)),
+                            human_bytes(h["owned_bytes"].as_u64().unwrap_or(0)),
+                            if h["staged"] == true {
+                                format!(" (done in {} s)", h["stage_secs"])
+                            } else {
+                                " (copying)".into()
+                            }
+                        );
+                    }
+                    println!(
+                        "  read so far: {} from this disk, {} from the other nodes, {} from the storage",
+                        human_bytes(h["read_local_bytes"].as_u64().unwrap_or(0)),
+                        human_bytes(h["read_remote_bytes"].as_u64().unwrap_or(0)),
+                        human_bytes(h["read_source_bytes"].as_u64().unwrap_or(0))
+                    );
+                    if let Some(n) = h["note"].as_str() {
+                        println!("  \x1b[1;33mwarning:\x1b[0m {n}");
+                    }
+                } else if let Some(e) = d["error"].as_str() {
+                    println!("  \x1b[1;33mnot available here:\x1b[0m {e}");
+                } else if d["member"] == true {
+                    println!("  here: starting");
+                }
+            }
+        }
+        VolumeCmd::Delete { .. } => {}
+    }
+    Ok(0)
+}
+
+pub(crate) fn human_bytes(b: u64) -> String {
     match b {
         0..1_000_000 => format!("{:.0} kB", b as f64 / 1e3),
         1_000_000..1_000_000_000 => format!("{:.1} MB", b as f64 / 1e6),

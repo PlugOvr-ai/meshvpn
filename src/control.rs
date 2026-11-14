@@ -95,6 +95,33 @@ pub enum Request {
         ttl_ms: u64,
     },
     AdminEnable,
+    /// `meshvpn volume ...` (`crate::volume`).
+    VolumeCreate {
+        name: String,
+        nodes: Vec<String>,
+        from: Option<String>,
+        copies: u8,
+    },
+    VolumeList,
+    VolumeDelete {
+        name: String,
+    },
+    /// Local files into a volume (`dir` in it).
+    VolumeUpload {
+        name: String,
+        dir: String,
+        local: Vec<String>,
+    },
+    /// A file or directory of a volume into the local directory `dest`.
+    VolumeDownload {
+        name: String,
+        path: String,
+        dest: String,
+    },
+    VolumeRm {
+        name: String,
+        paths: Vec<String>,
+    },
     /// Open network: accept a node as admin (its roster applies here).
     AdminTrust {
         who: String,
@@ -372,8 +399,79 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
                 text: direct.to_string(),
             }
         }
+        #[cfg(target_os = "linux")]
+        Ok(Request::VolumeList) => Response::Message {
+            text: node.volumes.status(&node).to_string(),
+        },
+        #[cfg(not(target_os = "linux"))]
+        Ok(
+            Request::VolumeList
+            | Request::VolumeCreate { .. }
+            | Request::VolumeDelete { .. }
+            | Request::VolumeUpload { .. }
+            | Request::VolumeDownload { .. }
+            | Request::VolumeRm { .. },
+        ) => Response::Error {
+            message: "volumes are for Linux nodes".into(),
+        },
+        // Every user: with its own rights (see `volume_caller`).
+        #[cfg(target_os = "linux")]
+        Ok(Request::VolumeUpload { name, dir, local }) => match volume_caller(&caller) {
+            Ok((user, creds)) => json_reply(
+                node.volumes
+                    .upload(
+                        &node,
+                        &name,
+                        &dir,
+                        local.into_iter().map(PathBuf::from).collect(),
+                        user,
+                        creds,
+                    )
+                    .await,
+            ),
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
+        #[cfg(target_os = "linux")]
+        Ok(Request::VolumeDownload { name, path, dest }) => match volume_caller(&caller) {
+            Ok((user, creds)) => json_reply(
+                node.volumes
+                    .download(&node, &name, &path, PathBuf::from(dest), user, creds)
+                    .await,
+            ),
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
+        #[cfg(target_os = "linux")]
+        Ok(Request::VolumeRm { name, paths }) => match volume_caller(&caller) {
+            Ok((user, _)) => json_reply(
+                node.volumes
+                    .remove(&node, &name, paths, user)
+                    .await
+                    .map(|v| serde_json::json!({ "version": v })),
+            ),
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
         Ok(_) if !privileged => Response::Error {
             message: "permission denied - try again with sudo".into(),
+        },
+        #[cfg(target_os = "linux")]
+        Ok(Request::VolumeCreate {
+            name,
+            nodes,
+            from,
+            copies,
+        }) => json_reply(node.volume_create(name, nodes, from, copies)),
+        #[cfg(target_os = "linux")]
+        Ok(Request::VolumeDelete { name }) => match node.volume_delete(&name) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
         },
         Ok(Request::AddPeer { addr }) => match node.add_peer(addr) {
             Ok(()) => {
@@ -549,6 +647,34 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
     let mut out = serde_json::to_vec(&resp).unwrap();
     out.push(b'\n');
     let _ = w.write_all(&out).await;
+}
+
+/// Who copies into or out of a volume: the calling user, with its own file rights (the daemon
+/// runs as root, the files are the user's). A rootless install works for its owner only.
+#[cfg(target_os = "linux")]
+fn volume_caller(caller: &crate::ext::Caller) -> anyhow::Result<(Option<String>, Option<crate::volume::Creds>)> {
+    if crate::config::rootless() {
+        if !caller.privileged {
+            anyhow::bail!("this meshvpn runs for its owner only (a rootless install)");
+        }
+        return Ok((caller.user.clone(), None));
+    }
+    let user = caller
+        .user
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("who is asking is unknown"))?;
+    let creds = crate::volume::creds_of(&user).ok_or_else(|| anyhow::anyhow!("no account {user}"))?;
+    Ok((Some(user), (creds.uid != 0).then_some(creds)))
+}
+
+#[cfg(target_os = "linux")]
+fn json_reply(r: anyhow::Result<serde_json::Value>) -> Response {
+    match r {
+        Ok(v) => Response::Message { text: v.to_string() },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
 }
 
 fn lease_reply(r: anyhow::Result<crate::proto::Lease>) -> Response {

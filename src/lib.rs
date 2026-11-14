@@ -38,6 +38,8 @@ mod share;
 mod ssh;
 #[cfg(unix)]
 mod sshd;
+#[cfg(target_os = "linux")]
+mod volume;
 /// Windows: no sshd integration (logins go to the Linux and macOS nodes).
 #[cfg(windows)]
 mod sshd {

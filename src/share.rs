@@ -322,6 +322,45 @@ enum Req {
     },
     /// Throughput test: data follows until the sender closes; the answer is how much arrived.
     Sink,
+    /// A volume's file list version (`crate::volume`), on the node that keeps it.
+    /// `user`: for which user of the asking node (None: the node itself, for its mount).
+    VolHead {
+        vol: String,
+        #[serde(default)]
+        user: Option<String>,
+    },
+    VolManifest {
+        vol: String,
+        #[serde(default)]
+        user: Option<String>,
+    },
+    /// Bytes of a volume's chunk this node keeps (never more than one chunk).
+    VolRead {
+        vol: String,
+        #[serde(default)]
+        user: Option<String>,
+        id: String,
+        chunk: u32,
+        off: u64,
+        len: u32,
+    },
+    /// A chunk copied in: `len` bytes follow the line.
+    VolPut {
+        vol: String,
+        #[serde(default)]
+        user: Option<String>,
+        id: String,
+        chunk: u32,
+        hash: String,
+        len: u32,
+    },
+    /// Files copied in, removed: `len` bytes of JSON follow the line.
+    VolCommit {
+        vol: String,
+        #[serde(default)]
+        user: Option<String>,
+        len: u32,
+    },
 }
 
 /// How long each side waits for the other's part of the greeting.
@@ -375,7 +414,7 @@ pub async fn serve(node: Arc<Node>) {
     }
 }
 
-async fn serve_conn(node: &Node, mut s: TcpStream) -> Result<()> {
+async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
     s.set_nodelay(true).ok();
     let mut nonce = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -394,13 +433,18 @@ async fn serve_conn(node: &Node, mut s: TcpStream) -> Result<()> {
     let hello = tokio::time::timeout(GREETING, read_line(&mut r))
         .await??
         .ok_or_else(|| anyhow!("closed before the hello"))?;
-    match serde_json::from_slice::<Req>(&hello)? {
+    let peer = match serde_json::from_slice::<Req>(&hello)? {
         Req::Hello { id, sig } if node.share_admits(&id, version, &nonce, &sig) => {
             w.write_all(&0u64.to_be_bytes()).await?;
+            id
         }
         Req::Hello { id, .. } => bail!("{id} is not admitted to this network"),
         _ => bail!("no hello (a node older than 0.33.1?)"),
-    }
+    };
+    #[cfg(target_os = "linux")]
+    let who = |user: Option<String>| crate::volume::Who { node: peer, user };
+    #[cfg(not(target_os = "linux"))]
+    let _ = peer;
     while let Some(line) = tokio::time::timeout(IDLE, read_line(&mut r)).await?? {
         let data: Option<Vec<u8>> = match serde_json::from_slice::<Req>(&line)? {
             Req::Hello { .. } => bail!("a second hello"),
@@ -419,6 +463,70 @@ async fn serve_conn(node: &Node, mut s: TcpStream) -> Result<()> {
                 return Ok(());
             }
             Req::Manifest { id } => node.shares.get(&id).map(|s| serde_json::to_vec(&s.manifest).unwrap()),
+            #[cfg(target_os = "linux")]
+            Req::VolHead { vol, user } => node.volumes.head(&vol, &who(user)),
+            #[cfg(target_os = "linux")]
+            Req::VolManifest { vol, user } => node.volumes.manifest_bytes(&vol, &who(user)),
+            #[cfg(target_os = "linux")]
+            Req::VolRead {
+                vol,
+                user,
+                id,
+                chunk,
+                off,
+                len,
+            } => {
+                static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+                let _permit = READS.acquire().await;
+                let (n, who) = (node.clone(), who(user));
+                tokio::task::spawn_blocking(move || n.volumes.read_local(&vol, &who, &id, chunk, off, len))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            #[cfg(target_os = "linux")]
+            Req::VolPut {
+                vol,
+                user,
+                id,
+                chunk,
+                hash,
+                len,
+            } => {
+                if len as u64 > 64 << 20 {
+                    bail!("chunk too large");
+                }
+                let mut data = vec![0u8; len as usize];
+                tokio::time::timeout(Duration::from_secs(60), r.read_exact(&mut data)).await??;
+                let (n, who) = (node.clone(), who(user));
+                match tokio::task::spawn_blocking(move || n.volumes.put(&vol, &who, &id, chunk, &hash, &data)).await? {
+                    Ok(()) => Some(vec![]),
+                    Err(e) => {
+                        debug!("volume chunk refused: {e:#}");
+                        None
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Req::VolCommit { vol, user, len } => {
+                if len > 64 << 20 {
+                    bail!("commit too large");
+                }
+                let mut data = vec![0u8; len as usize];
+                tokio::time::timeout(Duration::from_secs(60), r.read_exact(&mut data)).await??;
+                let answer = match serde_json::from_slice(&data) {
+                    Ok(c) => match node.volumes.commit(&vol, &who(user), c).await {
+                        Ok(v) => serde_json::json!({ "version": v }),
+                        Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+                    },
+                    Err(e) => serde_json::json!({ "error": e.to_string() }),
+                };
+                Some(answer.to_string().into_bytes())
+            }
+            #[cfg(not(target_os = "linux"))]
+            Req::VolHead { .. } | Req::VolManifest { .. } | Req::VolRead { .. } => None,
+            #[cfg(not(target_os = "linux"))]
+            Req::VolPut { .. } | Req::VolCommit { .. } => bail!("no volumes here"),
             Req::Chunk { id, file, index } => match node.shares.get(&id) {
                 Some(s) if file < s.manifest.files.len() && index < s.manifest.files[file].chunks.len() => {
                     let path = s.file(file);
@@ -535,6 +643,187 @@ async fn request(c: &mut Conn, req: &Req) -> Result<Option<Vec<u8>>> {
     let mut buf = vec![0u8; len as usize];
     c.lines.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+/// Connections to other nodes' chunk servers for the volumes, kept open between reads.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub struct Pool {
+    conns: Mutex<HashMap<crate::keys::NodeId, Vec<Conn>>>,
+    /// Nodes that could not be reached, and when: not tried again for a few seconds.
+    failed: Mutex<HashMap<crate::keys::NodeId, Instant>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Pool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn ask(&self, node: &Node, peer: crate::keys::NodeId, req: &Req) -> Result<Option<Vec<u8>>> {
+        if self
+            .failed
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        {
+            bail!("not reachable just now");
+        }
+        let idle = self.conns.lock().unwrap().get_mut(&peer).and_then(|v| v.pop());
+        let mut c = match idle {
+            Some(c) => c,
+            None => {
+                let h = node.holder_of(&peer).ok_or_else(|| anyhow!("offline"))?;
+                match tokio::time::timeout(Duration::from_secs(5), connect(node, &h)).await {
+                    Ok(Ok(c)) => c,
+                    _ => {
+                        self.failed.lock().unwrap().insert(peer, Instant::now());
+                        bail!("cannot connect to {}", h.name);
+                    }
+                }
+            }
+        };
+        // A connection that fails is dropped; the next read opens a new one.
+        let answer = request(&mut c, req).await?;
+        let mut conns = self.conns.lock().unwrap();
+        let idle = conns.entry(peer).or_default();
+        if idle.len() < 32 {
+            idle.push(c);
+        }
+        Ok(answer)
+    }
+
+    async fn ask_with(
+        &self,
+        node: &Node,
+        peer: crate::keys::NodeId,
+        req: &Req,
+        body: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        if self
+            .failed
+            .lock()
+            .unwrap()
+            .get(&peer)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        {
+            bail!("not reachable just now");
+        }
+        let h = node.holder_of(&peer).ok_or_else(|| anyhow!("offline"))?;
+        let mut c = tokio::time::timeout(Duration::from_secs(5), connect(node, &h))
+            .await
+            .map_err(|_| anyhow!("cannot connect to {}", h.name))??;
+        let mut line = serde_json::to_vec(req)?;
+        line.push(b'\n');
+        line.extend_from_slice(body);
+        c.w.write_all(&line).await?;
+        let len = c.lines.read_u64().await?;
+        if len == MISSING {
+            return Ok(None);
+        }
+        if len > 128 * 1024 * 1024 {
+            bail!("oversized answer");
+        }
+        let mut buf = vec![0u8; len as usize];
+        c.lines.read_exact(&mut buf).await?;
+        let mut conns = self.conns.lock().unwrap();
+        let idle = conns.entry(peer).or_default();
+        if idle.len() < 32 {
+            idle.push(c);
+        }
+        Ok(Some(buf))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn volume_read(
+        &self,
+        node: &Node,
+        peer: crate::keys::NodeId,
+        vol: &str,
+        user: Option<&str>,
+        id: &str,
+        chunk: u32,
+        off: u64,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        let req = Req::VolRead {
+            vol: vol.into(),
+            user: user.map(String::from),
+            id: id.into(),
+            chunk,
+            off,
+            len,
+        };
+        self.ask(node, peer, &req).await
+    }
+
+    pub async fn volume_head(
+        &self,
+        node: &Node,
+        peer: crate::keys::NodeId,
+        vol: &str,
+        user: Option<&str>,
+    ) -> Result<Option<Vec<u8>>> {
+        let req = Req::VolHead {
+            vol: vol.into(),
+            user: user.map(String::from),
+        };
+        self.ask(node, peer, &req).await
+    }
+
+    pub async fn volume_manifest(
+        &self,
+        node: &Node,
+        peer: crate::keys::NodeId,
+        vol: &str,
+        user: Option<&str>,
+    ) -> Result<Option<Vec<u8>>> {
+        let req = Req::VolManifest {
+            vol: vol.into(),
+            user: user.map(String::from),
+        };
+        self.ask(node, peer, &req).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn volume_put(
+        &self,
+        node: &Node,
+        peer: crate::keys::NodeId,
+        vol: &str,
+        user: Option<&str>,
+        id: &str,
+        chunk: u32,
+        hash: &str,
+        data: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let req = Req::VolPut {
+            vol: vol.into(),
+            user: user.map(String::from),
+            id: id.into(),
+            chunk,
+            hash: hash.into(),
+            len: data.len() as u32,
+        };
+        self.ask_with(node, peer, &req, data).await
+    }
+
+    pub async fn volume_commit(
+        &self,
+        node: &Node,
+        peer: crate::keys::NodeId,
+        vol: &str,
+        user: Option<&str>,
+        body: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let req = Req::VolCommit {
+            vol: vol.into(),
+            user: user.map(String::from),
+            len: body.len() as u32,
+        };
+        self.ask_with(node, peer, &req, body).await
+    }
 }
 
 /// Throughput over a LAN path, Mbit/s: `streams` connections straight to `ip` (not through the
@@ -825,7 +1114,7 @@ pub(crate) fn safe_mode(mode: u32) -> u32 {
 
 /// `root/rel` with its parent directories created (added to `created`), refusing to leave
 /// `root` (a canonical path) through symlinks already in the tree.
-fn inside(root: &Path, rel: &str, created: &mut Vec<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn inside(root: &Path, rel: &str, created: &mut Vec<PathBuf>) -> Result<PathBuf> {
     let path = root.join(rel);
     let dir = path.parent().ok_or_else(|| anyhow!("bad path {rel}"))?;
     let mut missing = vec![];
@@ -849,7 +1138,7 @@ fn inside(root: &Path, rel: &str, created: &mut Vec<PathBuf>) -> Result<PathBuf>
 /// writable by others unless sticky like /tmp, none of another user's than `owner`), so no
 /// one can swap a part of the way for a link while it writes.
 #[cfg(unix)]
-fn safe_destination(dest: &Path, owner: Option<u32>) -> Result<()> {
+pub(crate) fn safe_destination(dest: &Path, owner: Option<u32>) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let abs = if dest.is_absolute() {
         dest.to_path_buf()
@@ -886,7 +1175,7 @@ fn safe_destination(dest: &Path, owner: Option<u32>) -> Result<()> {
 
 /// The primary group of `uid`.
 #[cfg(unix)]
-fn gid_of(uid: u32) -> u32 {
+pub(crate) fn gid_of(uid: u32) -> u32 {
     unsafe {
         let pw = libc::getpwuid(uid);
         if pw.is_null() { uid } else { (*pw).pw_gid }

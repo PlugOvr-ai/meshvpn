@@ -574,6 +574,46 @@ time, so take the numbers as approximate. Shared data travels encrypted over the
 authenticated (only network members can download) but not encrypted, like NCCL's own traffic. `share` and `fetch` need
 root, because the daemon reads and writes the files; fetched files belong to the user who ran `sudo`.
 
+## Volumes: the nodes' disks as one file system (experimental, Linux)
+
+A volume is storage made of the disks of a group of nodes, mounted read-only at `/volumes/NAME` on each of them. Filled
+from network storage, it takes the storage out of the training's way: every node copies its share once, all at once,
+and reads afterwards come from its own disk, the other nodes' disks and its RAM.
+
+```bash
+# An admin: a volume on three nodes, filled from storage they all have mounted at the same path
+sudo meshvpn volume create imagenet --nodes gpu1,gpu2,gpu3 --from /lustre/datasets/imagenet
+meshvpn volume list                                    # copying progress, reads by source
+
+# Any user with SSH access to the nodes, from any node - a laptop too
+meshvpn volume cp ./checkpoints imagenet:runs/42      # in (2 copies of each chunk by default)
+meshvpn volume cp imagenet:runs/42 ./back             # out
+meshvpn volume rm imagenet:runs/42
+sudo meshvpn volume delete imagenet                   # every node unmounts it and deletes its chunks
+```
+
+* Files are cut into 4 MB chunks; which nodes keep a chunk follows from the node ids (rendezvous hashing). With
+  `--from`, each node copies its own share from the storage; until it has, and while a node is offline, those chunks
+  are read from the storage. Files copied in have `--copies` copies (2 by default): there is nothing behind them.
+* The volume can be read right away, also while the nodes copy. The first node of `--nodes` keeps the list of files;
+  the others follow it within seconds. While it is offline the volume is read-only.
+* The files change only through `volume cp` and `volume rm`, never by writing into the mount, so every node sees the
+  same files. A file copied in again replaces the old one everywhere; programs that have it open keep reading the
+  old version.
+* **Who may do what:** a user works with a volume only if it could log in to the volume's nodes by SSH (`meshvpn ssh
+  allow`, see above). Files copied in belong to the account it logs in as there and keep their mode; the mount
+  shows owners and modes as they are, and the kernel enforces them. Files from the storage keep the storage's owners
+  and modes. A user copies in only what it can read itself, copies out only what it may read, and replaces or removes
+  only its own files. `cp` and `rm` need no sudo: the daemon opens and creates the user's files with the user's own
+  rights. Only admins make and delete volumes, and only from network storage (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB,
+  FUSE file systems such as sshfs), never from a node's local disk.
+* **Data path:** between nodes that share a LAN, chunks go straight over it (port 7871, the native interface, like
+  NCCL), authenticated but not encrypted; otherwise through the encrypted mesh.
+* Without root (rootless install) the volume is mounted with `fusermount3` at `~/volumes/NAME` (the package fuse3),
+  readable by the user only unless `user_allow_other` is set in `/etc/fuse.conf`; the chunks are in `~/.cache`. As
+  root, the chunks are in `/var/lib/meshvpn/volumes`; a tenth of the disk (at least 1 GB) stays free.
+* In a container, mounting needs `/dev/fuse` and `SYS_ADMIN`.
+
 ## Everyday use
 
 | Command | What it does |

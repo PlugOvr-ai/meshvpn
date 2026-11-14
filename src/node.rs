@@ -30,6 +30,8 @@ mod punch;
 mod rendezvous;
 mod replay;
 mod udp;
+#[cfg(target_os = "linux")]
+mod volumes;
 pub mod why;
 
 /// Where IP packets for this node go: the kernel, or the TCP/IP stack in this process.
@@ -483,6 +485,9 @@ pub struct Node {
     socks: Option<String>,
     /// Datasets/checkpoints this node shares (`meshvpn share`).
     pub shares: crate::share::Store,
+    /// Storage made of the disks of a group of nodes (`meshvpn volume`).
+    #[cfg(target_os = "linux")]
+    pub volumes: crate::volume::Volumes,
     /// Direct UDP paths (None: disabled, or no way out over UDP).
     udp: Option<Arc<tokio::net::UdpSocket>>,
     /// The IPv6 socket (same port; no NAT on the way, so direct paths through most firewalls).
@@ -742,6 +747,8 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         nonces,
         socks,
         shares: crate::share::Store::load(&dir),
+        #[cfg(target_os = "linux")]
+        volumes: crate::volume::Volumes::new(&dir),
         udp6: udp::bind6(udp.as_ref()).await,
         ext_notify: tokio::sync::Notify::new(),
         udp,
@@ -921,6 +928,8 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     tokio::spawn(node.clone().update_loop());
     tokio::spawn(node.clone().inventory_loop());
     tokio::spawn(crate::share::serve(node.clone()));
+    #[cfg(target_os = "linux")]
+    tokio::spawn(crate::volume::Volumes::run(node.clone()));
     if node.udp.is_some() {
         for sock in node.udp.iter().chain(node.udp6.iter()) {
             tokio::spawn(node.clone().udp_loop(sock.clone()));
@@ -967,6 +976,8 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         let _ = tokio::time::timeout(Duration::from_secs(3), crate::portmap::unmap(&m)).await;
     }
     node.exit_stop();
+    #[cfg(target_os = "linux")]
+    node.volumes.shutdown();
     node.save_state();
     if node.cfg.manage_hosts
         && let Err(e) = crate::hosts::write(crate::networks::name(&dir).as_deref(), None)
@@ -2089,6 +2100,50 @@ impl Node {
             }
         }
         lines.concat()
+    }
+
+    /// The accounts of this machine that `user` on node `from` may log in as by SSH (the rules
+    /// of `authorized_keys`): what it may work with here as that user (volumes). Only a user
+    /// that publishes a key could log in at all.
+    #[cfg(target_os = "linux")]
+    pub fn ssh_accounts(&self, from: &NodeId, user: &str) -> Vec<String> {
+        let access = self.ext_ssh_access();
+        let st = self.state.lock().unwrap();
+        let Some(rec) = st.records.get(from) else {
+            return vec![];
+        };
+        if st.banned.contains_key(from) || !access.only.as_ref().is_none_or(|o| o.contains(from)) {
+            return vec![];
+        }
+        let keys: Vec<&str> = rec
+            .info
+            .ssh_keys
+            .iter()
+            .filter(|k| k.user == user)
+            .map(|k| k.key.as_str())
+            .collect();
+        if keys.is_empty() {
+            return vec![];
+        }
+        let mut out = st.ssh_allow_all.clone();
+        for r in Self::ssh_rules(&st, &access) {
+            if r.node == *from && r.from_user.as_ref().is_none_or(|u| u == user) {
+                out.extend(r.users.iter().cloned());
+            }
+        }
+        for k in &st.ssh_allow_keys {
+            if keys.contains(&k.key.as_str()) {
+                out.extend(k.users.iter().cloned());
+            }
+        }
+        for k in &access.keys {
+            if keys.contains(&k.key.as_str()) && (k.from.is_empty() || k.from.contains(&rec.info.ip())) {
+                out.push(k.user.clone());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// This machine's login rules (limited by an extension, if it says so) and the extension's.

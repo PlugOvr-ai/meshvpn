@@ -390,7 +390,7 @@ impl Node {
         }
     }
 
-    fn names(&self, st: &State, ids: &[NodeId]) -> Vec<String> {
+    pub(super) fn names(&self, st: &State, ids: &[NodeId]) -> Vec<String> {
         ids.iter()
             .map(|id| {
                 if *id == self.ident.id {

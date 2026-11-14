@@ -10,6 +10,26 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-14
+
+Volumes (experimental): the disks of a group of nodes as one file system, filled from network storage or by copying
+files in from any node.
+
+### Added
+- **`meshvpn volume` (experimental, Linux):** `volume create NAME --nodes a,b,c [--from /storage/path] [--copies 2]`
+  (admins) makes storage out of those nodes' disks, mounted read-only at `/volumes/NAME` on each (rootless:
+  `~/volumes/NAME`, through fusermount3). With `--from`, every node copies its share of the network storage at once
+  and reads the rest from the others; until then, and when a node is offline, from the storage. `volume cp` copies
+  files in (2 copies of each chunk by default) and out, from any node, a laptop too; `volume rm` removes them;
+  `volume list` shows the progress; `volume delete` removes the volume everywhere. In a simulated cluster (storage
+  limited to 1 Gbit/s, three nodes) an epoch over 5 GB took 45 s from the storage; the nodes had copied the data after
+  about 70 s, after which an epoch took 1-2 s (bounded by that machine's RAM, not by a real cluster's disks).
+- **User rights for volumes:** only a user that could log in to the volume's nodes by SSH works with it; its files
+  belong to its account there and keep their mode, which the mount enforces; it replaces and removes only its own
+  files, copies in only what it can read and copies out only what it may read. The daemon handles the user's local
+  files with the user's own rights (no sudo needed for `cp` and `rm`).
+- The daemon raises its limit of open files (to the hard limit).
+
 ## [0.33.1] - 2026-11-14
 
 Fixes from a security audit: the share server asks who is fetching, a node that is online keeps its name, and
