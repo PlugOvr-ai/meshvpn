@@ -738,6 +738,13 @@ pub fn upload(
         tar.arg("-cf").arg("-");
         for s in sources {
             let (parent, name) = split_path(s);
+            // A name that starts with `-` would be an option to tar (and some of them run
+            // commands): as `./-name` it is a file.
+            let name = if name.starts_with('-') {
+                format!("./{name}")
+            } else {
+                name
+            };
             tar.arg("-C").arg(parent).arg(name);
         }
         let child = tar.stdout(Stdio::piped()).stderr(Stdio::null()).spawn();

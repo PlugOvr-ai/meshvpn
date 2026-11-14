@@ -57,6 +57,11 @@ pub(crate) fn is_public(ip: Ipv4Addr) -> bool {
         || (a == 100 && b & 0xc0 == 64) // shared / CGNAT, the mesh
         || (a == 192 && b == 0)
         || (a == 198 && (b & 0xfe) == 18) // benchmarking
+        // Cloud providers' own services for their machines, in public ranges: Azure's
+        // WireServer, IBM Cloud's service network.
+        || ip == Ipv4Addr::new(168, 63, 129, 16)
+        || (a == 161 && b == 26)
+        || (a == 166 && (b & 0xfc) == 8)
         || a >= 240)
 }
 
@@ -445,7 +450,17 @@ mod tests {
 
     #[test]
     fn exits_only_reach_the_internet() {
-        for ip in ["1.1.1.1", "8.8.8.8", "140.82.112.3", "100.63.0.1", "100.128.0.1"] {
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "140.82.112.3",
+            "100.63.0.1",
+            "100.128.0.1",
+            "168.63.129.17",
+            "161.27.0.1",
+            "166.7.255.255",
+            "166.12.0.1",
+        ] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
         for ip in [
@@ -462,6 +477,11 @@ mod tests {
             "192.0.2.1",
             "198.18.0.1",
             "240.0.0.1",
+            // What clouds answer their machines on: Azure, IBM.
+            "168.63.129.16",
+            "161.26.0.10",
+            "166.8.0.1",
+            "166.11.255.255",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }

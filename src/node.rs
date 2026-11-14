@@ -264,6 +264,30 @@ struct Backoff {
     delay: Duration,
 }
 
+/// A node that publishes a name, for `name_holder`.
+struct NameWanted<K> {
+    id: NodeId,
+    /// A user's computer, admitted for a time.
+    client: bool,
+    /// Online, or not offline for long enough to lose its name.
+    present: bool,
+    online: bool,
+    /// Who gets a free name: the smallest.
+    rank: K,
+}
+
+/// Who has a name that `wanting` publish; `held`: who had it so far. See `Node::settle_names`.
+fn name_holder<K: Ord>(held: Option<NodeId>, wanting: &[NameWanted<K>]) -> Option<NodeId> {
+    // A client only where no node publishes the name.
+    let nodes = wanting.iter().any(|w| !w.client);
+    let wanting = || wanting.iter().filter(move |w| w.client != nodes);
+    let keeps = held.filter(|h| {
+        wanting().any(|w| w.id == *h && w.present) || (wanting().any(|w| w.id == *h) && !wanting().any(|w| w.online))
+    });
+    // Only one that is online gets a name: one we merely know of may be long gone.
+    keeps.or_else(|| wanting().filter(|w| w.online).min_by_key(|w| &w.rank).map(|w| w.id))
+}
+
 #[derive(Default)]
 struct State {
     records: HashMap<NodeId, Record>,
@@ -400,6 +424,19 @@ struct State {
     trusted_admins: Vec<NodeId>,
     /// Open network: rosters of other nodes not confirmed here yet (signer -> roster).
     pending_rosters: HashMap<NodeId, (SignedDoc, Roster, Instant)>,
+    /// Rosters signed by nobody whose word counts here (signer -> roster): one applies when an
+    /// admin known here gives its word for it (`Endorsement`).
+    held_rosters: HashMap<NodeId, (SignedDoc, Roster)>,
+    /// Admins' words for a roster another admin signed, the newest per admin: for the roster
+    /// we have, or a later one.
+    endorsements: HashMap<NodeId, (SignedDoc, Endorsement)>,
+    /// blake3 of the roster's signed text (what endorsements name).
+    roster_hash: String,
+    /// This node joined with an admin's invite: the network is managed, also while its roster
+    /// isn't here yet.
+    invited: bool,
+    /// Members that turned this node away as not admitted (name, when): they have other admins.
+    other_admins: HashMap<NodeId, Instant>,
     my_claim: Option<ClaimMsg>,
     /// Why another node turned us away (name of that node, reason), until we are admitted.
     rejected: Option<(String, String)>,
@@ -422,6 +459,8 @@ struct State {
     punch_since: HashMap<NodeId, Instant>,
     /// Open invites that may be joined through hole punching (see `join`).
     join_slots: Vec<crate::config::JoinSlot>,
+    /// Which node has each name (see `settle_names`).
+    name_holders: HashMap<String, NodeId>,
     rendezvous: rendezvous::RendezvousState,
 }
 
@@ -739,9 +778,14 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         st.trusted_admins = node.cfg.trusted_admins.clone();
         st.leases = saved.leases.clone();
         st.join_slots = saved.join_slots.clone();
+        st.name_holders = saved.name_holders.clone().into_iter().collect();
         st.my_claim = node.own_claim();
+        st.invited = node.cfg.ticket.is_some() || node.cfg.claim.is_some();
         if let Some(r) = saved.roster.clone() {
             node.restore_roster(&mut st, r);
+        }
+        for e in saved.endorsements.clone() {
+            node.keep_endorsement(&mut st, e);
         }
         for c in saved.claims.clone() {
             if let Err(e) = node.accept_claim(&mut st, c) {
@@ -851,6 +895,19 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
     }
     node.ssh_check();
     tokio::spawn(node.clone().tick_loop());
+    // A panic while the state is locked leaves the lock poisoned: every task that takes it
+    // afterwards panics too, and the process would stay around doing nothing. It ends instead,
+    // so that the service manager starts a fresh one.
+    let n = node.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if n.state.is_poisoned() {
+                tracing::error!("an internal error left the node's state unusable: ending (the service restarts it)");
+                std::process::exit(101);
+            }
+        }
+    });
     let n = node.clone();
     tokio::spawn(async move {
         loop {
@@ -2732,14 +2789,50 @@ impl Node {
         })
     }
 
+    /// Who has each name (for `name_rank`). The node that has a name keeps it while it is online,
+    /// whatever another node publishes (a newer record, an earlier admission); once it is
+    /// offline, the name goes to one of that name that is online - so a machine set up again
+    /// gets its name back from its old identity. A client (a user's computer) has a name only
+    /// while no node publishes it.
+    fn settle_names(&self, st: &mut State) {
+        let mut by_name: HashMap<&str, Vec<&Record>> = HashMap::new();
+        for r in st.records.values() {
+            by_name.entry(&r.info.name).or_default().push(r);
+        }
+        let mut holders = HashMap::with_capacity(by_name.len());
+        for (name, recs) in by_name {
+            let wanting: Vec<NameWanted<_>> = recs
+                .iter()
+                .map(|r| NameWanted {
+                    id: r.info.id,
+                    client: Self::client_of(st, &r.info.id).is_some(),
+                    // After a start nobody is online yet: `offline_for` counts from the start
+                    // then, so the node that has the name has the same time to show up as it
+                    // has after its last sign of life.
+                    present: self.offline_for(st, &r.info.id).is_none_or(|d| d.is_zero()),
+                    online: self.is_online(st, &r.info.id),
+                    rank: self.new_holder_rank(st, r),
+                })
+                .collect();
+            if let Some(h) = name_holder(st.name_holders.get(name).copied(), &wanting) {
+                holders.insert(name.to_string(), h);
+            }
+        }
+        st.name_holders = holders;
+    }
+
     /// A machine that was set up again leaves its old identity behind under the same name. In a
     /// managed network only for one admitted after the old identity's last record (a reinstall
     /// joins anew): an existing member taking the name of one that is offline doesn't count.
+    ///
+    /// Nodes and clients (users' computers) apart: a client that is online never makes the
+    /// others forget a node of its name.
     fn auto_forget(&self, st: &mut State) {
         let me = st.my_name.clone();
         let managed = Self::managed(st);
-        let mut newest: HashMap<&str, u64> = HashMap::new();
-        newest.insert(&me, u64::MAX);
+        let client = |id: &NodeId| Self::client_of(st, id).is_some();
+        let mut newest: HashMap<(&str, bool), u64> = HashMap::new();
+        newest.insert((&me, client(&self.ident.id)), u64::MAX);
         for r in st.records.values() {
             if self.is_online(st, &r.info.id) {
                 let since = if managed {
@@ -2747,14 +2840,18 @@ impl Node {
                 } else {
                     r.info.seq
                 };
-                let e = newest.entry(&r.info.name).or_default();
+                let e = newest.entry((&r.info.name, client(&r.info.id))).or_default();
                 *e = (*e).max(since);
             }
         }
         let stale: Vec<NodeId> = st
             .records
             .values()
-            .filter(|r| newest.get(r.info.name.as_str()).is_some_and(|&s| s > r.info.seq))
+            .filter(|r| {
+                newest
+                    .get(&(r.info.name.as_str(), client(&r.info.id)))
+                    .is_some_and(|&s| s > r.info.seq)
+            })
             .filter(|r| self.offline_for(st, &r.info.id).is_some_and(|d| d > AUTO_FORGET_AFTER))
             .map(|r| r.info.id)
             .collect();
@@ -3203,10 +3300,14 @@ impl Node {
 
     /// Mesh address of `host` (`name`, `name.mesh` or a mesh IP); None if it isn't in the mesh.
     pub fn resolve(&self, host: &str) -> Option<Ipv4Addr> {
-        let h = host.trim_end_matches('.').to_lowercase();
-        let h = crate::networks::strip_suffix(&self.dir, &h);
+        let full = host.trim_end_matches('.').to_lowercase();
+        let h = crate::networks::strip_suffix(&self.dir, &full);
         if let Ok(ip) = h.parse::<Ipv4Addr>() {
             return is_overlay(IpAddr::V4(ip)).then_some(ip);
+        }
+        // `localhost`, `wpad`: never a node by the plain name (`wpad.mesh` is one).
+        if h.len() == full.len() && crate::hosts::reserved(h) {
+            return None;
         }
         let st = self.state.lock().unwrap();
         if h == st.my_name {
@@ -3483,6 +3584,8 @@ impl Node {
                 unwanted_since: None,
             };
             st.links.insert(peer, entry);
+            // Said again right away if it still holds (the peer's roster comes first).
+            st.other_admins.remove(&peer);
             self.ingest(&mut st, hello.info.clone(), true);
             if let Some(core) = hello.core.clone()
                 && core.peek().is_some_and(|(id, _)| id == peer)
@@ -3564,7 +3667,7 @@ impl Node {
                 T_MEASURE => {}
                 T_WHY => self.handle_why(peer, payload),
                 T_WHY_REPLY => self.handle_why_reply(peer, payload),
-                T_ROSTER | T_CLAIM => {
+                T_ROSTER | T_CLAIM | T_ENDORSE => {
                     self.dispatch_admin(kind, peer, payload);
                 }
                 T_DOC => self.handle_doc(peer, payload),
@@ -3584,6 +3687,12 @@ impl Node {
                         .unwrap_or(peer.short());
                     warn!("{by} turned this node away: {why}");
                     st.rejected = Some((by, why.clone()));
+                    // A member that doesn't count this node as one: its list of admins is another.
+                    if Self::managed(&st)
+                        && (why.starts_with("this network is managed") || why.contains("not issued by an admin"))
+                    {
+                        self.note_other_admins(&mut st, peer);
+                    }
                     break format!("turned away: {why}");
                 }
                 T_BENCH_START => {
@@ -3922,6 +4031,12 @@ impl Node {
                 details_rate.retain(|id, _| records.contains_key(id));
                 self.expire_leases(&mut st);
                 self.expire_clients(&mut st);
+                // An admin's word for the roster it didn't sign (also after an update from a
+                // version without it).
+                if let Some(f) = self.endorse_roster(&mut st) {
+                    self.broadcast(&st, &f, None);
+                }
+                st.other_admins.retain(|_, at| at.elapsed() < Duration::from_secs(3600));
                 self.auto_forget(&mut st);
                 self.rebuild(&mut st);
                 st.structural = if self.on_demand(&st) {
@@ -3982,10 +4097,12 @@ impl Node {
             forgotten: st.forgotten.values().cloned().collect(),
             rotation: st.rotation.as_ref().map(|(r, _)| r.clone()),
             roster: st.roster.as_ref().map(|(r, _)| r.clone()),
+            endorsements: st.endorsements.values().map(|(d, _)| d.clone()).collect(),
             claims: st.claims.values().map(|a| a.msg.clone()).collect(),
             leases: st.leases.clone(),
             docs: st.docs.values().map(|(_, s)| s.clone()).collect(),
             join_slots: st.join_slots.clone(),
+            name_holders: st.name_holders.clone().into_iter().collect(),
             ip_index: st.next_ip_index,
             burned_ips: st.burned_ips.iter().copied().collect(),
         };
@@ -4030,6 +4147,7 @@ impl Node {
             let plain = match (self.cfg.manage_hosts, suffix.strip_suffix(".mesh")) {
                 (false, _) => String::new(),
                 (true, Some(net)) => format!(",{name}.{net}"),
+                (true, None) if crate::hosts::reserved(&name) => String::new(),
                 (true, None) => format!(",{name}"),
             };
             let id = if ip == self.my_ip {
@@ -4195,6 +4313,7 @@ impl Node {
     }
 
     fn update_hosts(&self) {
+        self.settle_names(&mut self.state.lock().unwrap());
         self.update_known_hosts();
         if !self.cfg.manage_hosts {
             return;
@@ -4322,6 +4441,14 @@ impl Node {
                          sudo meshvpn admin trust {n}"
                     ));
                 }
+                for id in st.other_admins.keys().filter(|id| self.is_online(&st, id)) {
+                    let n = st.records.get(id).map_or_else(|| id.short(), |r| r.info.name.clone());
+                    w.push(format!(
+                        "{n} has another list of admins than this node (the admins changed while one of the \
+                         two was away). Join the one that is wrong again with a new invite: \
+                         sudo meshvpn join --force <invite>"
+                    ));
+                }
                 for (ip, owners) in &st.ip_conflicts {
                     let names: Vec<String> = owners
                         .iter()
@@ -4358,11 +4485,14 @@ impl Node {
             },
             exit_offer: st.exit_offer,
             exit_via: self.exit_status(&st).0,
+            // Before the roster is here: the admins the invite named.
             admins: st
                 .roster
                 .as_ref()
-                .map(|(_, r)| {
-                    r.admins
+                .map(|(_, r)| r.admins.as_slice())
+                .or_else(|| st.invited.then_some(st.trusted_admins.as_slice()))
+                .map(|admins| {
+                    admins
                         .iter()
                         .filter(|id| !st.banned.contains_key(id))
                         .map(|id| {
@@ -4965,6 +5095,46 @@ impl Node {
         let mut keys: Vec<(u32, [u8; 32])> = st.keys.iter().map(|(v, k)| (*v, *k)).collect();
         keys.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
         keys.into_iter().map(|(_, k)| k).collect()
+    }
+
+    /// The stored network keys with their versions.
+    pub fn network_key_versions(&self) -> Vec<(u32, [u8; 32])> {
+        let st = self.state.lock().unwrap();
+        st.keys.iter().map(|(v, k)| (*v, *k)).collect()
+    }
+
+    fn share_hello_bytes(&self, nonce: &[u8; 32]) -> Vec<u8> {
+        let mut m = format!("meshvpn share hello v1\n{}\n", self.net).into_bytes();
+        m.extend_from_slice(nonce);
+        m
+    }
+
+    /// What this node answers a share server's nonce with: its id and its signature.
+    pub fn share_proof(&self, nonce: &[u8; 32]) -> (NodeId, String) {
+        (
+            self.ident.id,
+            crate::keys::b64(&self.ident.sign(&self.share_hello_bytes(nonce))),
+        )
+    }
+
+    /// May the share client that proved a network key of `version` and signed our `nonce` as
+    /// node `id` fetch here? What a link asks of a node too: not banned, admitted, and with
+    /// an old key only if the new one was sealed for it.
+    pub fn share_admits(&self, id: &NodeId, version: u32, nonce: &[u8; 32], sig: &str) -> bool {
+        let Ok(sig) = crate::keys::unb64(sig) else {
+            return false;
+        };
+        if crate::keys::verify(id, &self.share_hello_bytes(nonce), &sig).is_err() {
+            return false;
+        }
+        let st = self.state.lock().unwrap();
+        *id == self.ident.id
+            || (Self::admitted(&st, id)
+                && (version >= st.key_version
+                    || st
+                        .rotation
+                        .as_ref()
+                        .is_some_and(|(_, r)| r.envelopes.iter().any(|e| e.to == *id))))
     }
 
     /// In userspace mode, connections into the mesh go through our own SOCKS proxy.
@@ -5621,6 +5791,69 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_node_that_is_online_keeps_its_name() {
+        let id = |n: u8| crate::keys::Key32([n; 32]);
+        let (old, new, laptop) = (id(1), id(2), id(3));
+        let w = |id, client, present, online, rank: u8| NameWanted {
+            id,
+            client,
+            present,
+            online,
+            rank,
+        };
+        let node = |id, online, rank| w(id, false, online, online, rank);
+        // Nobody has the name yet: the best of those online.
+        assert_eq!(name_holder(None, &[node(old, true, 1), node(new, true, 0)]), Some(new));
+        assert_eq!(name_holder(None, &[node(old, false, 0), node(new, true, 1)]), Some(new));
+        // Nobody online: nobody gets it (the order of `name_rank` decides what is shown).
+        assert_eq!(name_holder(None, &[node(old, false, 0), node(new, false, 1)]), None);
+        // The one that has it keeps it against a better rank (a newer record, an earlier
+        // admission) while it is online...
+        assert_eq!(
+            name_holder(Some(old), &[node(old, true, 1), node(new, true, 0)]),
+            Some(old)
+        );
+        // ...and for as long as nobody else of that name is online...
+        assert_eq!(
+            name_holder(Some(old), &[node(old, false, 1), node(new, false, 0)]),
+            Some(old)
+        );
+        // ...and while it is not yet offline for long (this node just started).
+        assert_eq!(
+            name_holder(Some(old), &[w(old, false, true, false, 1), node(new, true, 0)]),
+            Some(old)
+        );
+        // Offline: the machine set up again gets the name, and keeps it should the old one
+        // come back.
+        assert_eq!(
+            name_holder(Some(old), &[node(old, false, 0), node(new, true, 1)]),
+            Some(new)
+        );
+        assert_eq!(
+            name_holder(Some(new), &[node(old, true, 0), node(new, true, 1)]),
+            Some(new)
+        );
+        // It no longer publishes the name: the name is free.
+        assert_eq!(name_holder(Some(old), &[node(new, true, 0)]), Some(new));
+        assert_eq!(name_holder::<u8>(Some(old), &[]), None);
+        // A client never has a name a node publishes, online or not - not even one it had.
+        let client = |online| w(laptop, true, online, online, 0);
+        assert_eq!(name_holder(None, &[client(true), node(old, false, 1)]), None);
+        assert_eq!(name_holder(Some(laptop), &[client(true), node(old, false, 1)]), None);
+        assert_eq!(
+            name_holder(Some(laptop), &[client(true), node(old, true, 1)]),
+            Some(old)
+        );
+        assert_eq!(name_holder(Some(old), &[client(true), node(old, false, 1)]), Some(old));
+        // Among clients as among nodes.
+        assert_eq!(name_holder(None, &[client(true)]), Some(laptop));
+        assert_eq!(
+            name_holder(Some(laptop), &[client(true), w(new, true, true, true, 0)]),
+            Some(laptop)
+        );
+    }
 
     #[test]
     fn blocks_of_several_networks() {

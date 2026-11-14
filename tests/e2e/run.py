@@ -493,6 +493,67 @@ def test_admin_invites(lab):
 
 
 @test
+def test_admin_changes(lab):
+    """The admins changed since an invite was made, or while a node was away: the node takes the
+    list that an admin it knows gives its word for, whoever signed it. Two lists of admins (they
+    changed on both sides of a split) are reported, and joining again settles it."""
+    net, (hub, b, c, s) = mesh(lab, ["hub", "b", "c", "s"])
+    version = lambda n: n.mvj("admin status").get("version")  # noqa: E731
+    v = version(hub)
+    wait(lambda: version(s) == v and s.online("b") and s.online("c"), "s has the list and knows the others")
+    old = invite(hub, "--uses 3")  # names hub as the only admin
+    s.stop()
+    hub.mv("admin add b")
+    wait(lambda: b.mvj("admin status")["this_node_is_admin"], "b is admin", 20)
+    b.mv("admin add c")  # signed by b
+    wait(lambda: version(hub) == v + 2 and c.mvj("admin status")["this_node_is_admin"], "c is admin", 20)
+    # A new node with the invite from before: its admin (hub) didn't sign the list in force.
+    n1 = lab.node("n1", [net])
+    n1.mv(f"join {old} --name n1")
+    n1.up()
+    wait(lambda: hub.online("n1") and version(n1) == v + 2, "n1 has the list b signed", 40)
+    check(n1.mv("invite", ok=False).returncode != 0, "a member could invite")
+    # A node that was away for both changes: the list it has knows hub only.
+    s.up()
+    wait(lambda: version(s) == v + 2, "s has the list b signed", 40)
+    # The list in force signed by a node that is no admin any more (it removed itself).
+    b.mv("admin rm b")
+    wait(lambda: version(c) == v + 3 and version(hub) == v + 3, "b is no admin", 20)
+    n2 = lab.node("n2", [net])
+    n2.mv(f"join {invite(c)} --name n2")
+    n2.up()
+    wait(lambda: hub.online("n2") and version(n2) == v + 3, "n2 has the list b signed last", 40)
+    st = n2.mvj("admin status")
+    check(sorted(st["admins"]) == ["c", "hub"] and not st["this_node_is_admin"], f"n2's admins: {st}")
+    check(n2.mv("admin enable", ok=False).returncode != 0, "admin enable in a managed network")
+    for n in (hub, c, s, n1, n2):
+        check("another list" not in str(n.status()["warnings"]), f"{n.name}: {n.status()['warnings']}")
+    # Two lists: hub removes c while c is away, and c - alone - changes the admins too.
+    others = [hub, b, s, n1, n2]
+    c.stop()
+    hub.mv("admin rm c")
+    wait(lambda: all(version(n) == v + 4 for n in others), "c is no admin for the others", 30)
+    for n in others:
+        n.stop()
+    c.up()
+    c.mv("admin add s")
+    check(version(c) == v + 4, "c has its own list")
+    for n in others:
+        n.up()
+    wait(lambda: "c has another list of admins" in str(hub.status()["warnings"]), "hub reports c's list", 60)
+    wait(lambda: "has another list of admins" in str(c.status()["warnings"]), "c reports the others' list", 60)
+    check(hub.mvj("admin status")["admins"] == ["hub"], "hub keeps its list")
+    # c joins again with an invite of the admin that is right.
+    c.stop()
+    c.mv(f"join --force {invite(hub)} --name c")
+    c.up()
+    wait(lambda: hub.online("c") and c.mvj("admin status")["admins"] == ["hub"], "c has hub's list", 40)
+    # c is a new node now; the one it was counts as online for a moment longer.
+    wait(lambda: "another list" not in str(hub.status()["warnings"]) and "another list" not in str(c.status()["warnings"]),
+         "no warning any more", 150)
+
+
+@test
 def test_admin_trust(lab):
     """Open network: admin enable on one node doesn't make it everyone's admin; each other node
     applies it once its owner confirms (admin trust). A restarted node keeps a roster that
@@ -692,6 +753,69 @@ def test_forget(lab):
 
 
 @test
+def test_names(lab):
+    """Who has a name: a node that is online keeps it, a client never gets a node's, a machine set up again gets its own back; wpad never goes in as a plain name."""
+    net, (hub, x, gpu1) = mesh(lab, ["hub", "x", "gpu1"])
+
+    def named(n, name):
+        """The IPv4 address `name` has in n's /etc/hosts."""
+        for line in n.sh("cat /etc/hosts").splitlines():
+            f = line.split()
+            if len(f) > 1 and "." in f[0] and name in f[1:]:
+                return f[0]
+        return None
+
+    def online(n, ip):
+        return any(p["ip"] == ip and p["online"] for p in n.status()["peers"])
+
+    ip1, ipx = gpu1.ip(), x.ip()
+    wait(lambda: named(hub, "gpu1") == ip1, "gpu1 by name", 30)
+    # Another node (admitted before gpu1, and with a newer record) calls itself gpu1 too
+    # (`meshvpn rename` refuses a name that is taken; its configuration doesn't).
+    p = x.mv("rename gpu1", ok=False)
+    check("already called gpu1" in p.stdout + p.stderr, "rename to a name that is taken")
+    x.stop()
+    x.sh("sed -i 's/^name = \"x\"/name = \"gpu1\"/' /etc/meshvpn/config.toml")
+    x.up()
+    wait(lambda: any(f[0] == ipx and f[-1].startswith("gpu1-") for f in map(str.split, hub.sh("cat /etc/hosts").splitlines()) if f),
+         "the second gpu1 is known by name and id", 30)
+    time.sleep(12)
+    check(named(hub, "gpu1") == ip1 and named(hub, "gpu1.mesh") == ip1, f"an online node lost its name: {hub.sh('cat /etc/hosts')}")
+    x.stop()
+    x.sh("sed -i 's/^name = \"gpu1\"/name = \"x\"/' /etc/meshvpn/config.toml")
+    x.up()
+    wait(lambda: named(hub, "x") == ipx, "x has its name back", 30)
+    # A user's computer of that name.
+    laptop = lab.node("laptop", [net])
+    laptop.mv(f"join {hub.mvj('invite --client alice --client-for 10m')['invite']} --name gpu1")
+    laptop.up()
+    ipl = laptop.ip()
+    wait(lambda: online(hub, ipl), "the client is in", 40)
+    check(named(hub, "gpu1") == ip1, "a client took an online node's name")
+    # The node goes offline: the client still doesn't get the name...
+    gpu1.stop()
+    wait(lambda: not online(hub, ip1), "gpu1 offline", 150)
+    time.sleep(12)
+    check(named(hub, "gpu1") == ip1 and online(hub, ipl), f"a client took an offline node's name: {hub.sh('cat /etc/hosts')}")
+    # ...but the machine set up again does (a new identity, the same name).
+    again = lab.node("gpu1new", [net])
+    again.mv(f"join {invite(hub)} --name gpu1")
+    again.up()
+    ip2 = again.ip()
+    wait(lambda: named(hub, "gpu1") == ip2, "the machine set up again has its name", 60)
+    # It has the name now: the old identity coming back doesn't take it (though admitted first).
+    gpu1.up()
+    wait(lambda: online(hub, ip1), "the old gpu1 is back", 60)
+    time.sleep(12)
+    check(named(hub, "gpu1") == ip2, f"the name went back to the old identity: {hub.sh('cat /etc/hosts')}")
+    # Names that programs look up on their own: with .mesh only, on every node.
+    x.mv("rename wpad")
+    wait(lambda: named(hub, "wpad.mesh") == ipx and named(x, "wpad.mesh") == ipx, "wpad.mesh is known", 30)
+    check(named(hub, "wpad") is None and named(x, "wpad") is None, f"wpad as a plain name: {hub.sh('cat /etc/hosts')}")
+    check(ping(hub, "wpad.mesh"), "wpad.mesh doesn't answer")
+
+
+@test
 def test_clients(lab):
     """A user's computer joins as a client for a time: reaches the nodes, relays nothing, is dropped when its time is up, renews."""
     net, (hub, a) = mesh(lab, ["hub", "a"])
@@ -702,6 +826,12 @@ def test_clients(lab):
     laptop.up()
     wait(lambda: hub.online("alice-laptop") and a.online("alice-laptop"), "the client is in", 40)
     check(ping(laptop, "a.mesh"), "the client reaches a")
+    # While it is in, it fetches what the nodes share.
+    a.sh("mkdir -p /data/ds && head -c 300000 /dev/urandom > /data/ds/f")
+    oid = a.mvj("share /data/ds")["id"]
+    wait(lambda: any(o["id"] == oid for o in laptop.mvj("objects")), "the client sees the object", 30)
+    laptop.mvj(f"fetch {oid} /srv")
+    check(sha(laptop, "/srv/ds") == sha(a, "/data/ds"), "the client's fetch")
     check("(client: alice)" in hub.mv("status"), "status marks the client")
     st = laptop.status()
     check(st["client"]["user"] == "alice", f"the client knows it is one: {st.get('client')}")
@@ -709,6 +839,10 @@ def test_clients(lab):
     # Its time is up: every node drops it, and it can't reach anyone.
     wait(lambda: not hub.online("alice-laptop") and not a.online("alice-laptop"), "the client is dropped when its time is up", 120)
     check(not ping(laptop, "a.mesh", count=1), "an expired client still reaches a")
+    # It still has the network key, and a is on its LAN: the key alone opens nothing.
+    p = laptop.mv(f"fetch {oid} /srv2", ok=False, timeout=120)
+    check(p.returncode != 0 and laptop.sh("ls /srv2/ds 2>/dev/null | wc -l").strip() == "0",
+          f"an expired client fetched a shared object: {p.stdout}{p.stderr}")
     check("renew" in laptop.mv("status"), "the client is told to renew")
     # Renewal: a new client invite for the same computer, same identity.
     old_id = laptop.status()["id"]

@@ -153,6 +153,12 @@ async fn expected_sum(client: &reqwest::Client, repo: &str, tag: &str, name: &st
         return signed_sum(&String::from_utf8_lossy(&sums), name)
             .ok_or_else(|| anyhow!("{name} is not in the release's signed checksums"));
     }
+    // meshvpn's own releases from before the signatures are never installed: such a release's
+    // checksum file proves nothing (who can change the release can change the file too). An
+    // extension's releases have their own version numbers.
+    if repo == REPO {
+        bail!("release {tag} is older than the first signed one ({SIGNED_FROM}) - not installing");
+    }
     let sums = get(format!("{base}/{name}.sha256")).await?;
     Ok(String::from_utf8_lossy(&sums)
         .split_whitespace()

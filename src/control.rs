@@ -207,7 +207,13 @@ async fn serve_unix(node: Arc<Node>, path: PathBuf) {
     };
     crate::sys::set_mode(&path, 0o666).ok();
     let me = unsafe { libc::geteuid() };
-    while let Ok((stream, _)) = listener.accept().await {
+    loop {
+        // An error here is mostly "too many open files": that passes, and ending the loop
+        // would leave the daemon deaf to `meshvpn` until it is restarted.
+        let Ok((stream, _)) = listener.accept().await else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        };
         let cred = stream.peer_cred().ok();
         let caller = crate::ext::Caller {
             privileged: cred.is_some_and(|c| c.uid() == 0 || c.uid() == me),

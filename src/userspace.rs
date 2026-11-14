@@ -612,7 +612,12 @@ pub async fn socks_server(node: Arc<Node>, stack: StackTx, listen: String) {
         }
     };
     info!("userspace mode: reach the mesh through socks5h://{listen}");
-    while let Ok((client, _)) = listener.accept().await {
+    loop {
+        // An error is mostly "too many open files", and that passes.
+        let Ok((client, _)) = listener.accept().await else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        };
         let (node, stack) = (node.clone(), stack.clone());
         tokio::spawn(async move {
             if let Err(e) = socks_client(client, &node, &stack).await {

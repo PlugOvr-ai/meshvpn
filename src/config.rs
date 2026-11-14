@@ -584,6 +584,9 @@ pub struct SavedState {
     /// Managed networks: the admin roster and the admissions of invited nodes.
     #[serde(default)]
     pub roster: Option<crate::proto::SignedDoc>,
+    /// The other admins' words for that roster (`proto::Endorsement`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endorsements: Vec<crate::proto::SignedDoc>,
     #[serde(default)]
     pub claims: Vec<crate::proto::ClaimMsg>,
     /// GPU reservations on this node.
@@ -595,6 +598,10 @@ pub struct SavedState {
     /// Open invites that may be joined through hole punching.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub join_slots: Vec<JoinSlot>,
+    /// Which node has each name: a node that is online keeps its name over a restart of this
+    /// one too.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub name_holders: std::collections::BTreeMap<String, crate::keys::NodeId>,
     /// The candidate address this node uses (`keys::overlay_ip_at`), from the next start on.
     #[serde(default)]
     pub ip_index: u8,

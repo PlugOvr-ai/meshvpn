@@ -22,7 +22,19 @@ pub async fn serve<S>(node: Arc<Node>, stream: S, peer: SocketAddr, local: Socke
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let attempts = Arc::new(Mutex::new(Attempts::default()));
+    let Some(slot) = Pending::take(peer.ip()) else {
+        debug!("ssh from {peer}: too many connections that have not logged in yet");
+        return;
+    };
+    let attempts = Arc::new(Mutex::new(Attempts {
+        pending: Some(slot),
+        ..Default::default()
+    }));
+    let stream = LoginDeadline {
+        inner: stream,
+        deadline: Box::pin(tokio::time::sleep(LOGIN_TIME)),
+        attempts: attempts.clone(),
+    };
     let handler = Conn {
         node: node.clone(),
         peer,
@@ -42,7 +54,8 @@ where
         Err(e) => debug!("ssh from {peer}: {e:#}"),
     }
     // A login that never succeeded: say why, once per connection (clients try several keys).
-    let a = attempts.lock().unwrap();
+    let mut a = attempts.lock().unwrap();
+    a.pending = None;
     if !a.ok && !a.users.is_empty() {
         let text = format!(
             "login as {} from {}: {}",
@@ -61,10 +74,101 @@ struct Attempts {
     ok: bool,
     users: Vec<String>,
     reasons: Vec<String>,
+    /// The connection's place among those that have not logged in (given back at the login).
+    pending: Option<Pending>,
+}
+
+/// How long a connection may take to log in (as sshd's LoginGraceTime).
+const LOGIN_TIME: Duration = Duration::from_secs(120);
+/// Connections that have not logged in yet: so many from one mesh address, so many in all.
+/// Each holds a descriptor of the daemon, and a node needs no login rule to open one.
+const PENDING_PER_PEER: u32 = 16;
+const PENDING_TOTAL: u32 = 256;
+
+static PENDING: Mutex<std::collections::BTreeMap<IpAddr, u32>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// One place among the connections that have not logged in yet.
+struct Pending(IpAddr);
+
+impl Pending {
+    fn take(ip: IpAddr) -> Option<Self> {
+        let mut p = PENDING.lock().unwrap();
+        if p.values().sum::<u32>() >= PENDING_TOTAL || p.get(&ip).is_some_and(|n| *n >= PENDING_PER_PEER) {
+            return None;
+        }
+        *p.entry(ip).or_default() += 1;
+        Some(Pending(ip))
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut p = PENDING.lock().unwrap();
+        if let Some(n) = p.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                p.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// The connection until the login: reading fails once `LOGIN_TIME` is over without one, which
+/// ends the session (a client that says nothing would otherwise stay for good).
+struct LoginDeadline<S> {
+    inner: S,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    attempts: Arc<Mutex<Attempts>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for LoginDeadline<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if !this.attempts.lock().unwrap().ok && this.deadline.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no login in time",
+            )));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for LoginDeadline<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 impl Attempts {
     fn note(&mut self, user: &str, reason: String) {
+        // The name is the client's choice and ends up in the log, in `doctor` and in MCP
+        // results: only one that could be an account's name is repeated there.
+        let user = if crate::proto::valid_user(user) {
+            user
+        } else {
+            "(invalid name)"
+        };
         if !self.users.iter().any(|u| u == user) {
             self.users.push(user.to_string());
         }
@@ -455,16 +559,24 @@ impl Conn {
 impl russh::server::Handler for Conn {
     type Error = anyhow::Error;
 
-    async fn auth_publickey_offered(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        Ok(if self.allowed(user, key).is_some() {
+    async fn auth_publickey_offered(
+        &mut self,
+        user: &str,
+        key: russh::server::PublicKeyOffer<'_>,
+    ) -> Result<Auth, Self::Error> {
+        Ok(if self.allowed(user, key.public_key).is_some() {
             Auth::Accept
         } else {
             Auth::reject()
         })
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        let Some(who) = self.allowed(user, key) else {
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: russh::server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        let Some(who) = self.allowed(user, key.public_key) else {
             return Ok(Auth::reject());
         };
         let Some(acct) = account_for(user) else {
@@ -476,7 +588,11 @@ impl russh::server::Handler for Conn {
             self.attempts.lock().unwrap().note(user, why);
             return Ok(Auth::reject());
         };
-        self.attempts.lock().unwrap().ok = true;
+        {
+            let mut a = self.attempts.lock().unwrap();
+            a.ok = true;
+            a.pending = None;
+        }
         info!("ssh: {who} logged in as {user}");
         self.who = who;
         self.account = Some(acct);

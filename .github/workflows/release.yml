@@ -323,7 +323,7 @@ jobs:
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo sh -s -- --desktop mate join mesh1-...
           \`\`\`
 
-          **Without root** (for one user, in ~/.local): Xfce, MATE and the Chromium browser packed in one download, any Linux distribution, x86_64 and ARM64 (`--desktop mate` for MATE). Source: \`meshvpn-full-sources-*\`:
+          **Without root** (for one user, in ~/.local): Xfce, MATE and the Chromium browser packed in one download, any Linux distribution, x86_64 and ARM64 (\`--desktop mate\` for MATE). Source: \`meshvpn-full-sources-*\`:
 
           \`\`\`sh
           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh -s -- --user --desktop xfce join mesh1-...

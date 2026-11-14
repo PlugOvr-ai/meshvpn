@@ -1098,8 +1098,15 @@ fn real_main(cli: Cli) -> Result<i32> {
                     println!("{text}");
                 } else {
                     let v: serde_json::Value = serde_json::from_str(&text)?;
-                    if v["managed"] == true {
+                    if v["waiting_for_roster"] == true {
+                        println!(
+                            "managed network: this node joined with an admin's invite and waits for the list \
+                             of admins (it arrives from a member that is online). Until then, for this node:"
+                        );
+                    } else if v["managed"] == true {
                         println!("managed network (roster v{})", v["version"]);
+                    }
+                    if v["managed"] == true {
                         let admins: Vec<&str> = v["admins"]
                             .as_array()
                             .into_iter()

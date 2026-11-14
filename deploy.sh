@@ -146,15 +146,19 @@ rm -f ~/.meshvpn-deploy.pub
 \$SUDO cat /etc/meshvpn/ssh_key.pub > ~/.meshvpn-deploy.pub"
 dev_sudo "$@" || die "installing on $HOSTNAME_DEV failed"
 PUBKEY="$(dev 'cat ~/.meshvpn-deploy.pub; rm -f ~/.meshvpn-deploy.pub' "$@" </dev/null | tr -d '\r')"
+# Exactly one key, and only its type and body go into authorized_keys below: what the device
+# sends is not trusted (a second line would be a key of its own choice, without restrictions).
+KEY_BODY="$(printf '%s\n' "$PUBKEY" | awk '{print $2}')"
 case "$PUBKEY" in ssh-ed25519\ *) ;; *) die "could not read the device's key" ;; esac
+[ "$(printf '%s\n' "$PUBKEY" | wc -l)" -eq 1 ] || die "the device sent more than one line as its key"
+case "$KEY_BODY" in '' | *[!A-Za-z0-9+/=]*) die "the device's key is not a key" ;; esac
 
 # Let the device in here for port forwarding only: any command it tries just prints
 # meshvpn-ok, so a compromised device gets no shell on this machine. (It may still forward to
 # any address: the mesh endpoints it needs change, and permitopen takes no patterns for hosts.)
 mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
-KEY_BODY="$(echo "$PUBKEY" | awk '{print $2}')"
 if ! grep -qF "$KEY_BODY" ~/.ssh/authorized_keys; then
-    printf 'restrict,port-forwarding,command="echo meshvpn-ok" %s\n' "$PUBKEY" >>~/.ssh/authorized_keys
+    printf 'restrict,port-forwarding,command="echo meshvpn-ok" ssh-ed25519 %s meshvpn-device\n' "$KEY_BODY" >>~/.ssh/authorized_keys
     say "Authorized the device's key in ~/.ssh/authorized_keys (port forwarding only)."
 fi
 

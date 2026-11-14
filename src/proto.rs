@@ -44,6 +44,8 @@ pub const T_WANT_DETAILS: u8 = 23;
 /// `T_DIGEST` with liveness, to nodes that take details apart: (node id, seq, seconds since
 /// the sender last heard from that node, `u16::MAX` for never), 42 bytes each.
 pub const T_DIGEST2: u8 = 24;
+/// An admin's word for the roster (`Endorsement`), flooded and kept with the roster.
+pub const T_ENDORSE: u8 = 25;
 
 /// A JSON document signed by a node.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -78,6 +80,18 @@ pub struct Roster {
     pub members: Vec<NodeId>,
     pub issuer: NodeId,
     pub at: u64,
+}
+
+/// An admin's word for a roster that another admin signed. Every admin gives it for the roster in
+/// force. A node that knows this admin but not the signer - it joined with an invite from before
+/// the signer was admin, or missed the versions in between - takes the roster on it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Endorsement {
+    pub net: String,
+    pub version: u32,
+    /// blake3 of the roster's signed text (hex).
+    pub roster: String,
+    pub by: NodeId,
 }
 
 /// An invitation ticket, signed by an admin: good for `uses` new nodes until `expires`.

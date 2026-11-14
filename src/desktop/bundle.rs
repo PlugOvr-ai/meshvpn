@@ -567,10 +567,12 @@ pub fn setup(from: Option<&Path>) -> Result<Bundle> {
                 let client = crate::update::client(None)?;
                 // The bundle is published with meshvpn's own releases, also for builds with an
                 // extension (their releases elsewhere, their version number their own): those
-                // and development builds take the newest one.
+                // and builds that are no release (development, self-built: the version of the
+                // source tree, from before the signed releases) take the newest one.
                 let repo = crate::update::REPO;
                 let own = crate::ext::get().and_then(|e| e.version()).is_none();
-                let tag = if own && !crate::update::is_dev_build() {
+                let release = crate::update::at_least(env!("CARGO_PKG_VERSION"), crate::update::SIGNED_FROM);
+                let tag = if own && release && !crate::update::is_dev_build() {
                     format!("v{}", env!("CARGO_PKG_VERSION"))
                 } else {
                     crate::update::latest_tag_of(&client, repo).await?

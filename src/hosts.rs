@@ -13,10 +13,33 @@ const HOSTS: &str = r"C:\Windows\System32\drivers\etc\hosts";
 const BEGIN: &str = "# BEGIN meshvpn (managed automatically, do not edit)";
 const END: &str = "# END meshvpn";
 
+/// Names that mean this machine or that programs look up on their own (a browser asks `wpad`
+/// for its proxy): as a plain name they never point into the mesh, whatever a node calls
+/// itself. `wpad.mesh` is that node as any other.
+pub fn reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "localhost"
+            | "localhost4"
+            | "localhost6"
+            | "ip6-localhost"
+            | "ip6-loopback"
+            | "ip6-localnet"
+            | "ip6-mcastprefix"
+            | "ip6-allnodes"
+            | "ip6-allrouters"
+            | "broadcasthost"
+            | "wpad"
+            | "isatap"
+            | "metadata"
+    )
+}
+
 /// `suffix`: `mesh`, or `<network>.mesh` for a further network of this machine.
 fn names(name: &str, suffix: &str) -> String {
     match suffix.strip_suffix(".mesh") {
         Some(net) => format!("{name}.{suffix} {name}.{net}"),
+        None if reserved(name) => format!("{name}.{suffix}"),
         None => format!("{name}.{suffix} {name}"),
     }
 }
@@ -155,5 +178,29 @@ mod tests {
         // Its IPv4 address is another node's here: by name over IPv6 only.
         let out = render(&[e(None, v6)], "lab.mesh");
         assert_eq!(out, "fd12:3456:789a::1\tgpu1.lab.mesh gpu1.lab\n");
+    }
+
+    #[test]
+    fn some_names_never_point_into_the_mesh() {
+        let ip = Ipv4Addr::new(100, 64, 0, 9);
+        let e = |name: &str| Entry {
+            name: name.into(),
+            v4: Some(ip),
+            v6: None,
+            id: crate::keys::Key32([7; 32]),
+        };
+        for name in ["wpad", "localhost", "isatap", "metadata"] {
+            assert_eq!(render(&[e(name)], "mesh"), format!("100.64.0.9\t{name}.mesh\n"));
+            assert_eq!(
+                render_aliases(&[(name.to_string(), ip)], &HashSet::new(), "mesh"),
+                format!("100.64.0.9\t{name}.mesh\n")
+            );
+            // A further network's names all end in its name.
+            assert_eq!(
+                render(&[e(name)], "lab.mesh"),
+                format!("100.64.0.9\t{name}.lab.mesh {name}.lab\n")
+            );
+        }
+        assert_eq!(render(&[e("wpad2")], "mesh"), "100.64.0.9\twpad2.mesh wpad2\n");
     }
 }

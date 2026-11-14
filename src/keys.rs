@@ -26,7 +26,9 @@ impl Key32 {
         self.hex()[..8].to_string()
     }
     pub fn from_hex(s: &str) -> Result<Self> {
-        if s.len() != 64 {
+        // Only hex digits: the text may come from another node, and slicing it below must not
+        // cut a longer character in two (a panic), nor take "+f" for a byte.
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("expected 64 hex chars");
         }
         let mut out = [0u8; 32];
@@ -224,6 +226,19 @@ pub fn in_overlay(ip: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_hex_takes_only_hex_digits() {
+        // 64 bytes, but a two-byte character in them: must be an error, not a panic (this text
+        // comes from other nodes).
+        let bad = format!("a\u{e9}{}", "0".repeat(61));
+        assert_eq!(bad.len(), 64);
+        assert!(Key32::from_hex(&bad).is_err());
+        assert!(Key32::from_hex(&format!("+f{}", "0".repeat(62))).is_err());
+        assert!(serde_json::from_str::<Key32>(&format!("\"{bad}\"")).is_err());
+        let k = Key32(random32());
+        assert_eq!(Key32::from_hex(&k.hex()).unwrap(), k);
+    }
 
     #[test]
     fn overlay_ips_stay_in_cgnat_range() {

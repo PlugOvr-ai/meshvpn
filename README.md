@@ -565,7 +565,7 @@ same instructions automatically when they connect.
 | `meshvpn gpu reserve tag:gpu -n 2 [--for 2h] [--one]` | Reserve GPUs, so no other agent or job takes them: per node (all or nothing), or on the single best node. The node with the GPUs grants it, so reservations never collide. Prints `CUDA_VISIBLE_DEVICES`. Expires unless renewed (`gpu renew`), release with `gpu release`. Advisory, like Slurm without cgroups |
 | `meshvpn launch --gpus 4 tag:gpu -- torchrun ...` | Reserve 4 GPUs per node for the job, set `CUDA_VISIBLE_DEVICES` and `--nproc_per_node`, release them at the end (they expire 15 min after a crashed launcher) |
 | `sudo meshvpn share ./dataset` | Share a dataset or checkpoint (file or directory); prints its id |
-| `sudo meshvpn fetch <id> /data` | Download it **from all nodes that have it at once**, over LAN paths where possible. Every 4 MB chunk is verified, interrupted downloads resume, and the node serves the data afterwards, so each node speeds up the next ones |
+| `sudo meshvpn fetch <id> /data` | Download it **from all nodes that have it at once**, over LAN paths where possible. Every 4 MB chunk is verified, interrupted downloads resume, and the node serves the data afterwards, so each node speeds up the next ones. Only nodes that are members now are served (the network key alone opens nothing): to fetch from a node with 0.33.1 or newer, the fetching node needs 0.33.1 too |
 | `meshvpn objects` | Shared objects and which nodes have them |
 
 Notes: a LAN path counts only if the other node actually answers on its LAN address (Docker bridges, VPNs and similar
@@ -609,6 +609,11 @@ with the same invite is rejected, and so is a node that only has the network key
 The first member to see a new node countersigns its admission, so members that were offline at the time accept it later
 too. Rejected attempts show up as warnings in the admins' logs.
 
+The list of admins is signed by the admin that changed it last, and every other admin adds its word for it. A node
+takes a new list if an admin it knows signed it or gave its word: a new node knows the admins its invite named, a node
+that was away the admins of the list it has. So an invite keeps working after the admins changed, as long as one of the
+admins it named is still one (and runs 0.33.1 or later).
+
 Networks created before v0.7 (or with `init --open`) are **open**: everybody with the network key may invite and ban.
 Make one managed with `sudo meshvpn admin enable` on your main node. That node becomes the admin, every node known at
 that moment stays a member, and old invites stop working. Each other node applies this only once its owner confirms it
@@ -637,7 +642,7 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 | Rendezvous | Nodes with endpoints (and every node with global IPv6 addresses, for hole punching) put them into BitTorrent's Mainline DHT (BEP 44 mutable item, every 30 minutes and when they change): under a key and salt derived from the network key, the node id and the day; XChaCha20-Poly1305 with a key from the network key; signed by the node and dated (older than 75 minutes is ignored). After a put, the node looks its entry up itself and puts it again soon if a lookup still finds an older one. Nodes look up those they lost (every 2 minutes while they have no link or the node has been gone less than 15 minutes, 10 minutes otherwise, hourly for nodes gone for a day) and dial the addresses found first; for hole punching they use the newer of entry and record, all addresses at once. The DHT client never answers or stores anything for others. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
 | Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key bound to the network id). Relays can't read or forge traffic, and the inner source IP must match the sender. |
-| Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable); `<name>.<network>.mesh` for a further network of the machine. |
+| Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable); `<name>.<network>.mesh` for a further network of the machine. If several nodes publish the same name, one has it and the others are `<name>-<id>.mesh`: the node that has the name keeps it while it is online; once it is offline, a node of that name that is online gets it (a machine set up again takes over from its old identity, without anybody doing anything). A client (a user's computer, `invite --client`) never gets a name a node has, online or not. `localhost`, `wpad` and a few more names that programs look up on their own are entered with `.mesh` only. |
 
 Files: `/etc/meshvpn/config.toml` (settings and secret keys, mode 0600), `state.json` (known nodes) and `/run/meshvpn.sock`
 (control socket: anyone may ask for the status, but changes need root). Use `--dir` or `MESHVPN_DIR` to put them elsewhere, e.g. to run several nodes on one machine. A further network of the
@@ -654,10 +659,22 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
   member can do all of that. Members are trusted either way: they can reach each other's services and share data.
   Treat invite codes like passwords until they are used or expire. If two admins ban nodes at the same moment, run the
   ban again.
+* Every admin can remove every other admin, and a node believes the admins it knows. A node that was offline when an
+  admin was removed still knows that admin: if the removed admin reaches it first with a list of its own, the node
+  follows that list, and the admins that are right can't change its mind. The same happens if two admins change the
+  list at the same moment. Nodes on both sides then warn in `meshvpn status` that the other one has another list of
+  admins. To settle it, join the node that is wrong again with a new invite (`sudo meshvpn join --force <invite>`).
+  Remove an admin you no longer trust with `sudo meshvpn ban`, not with `admin rm` alone: every node that has heard
+  of the ban refuses the banned node, so it can only get to a node that comes back before any other node does.
+* Names are as trustworthy as the machines you admitted as nodes: a node can call itself like another node that is
+  offline and then has its name (`gpu1.mesh`, SSH host key included), which is what a machine that was set up again
+  does. It can't take the name of a node that is online, and a client (`invite --client`) can't take a node's name at
+  all. SSH permissions (`meshvpn ssh allow`), admin rights and exit nodes go by the node's id, never by its name.
 * Updates are downloaded from this repository's GitHub releases. From 0.27.0 on, `meshvpn update` installs a release
   only if its checksums carry a valid signature of the release key, which the build machines don't hold (so a
-  compromised GitHub account alone can't ship an update). Nodes never install updates by themselves: only
-  `meshvpn update` does.
+  compromised GitHub account alone can't ship an update). Since 0.33.1 a release older than that is
+  never installed, not even by a build from source. Nodes never install updates by themselves: only `meshvpn update`
+  does.
 * The end-to-end layer has replay protection (since 0.24.0) but no forward secrecy (the hop-by-hop Noise links have
   both).
 * Invites are bearer secrets: whoever has one can join (until it is used up or expires). Members see the tickets in

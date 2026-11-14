@@ -12,6 +12,12 @@
 //! Tickets travel inside every claim, so every member sees them. A ticket is therefore bound to
 //! a one-time key whose secret is only in the invite: a claim counts only if that key signed it
 //! too (for this node and time), so seeing a ticket is not enough to use it.
+//!
+//! A roster carries one signature, of an admin of the version before. A node that doesn't have
+//! that version - a new one, whose invite names the admins of its time, or one that was away -
+//! can't check it when the signer isn't among the admins it knows. So every other admin gives
+//! its word for the roster in force (`Endorsement`), and the word of an admin a node knows is as
+//! good as that admin's signature.
 
 use super::*;
 
@@ -19,6 +25,18 @@ use super::*;
 const FRESH_MS: u64 = 3600 * 1000;
 /// Open network: unconfirmed rosters kept, one per signer.
 const MAX_PENDING_ROSTERS: usize = 16;
+
+/// What became of a roster that arrived.
+#[derive(PartialEq)]
+enum Took {
+    Applied,
+    /// The one we have.
+    Same,
+    /// Not ours and not taken: of our version with other content, or a later one that no
+    /// admin known here stands for.
+    Other,
+    No,
+}
 
 pub(super) struct Admitted {
     pub msg: ClaimMsg,
@@ -37,12 +55,28 @@ impl Node {
         st.roster.is_some()
     }
 
-    /// May `id` act as admin? In an open network everybody may (as before).
+    /// May `id` act as admin? In an open network everybody may (as before). A node that joined
+    /// with an admin's invite is in a managed network also before the roster is here: until
+    /// then only the admins its invite named.
     pub(super) fn is_admin(st: &State, id: &NodeId) -> bool {
         match &st.roster {
-            None => true,
+            None => !st.invited || (st.trusted_admins.contains(id) && !st.banned.contains_key(id)),
             Some((_, r)) => r.admins.contains(id) && !st.banned.contains_key(id),
         }
+    }
+
+    /// Whose signature under a new roster counts here: the admins of the roster we have; before
+    /// the first one, those our invite named (or the owner confirmed with `admin trust`).
+    fn roster_signer(st: &State, id: &NodeId) -> bool {
+        !st.banned.contains_key(id)
+            && match &st.roster {
+                None => st.trusted_admins.contains(id),
+                Some((_, r)) => r.admins.contains(id),
+            }
+    }
+
+    fn roster_hash(signed: &SignedDoc) -> String {
+        blake3::hash(signed.data.as_bytes()).to_hex().to_string()
     }
 
     /// May `id` be part of the network?
@@ -63,11 +97,25 @@ impl Node {
         }
     }
 
-    /// Which of the nodes publishing the same name gets it (the smallest key): one online first;
-    /// in a managed network then the one admitted first (a member can't take another's name by
-    /// publishing a newer record - its own admission's time is fixed); then the newest record
-    /// (a machine set up again gets its name back from its old identity).
-    pub(super) fn name_rank(&self, st: &State, r: &super::Record) -> (bool, u64, std::cmp::Reverse<u64>, NodeId) {
+    /// Which of the nodes publishing the same name gets it (the smallest key): a node before a
+    /// client (a user's computer never gets a name a node has, online or not); then the one that
+    /// has the name (`settle_names`: a node that is online keeps its name, whatever another
+    /// publishes); then as `new_holder_rank`.
+    pub(super) fn name_rank(
+        &self,
+        st: &State,
+        r: &super::Record,
+    ) -> (bool, bool, (bool, u64, std::cmp::Reverse<u64>, NodeId)) {
+        let id = r.info.id;
+        let holds = st.name_holders.get(&r.info.name) == Some(&id);
+        (Self::client_of(st, &id).is_some(), !holds, self.new_holder_rank(st, r))
+    }
+
+    /// Who gets a name that nobody has (or whose holder went offline): one online first; in a
+    /// managed network then the one admitted first (its admission's time is fixed, unlike its
+    /// record's version); then the newest record (a machine set up again gets its name back
+    /// from its old identity).
+    pub(super) fn new_holder_rank(&self, st: &State, r: &super::Record) -> (bool, u64, std::cmp::Reverse<u64>, NodeId) {
         let id = r.info.id;
         let admitted_at = match &st.roster {
             None => 0,
@@ -101,39 +149,47 @@ impl Node {
         }
     }
 
-    /// Accepts a (newer) roster signed by an admin we already trust. In an open network nobody
-    /// is trusted yet: a first roster from another node waits until the owner of this machine
-    /// confirms its signer (`meshvpn admin trust`), so no member can make itself the admin of
-    /// everyone on its own.
+    /// Accepts a (newer) roster that an admin we already trust signed, or gave its word for
+    /// (`Endorsement`). In an open network nobody is trusted yet: a first roster from another
+    /// node waits until the owner of this machine confirms its signer (`meshvpn admin trust`),
+    /// so no member can make itself the admin of everyone on its own.
     pub(super) fn apply_roster(&self, st: &mut State, signed: SignedDoc) -> bool {
+        self.take_roster(st, signed) == Took::Applied
+    }
+
+    fn take_roster(&self, st: &mut State, signed: SignedDoc) -> Took {
         let Ok(r) = signed.open::<Roster>(|r| r.issuer) else {
-            return false;
+            return Took::No;
         };
         if r.net != self.net || r.admins.is_empty() {
-            return false;
+            return Took::No;
         }
-        let trusted = match &st.roster {
-            Some((_, cur)) => {
-                if r.version <= cur.version {
-                    return false;
-                }
-                cur.admins.contains(&r.issuer) && !st.banned.contains_key(&r.issuer)
-            }
-            // First roster: the admins our invite named (or confirmed with admin trust), or our
-            // own (admin enable here).
-            None if st.trusted_admins.contains(&r.issuer) => true,
-            None if r.issuer == self.ident.id => r.admins.contains(&r.issuer),
-            None => {
-                self.keep_pending_roster(st, &r, signed);
-                return false;
-            }
-        };
+        let hash = Self::roster_hash(&signed);
+        if let Some((_, cur)) = &st.roster
+            && r.version <= cur.version
+        {
+            return match (r.version == cur.version, hash == st.roster_hash) {
+                (true, true) => Took::Same,
+                (true, false) => Took::Other,
+                _ => Took::No,
+            };
+        }
+        // The first roster may also be our own (admin enable here).
+        let own_first = st.roster.is_none() && r.issuer == self.ident.id && r.admins.contains(&r.issuer);
+        let trusted = own_first
+            || Self::roster_signer(st, &r.issuer)
+            || st
+                .endorsements
+                .values()
+                .any(|(_, e)| e.version == r.version && e.roster == hash && Self::roster_signer(st, &e.by));
         if !trusted {
-            debug!(
-                "ignoring roster v{} from {}: not signed by an admin",
-                r.version, r.issuer
-            );
-            return false;
+            let managed = st.roster.is_some();
+            if !managed && !st.invited {
+                self.keep_pending_roster(st, &r, signed);
+            } else {
+                self.hold_roster(st, r, signed);
+            }
+            return if managed { Took::Other } else { Took::No };
         }
         info!(
             "network is managed (roster v{}, {} admin(s), {} member(s) from before)",
@@ -141,9 +197,148 @@ impl Node {
             r.admins.len(),
             r.members.len()
         );
+        let version = r.version;
         st.roster = Some((signed, r));
         st.pending_rosters.clear();
+        st.held_rosters.retain(|_, (_, h)| h.version > version);
+        st.endorsements
+            .retain(|_, (_, e)| e.version > version || (e.version == version && e.roster == hash));
+        st.roster_hash = hash;
+        st.other_admins.clear();
+        Took::Applied
+    }
+
+    /// `peer` goes by another list of admins than this node: it sent a roster that isn't ours
+    /// and that no admin known here stands for, or it turned this node away as no member.
+    /// With one signature under a roster, and admins that can remove each other, a node can't
+    /// tell which list is the right one when both changed while it was away: it says so
+    /// (`meshvpn status`), and the owner joins the node that is wrong again.
+    pub(super) fn note_other_admins(&self, st: &mut State, peer: NodeId) {
+        const MAX: usize = 64;
+        if !st.other_admins.contains_key(&peer) {
+            if st.other_admins.len() >= MAX {
+                return;
+            }
+            warn!(
+                "{} has another list of admins than this node",
+                self.names(st, &[peer]).join("")
+            );
+        }
+        st.other_admins.insert(peer, Instant::now());
+    }
+
+    /// A roster whose signer isn't an admin known here: kept (the newest per signer) until an
+    /// admin that is gives its word for it.
+    fn hold_roster(&self, st: &mut State, r: Roster, signed: SignedDoc) {
+        if st
+            .held_rosters
+            .get(&r.issuer)
+            .is_some_and(|(_, have)| have.version >= r.version)
+            || (!st.held_rosters.contains_key(&r.issuer) && st.held_rosters.len() >= MAX_PENDING_ROSTERS)
+        {
+            return;
+        }
+        debug!(
+            "roster v{} from {} waits: not signed by an admin known here",
+            r.version, r.issuer
+        );
+        st.held_rosters.insert(r.issuer, (signed, r));
+    }
+
+    /// An admin's word for a roster: kept when that admin's signature would count here, and it
+    /// is for the roster we have or a later one. Returns whether it is new.
+    pub(super) fn keep_endorsement(&self, st: &mut State, doc: SignedDoc) -> bool {
+        // The signature last: the rest costs nothing.
+        let Ok(e) = serde_json::from_str::<Endorsement>(&doc.data) else {
+            return false;
+        };
+        if e.net != self.net || e.roster.len() != 64 || !Self::roster_signer(st, &e.by) {
+            return false;
+        }
+        if let Some((_, cur)) = &st.roster
+            && (e.version < cur.version || (e.version == cur.version && e.roster != st.roster_hash))
+        {
+            return false;
+        }
+        if st
+            .endorsements
+            .get(&e.by)
+            .is_some_and(|(_, have)| have.version >= e.version)
+            || doc.open::<Endorsement>(|e| e.by).is_err()
+        {
+            return false;
+        }
+        st.endorsements.insert(e.by, (doc, e));
         true
+    }
+
+    /// This node's word for the roster in force, when it is an admin and another one signed it.
+    /// Returns the frame for the others when it is new.
+    pub(super) fn endorse_roster(&self, st: &mut State) -> Option<Vec<u8>> {
+        let me = self.ident.id;
+        let (_, r) = st.roster.as_ref()?;
+        if r.issuer == me || !r.admins.contains(&me) || st.banned.contains_key(&me) {
+            return None;
+        }
+        if st
+            .endorsements
+            .get(&me)
+            .is_some_and(|(_, e)| e.version == r.version && e.roster == st.roster_hash)
+        {
+            return None;
+        }
+        let e = Endorsement {
+            net: self.net.clone(),
+            version: r.version,
+            roster: st.roster_hash.clone(),
+            by: me,
+        };
+        let doc = SignedDoc::sign(&e, &self.ident);
+        let f = frame(T_ENDORSE, &serde_json::to_vec(&doc).unwrap());
+        st.endorsements.insert(me, (doc, e));
+        Some(f)
+    }
+
+    /// After the roster changed here: our word for it goes out, and who isn't admitted any
+    /// more is disconnected.
+    fn roster_changed(&self, st: &mut State) {
+        if let Some(f) = self.endorse_roster(st) {
+            self.broadcast(st, &f, None);
+        }
+        self.drop_unadmitted(st);
+    }
+
+    fn handle_endorse(&self, from: NodeId, payload: &[u8]) {
+        let Ok(doc) = serde_json::from_slice::<SignedDoc>(payload) else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        if !self.keep_endorsement(&mut st, doc) {
+            return;
+        }
+        self.broadcast(&st, &frame(T_ENDORSE, payload), Some(from));
+        // A roster that waited for this word (the lowest version first).
+        let mut waiting: Vec<(u32, SignedDoc)> = st
+            .held_rosters
+            .values()
+            .map(|(s, r)| (r.version, s.clone()))
+            .chain(st.pending_rosters.values().map(|(s, r, _)| (r.version, s.clone())))
+            .collect();
+        waiting.sort_by_key(|(v, _)| *v);
+        let mut applied = false;
+        for (_, s) in waiting {
+            if self.apply_roster(&mut st, s.clone()) {
+                applied = true;
+                self.broadcast(&st, &frame(T_ROSTER, &serde_json::to_vec(&s).unwrap()), None);
+            }
+        }
+        if applied {
+            // The word again, after the roster: whoever takes the roster on it needs both.
+            self.broadcast(&st, &frame(T_ENDORSE, payload), None);
+            self.roster_changed(&mut st);
+        }
+        drop(st);
+        self.save_state();
     }
 
     /// A roster read back from our own saved state: we accepted it before (its signers may
@@ -153,6 +348,7 @@ impl Node {
             && r.net == self.net
             && !r.admins.is_empty()
         {
+            st.roster_hash = Self::roster_hash(&signed);
             st.roster = Some((signed, r));
         }
     }
@@ -227,6 +423,7 @@ impl Node {
                 .pending_rosters
                 .values()
                 .map(|(s, r, _)| (r.version, s.clone()))
+                .chain(st.held_rosters.values().map(|(s, r)| (r.version, s.clone())))
                 .collect();
             v.sort_by_key(|(v, _)| *v);
             v.into_iter().map(|(_, s)| s).collect()
@@ -244,7 +441,7 @@ impl Node {
                  (sudo meshvpn admin enable on {name})"
             ));
         }
-        self.drop_unadmitted(&mut st);
+        self.roster_changed(&mut st);
         let admins = st
             .roster
             .as_ref()
@@ -263,11 +460,18 @@ impl Node {
             return;
         };
         let mut st = self.state.lock().unwrap();
-        if self.apply_roster(&mut st, signed.clone()) {
-            self.broadcast(&st, &frame(T_ROSTER, &serde_json::to_vec(&signed).unwrap()), Some(from));
-            self.drop_unadmitted(&mut st);
-            drop(st);
-            self.save_state();
+        match self.take_roster(&mut st, signed.clone()) {
+            Took::Applied => {
+                self.broadcast(&st, &frame(T_ROSTER, &serde_json::to_vec(&signed).unwrap()), Some(from));
+                self.roster_changed(&mut st);
+                drop(st);
+                self.save_state();
+            }
+            Took::Other => self.note_other_admins(&mut st, from),
+            Took::Same => {
+                st.other_admins.remove(&from);
+            }
+            Took::No => {}
         }
     }
 
@@ -439,8 +643,18 @@ impl Node {
 
     pub(super) fn admin_frames(&self, st: &State) -> Vec<Vec<u8>> {
         let mut f = vec![];
-        if let Some((r, _)) = &st.roster {
+        if let Some((r, cur)) = &st.roster {
+            // The admins' words before and after the roster: a node that knows one of them takes
+            // the roster on it, and the words of the others count once it has the roster.
+            let words: Vec<Vec<u8>> = st
+                .endorsements
+                .values()
+                .filter(|(_, e)| e.version == cur.version && e.roster == st.roster_hash)
+                .map(|(d, _)| frame(T_ENDORSE, &serde_json::to_vec(d).unwrap()))
+                .collect();
+            f.extend(words.iter().cloned());
             f.push(frame(T_ROSTER, &serde_json::to_vec(r).unwrap()));
+            f.extend(words);
         }
         for a in st.claims.values() {
             f.push(frame(T_CLAIM, &serde_json::to_vec(&a.msg).unwrap()));
@@ -512,13 +726,20 @@ impl Node {
         Ok(())
     }
 
-    /// Everybody admitted now (to keep them when the roster changes).
+    /// Every node admitted now (to keep them when the roster changes). Not the clients: they
+    /// are members by their tickets, until those say - in the roster they would stay for good.
     pub(super) fn current_members(&self, st: &State) -> Vec<NodeId> {
-        let mut m: Vec<NodeId> = st.records.keys().copied().filter(|id| Self::admitted(st, id)).collect();
+        let node = |id: &NodeId| Self::client_of(st, id).is_none();
+        let mut m: Vec<NodeId> = st
+            .records
+            .keys()
+            .copied()
+            .filter(|id| Self::admitted(st, id) && node(id))
+            .collect();
         if let Some((_, r)) = &st.roster {
             m.extend(r.members.iter().copied());
         }
-        m.extend(st.claims.keys().copied());
+        m.extend(st.claims.keys().copied().filter(|id| node(id)));
         m.push(self.ident.id);
         m.retain(|id| !st.banned.contains_key(id));
         m.sort();
@@ -531,6 +752,12 @@ impl Node {
         let mut st = self.state.lock().unwrap();
         if Self::managed(&st) {
             bail!("this network is already managed (see meshvpn admin status)");
+        }
+        if st.invited {
+            bail!(
+                "this node joined with an admin's invite: the network is managed, its list of admins has \
+                 not arrived here yet (see meshvpn admin status)"
+            );
         }
         let members = self.current_members(&st);
         let n = members.len();
@@ -625,6 +852,15 @@ impl Node {
             }
         };
         match &st.roster {
+            None if st.invited => serde_json::json!({
+                "managed": true,
+                "version": 0,
+                "waiting_for_roster": true,
+                "admins": st.trusted_admins.iter().map(name).collect::<Vec<_>>(),
+                "this_node_is_admin": false,
+                "members_from_before": 0,
+                "admitted_by_invite": [],
+            }),
             None => serde_json::json!({
                 "managed": false,
                 "note": "open network: everybody with the network key is a member and may invite and ban",
@@ -717,6 +953,7 @@ impl Node {
     pub(super) fn dispatch_admin(&self, kind: u8, peer: NodeId, payload: &[u8]) -> bool {
         match kind {
             T_ROSTER => self.handle_roster(peer, payload),
+            T_ENDORSE => self.handle_endorse(peer, payload),
             T_CLAIM => self.handle_claim(peer, payload),
             _ => return false,
         }

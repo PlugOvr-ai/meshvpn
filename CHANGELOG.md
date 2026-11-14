@@ -10,6 +10,94 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-11-14
+
+Fixes from a security audit: the share server asks who is fetching, a node that is online keeps its name, and
+invites keep working after the admins changed.
+
+### Security
+- **A malformed node id could stop a node for good:** a node id of 64 bytes with a non-ASCII character in it made
+  the parser panic while the node's state was locked. The process stayed up, but everything that needs the state
+  failed from then on (no status, no new links) until a restart. One frame per node was enough. Needed: membership;
+  in a managed network the network key alone (through an admission). Ids are now parsed digit by digit, and a node
+  whose state can no longer be used ends itself, so that the service starts it again.
+- **The network key alone no longer opens the share server:** the server for shared objects (port 7871, also on the
+  LAN) served everybody who could make a tag from a network key the node ever had: a banned node, a client whose
+  time was up, or whoever kept an invite that was used long ago could download every shared object for as long as
+  the node ran, and make it read data without limit. Needed: such a key and a route to the port. Every connection
+  now starts with a hello signed by the fetching node, and only nodes that are members now are served. Test data is
+  read for 60 seconds at most, idle connections close after 5 minutes.
+- **A node that is online keeps its name:** if two nodes published the same name, the name (`gpu1.mesh` in
+  `/etc/hosts`, and the SSH host key that goes with it) went to the one admitted first or, in open networks and
+  among the nodes of the roster, to the one with the newer record. A member could so take the name of a running node
+  and get the connections meant for it; a machine set up again was always the one admitted last. Needed:
+  membership; a client invite was enough, also to make every node forget a node that was offline for 10 minutes. Now
+  the node that has a name keeps it while it is online, whatever another node publishes. Once it is offline, a node
+  of that name that is online gets it and keeps it (a machine set up again takes over from its old identity as
+  before, with no step for anybody). A client (`invite --client`) never gets a name a node has, online or not, and
+  never makes the others forget a node. `localhost`, `wpad`, `isatap`, `metadata` and the like are entered with
+  `.mesh` only: as plain names they never point into the mesh. What stays as it is: a node (not a client) can take
+  the name of a node that is offline - names are as trustworthy as the machines admitted as nodes.
+- **A node no longer stays without admins when its invite's admins didn't sign the list in force:** a node took
+  the list of admins (the roster) only if an admin it knew had signed it: a new node knew the admins its invite
+  named, a node that was away those of the list it had. If another admin had changed the list since - one added
+  later, or one that has left - the node never took it. A new node then stayed an open network for itself: every
+  member could ban nodes on it, and `sudo meshvpn admin enable` there made it its own admin. A node that came back
+  stayed with its old list, with admins that had been removed. Needed: nothing but an invite made before the admins
+  changed, or a node that was off at the time. Now every admin gives its signed word for the list in force
+  (kept and passed on with it), and a node takes a list that an admin it knows signed or gave its word for. A node
+  that joined with an admin's invite is managed from the start: until the list arrives, only the admins of its
+  invite are admins for it, and `admin enable` is refused. The admins need this version for their word to exist;
+  older nodes ignore it.
+- **Two lists of admins are reported:** every admin can remove every other, so a node that was offline when an
+  admin was removed still follows that admin - if the removed admin reaches it first with a list of its own, the
+  node keeps that list, and so do two halves of a network whose admins changed the list at the same moment. That
+  can't be decided by the nodes themselves and stays as it is (README, Security). New: a node that sees a member
+  with another list of its version, or a later one no admin it knows stands for, or that is turned away by a member
+  as not admitted, warns in `meshvpn status` and its log: `<node> has another list of admins than this node`, with
+  the way out (`sudo meshvpn join --force <invite>` on the node that is wrong).
+- **Clients no longer become members for good:** when an admin changed the admins (`admin add`, `admin rm`) or left,
+  every client known at that moment was written into the roster as a member, without an end. Needed: a client
+  invite, and waiting. Clients now stay what their invite says. A client that got into the roster before is listed
+  by `meshvpn status` without `(client: ...)`: `sudo meshvpn ban <name>` removes it.
+- **`meshvpn cp`: a file name starting with `-` is a file:** in an upload, such a name reached `tar` as an option, and
+  one of them runs a command. Needed: a file with such a name in a directory the user uploads with `dir/*` (also
+  through the MCP tool `copy_to_nodes`). The name is now passed as `./-name`.
+- **Built-in SSH server: 2 minutes to log in, and limits before that:** a connection that never logged in stayed open
+  for as long as the other side liked, without a limit on their number: a member could use up the daemon's open
+  files, after which `meshvpn status` and other commands failed until a restart (the control socket stopped
+  accepting at the first error). Needed: membership; for the control socket a local account. Now a connection has
+  120 seconds to log in, at most 16 per node and 256 in all may be waiting to, and the control socket and the SOCKS
+  proxy go on accepting after an error.
+- **Refused logins: the user name is filtered:** the name a client asked to log in as went unfiltered (up to about
+  32 kB) into the log, `meshvpn ssh list`, `meshvpn doctor` and the MCP results: forged log lines, escape sequences
+  for the terminal, text for an agent. Needed: membership (no login rule, no key). A name that isn't a valid user
+  name is now shown as `(invalid name)`.
+- **A shared object's name can't cut a node off:** a node that fetched an object advertised it under the name in its
+  manifest, unchecked - with a name of more than 128 bytes or with control characters, every other node refused its
+  record from then on, across restarts, until `meshvpn unshare`. Needed: membership, and the other node fetching the
+  object (a shared file with a long name did the same without an attacker). Such a manifest is now refused, `meshvpn
+  share` asks for `--name`, and objects stored with such a name are no longer advertised.
+- **Exit node: no forwarding to Azure's and IBM's internal addresses:** 168.63.129.16, 161.26.0.0/16 and
+  166.8.0.0/14 are public ranges, but answer only inside those clouds (as 169.254.169.254 does everywhere, which was
+  refused already). Needed: membership and an exit node there.
+- **Releases from before the signatures are never installed:** a release older than 0.27.0 was accepted with its
+  checksum file alone, which whoever can change the release can change too. Official builds never took that path;
+  a build from source could (it reports an old version). Needed: control of the releases on GitHub. A build from
+  source now takes the desktop components of the newest release.
+- **`deploy.sh`: one key line only:** the script checked only how the key returned by the device begins; a second
+  line would have been written into `authorized_keys` on the jump host without `restrict` and `command=`. Needed:
+  control of the device being set up. The key must now be a single `ssh-ed25519` line of base64, and is written
+  from its parts.
+- **`install.sh --full` stops without a checksum tool:** without `sha256sum` it went on unchecked (the normal
+  path stopped). It now also takes `shasum`, and stops if there is neither.
+- **russh 0.65.1** (RUSTSEC-2026-0495, in the SSH agent server of the library, which meshvpn doesn't use).
+
+### Changed
+- **Fetching from a node with this version needs this version:** an older node gets `could not get the manifest ...
+  from any holder`, and its `net matrix --measure` shows no LAN throughput towards newer nodes. This version fetches
+  from older nodes as before.
+
 ## [0.33.0] - 2026-11-13
 
 A progress bar for meshvpn cp.

@@ -114,6 +114,11 @@ impl Manifest {
         if !(64 * 1024..=64 * 1024 * 1024).contains(&self.chunk_size) || self.files.len() > 1_000_000 {
             bail!("unreasonable manifest");
         }
+        // The name goes into this node's record once the object is here: one that records
+        // may not carry would make the other nodes refuse the whole record.
+        if !crate::proto::clean_text(&self.name) {
+            bail!("invalid name in manifest");
+        }
         for f in &self.files {
             let p = Path::new(&f.path);
             if f.path.is_empty()
@@ -192,7 +197,16 @@ impl Store {
     }
 
     pub fn ads(&self) -> Vec<ObjectAd> {
-        let mut v: Vec<ObjectAd> = self.objects.lock().unwrap().values().map(Stored::ad).collect();
+        // An object stored by an older version may have a name records can't carry: it stays
+        // out of the record (the others would refuse the record with it).
+        let mut v: Vec<ObjectAd> = self
+            .objects
+            .lock()
+            .unwrap()
+            .values()
+            .map(Stored::ad)
+            .filter(|a| crate::proto::clean_text(&a.name))
+            .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v.truncate(128); // keeps the node's record small enough for one link message
         v
@@ -267,6 +281,9 @@ pub fn build(path: &Path, name: Option<String>) -> Result<Stored> {
         total: files.iter().map(|f| f.size).sum(),
         files,
     };
+    if !crate::proto::clean_text(&manifest.name) {
+        bail!("the name is too long (128 bytes at most) or has control characters: give one with --name");
+    }
     let id = Manifest::id(&serde_json::to_vec(&manifest)?);
     Ok(Stored { id, manifest, root })
 }
@@ -288,6 +305,13 @@ fn auth_tag(key: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Req {
+    /// The first line of every connection: which node the client is, signed over the server's
+    /// nonce. The network key alone opens nothing - a banned node still has one, and so does
+    /// whoever holds an invite that was used long ago.
+    Hello {
+        id: crate::keys::NodeId,
+        sig: String,
+    },
     Manifest {
         id: String,
     },
@@ -298,6 +322,23 @@ enum Req {
     },
     /// Throughput test: data follows until the sender closes; the answer is how much arrived.
     Sink,
+}
+
+/// How long each side waits for the other's part of the greeting.
+const GREETING: Duration = Duration::from_secs(10);
+/// A connection without a request for this long is closed.
+const IDLE: Duration = Duration::from_secs(300);
+
+/// One request line. Requests are short: a longer line is not one.
+async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
+    let mut line = vec![];
+    if (&mut *r).take(4096).read_until(b'\n', &mut line).await? == 0 {
+        return Ok(None);
+    }
+    if line.last() != Some(&b'\n') {
+        bail!("request too long or cut off");
+    }
+    Ok(Some(line))
 }
 
 fn listen(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -319,7 +360,12 @@ pub async fn serve(node: Arc<Node>) {
             return;
         }
     };
-    while let Ok((stream, addr)) = listener.accept().await {
+    loop {
+        // An error is mostly "too many open files", and that passes.
+        let Ok((stream, addr)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
         let node = node.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_conn(&node, stream).await {
@@ -335,20 +381,36 @@ async fn serve_conn(node: &Node, mut s: TcpStream) -> Result<()> {
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
     s.write_all(&nonce).await?;
     let mut tag = [0u8; 32];
-    tokio::time::timeout(Duration::from_secs(10), s.read_exact(&mut tag)).await??;
-    if !node.network_keys().iter().any(|k| auth_tag(k, &nonce) == tag) {
+    tokio::time::timeout(GREETING, s.read_exact(&mut tag)).await??;
+    let Some((version, _)) = node
+        .network_key_versions()
+        .into_iter()
+        .find(|(_, k)| auth_tag(k, &nonce) == tag)
+    else {
         bail!("not a member of this network");
-    }
+    };
     let (r, mut w) = s.into_split();
-    let mut lines = BufReader::new(r).lines();
-    while let Some(line) = lines.next_line().await? {
-        let data: Option<Vec<u8>> = match serde_json::from_str::<Req>(&line)? {
+    let mut r = BufReader::new(r);
+    let hello = tokio::time::timeout(GREETING, read_line(&mut r))
+        .await??
+        .ok_or_else(|| anyhow!("closed before the hello"))?;
+    match serde_json::from_slice::<Req>(&hello)? {
+        Req::Hello { id, sig } if node.share_admits(&id, version, &nonce, &sig) => {
+            w.write_all(&0u64.to_be_bytes()).await?;
+        }
+        Req::Hello { id, .. } => bail!("{id} is not admitted to this network"),
+        _ => bail!("no hello (a node older than 0.33.1?)"),
+    }
+    while let Some(line) = tokio::time::timeout(IDLE, read_line(&mut r)).await?? {
+        let data: Option<Vec<u8>> = match serde_json::from_slice::<Req>(&line)? {
+            Req::Hello { .. } => bail!("a second hello"),
             Req::Sink => {
-                let mut r = lines.into_inner();
                 let mut buf = vec![0u8; 1 << 20];
                 let mut got = 0u64;
+                // A measurement takes seconds: what goes on for longer is something else.
+                let end = tokio::time::Instant::now() + Duration::from_secs(60);
                 loop {
-                    match r.read(&mut buf).await? {
+                    match tokio::time::timeout_at(end, r.read(&mut buf)).await?? {
                         0 => break,
                         n => got += n as u64,
                     }
@@ -418,24 +480,45 @@ struct Conn {
     w: tokio::net::tcp::OwnedWriteHalf,
 }
 
-async fn connect(node: &Node, h: &Holder) -> Result<Conn> {
-    let stream = match (h.lan_ip, node.socks_addr()) {
+async fn dial(node: &Node, h: &Holder) -> Result<TcpStream> {
+    Ok(match (h.lan_ip, node.socks_addr()) {
         (Some(ip), _) => TcpStream::connect(SocketAddr::from((ip, PORT))).await?,
         (None, Some(socks)) => crate::link::socks5_connect(&socks, &format!("{}:{PORT}", h.mesh_ip)).await?,
         (None, None) => TcpStream::connect(SocketAddr::from((h.mesh_ip, PORT))).await?,
-    };
+    })
+}
+
+/// The client's side of the greeting: a tag of the network key over the server's nonce, then
+/// (`hello`) which node this is, signed over the same nonce.
+async fn greet(node: &Node, stream: TcpStream, hello: bool) -> Result<Conn> {
     stream.set_nodelay(true).ok();
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
     let mut nonce = [0u8; 32];
-    r.read_exact(&mut nonce).await?;
+    tokio::time::timeout(GREETING, r.read_exact(&mut nonce)).await??;
     let key = node
         .network_keys()
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no network key"))?;
     w.write_all(&auth_tag(&key, &nonce)).await?;
-    Ok(Conn { lines: r, w })
+    let mut c = Conn { lines: r, w };
+    if hello {
+        let (id, sig) = node.share_proof(&nonce);
+        match tokio::time::timeout(GREETING, request(&mut c, &Req::Hello { id, sig })).await {
+            Ok(Ok(Some(_))) => {}
+            _ => bail!("the hello was not accepted"),
+        }
+    }
+    Ok(c)
+}
+
+async fn connect(node: &Node, h: &Holder) -> Result<Conn> {
+    match greet(node, dial(node, h).await?, true).await {
+        Ok(c) => Ok(c),
+        // A node older than 0.33.1 doesn't know the hello and closes at it: as before, then.
+        Err(_) => greet(node, dial(node, h).await?, false).await,
+    }
 }
 
 async fn request(c: &mut Conn, req: &Req) -> Result<Option<Vec<u8>>> {
@@ -456,11 +539,10 @@ async fn request(c: &mut Conn, req: &Req) -> Result<Option<Vec<u8>>> {
 
 /// Throughput over a LAN path, Mbit/s: `streams` connections straight to `ip` (not through the
 /// mesh, as NCCL and fetch use it), sending for `secs` seconds.
-pub async fn lan_throughput(node: &Node, ip: Ipv4Addr, streams: usize, secs: f64) -> Option<f32> {
-    let key = node.network_keys().into_iter().next()?;
+pub async fn lan_throughput(node: &Arc<Node>, ip: Ipv4Addr, streams: usize, secs: f64) -> Option<f32> {
     let mut set = tokio::task::JoinSet::new();
     for _ in 0..streams {
-        set.spawn(sink_stream(ip, key, secs));
+        set.spawn(sink_stream(node.clone(), ip, secs));
     }
     let mut ok: Vec<(u64, f64)> = vec![];
     while let Some(r) = set.join_next().await {
@@ -475,34 +557,31 @@ pub async fn lan_throughput(node: &Node, ip: Ipv4Addr, streams: usize, secs: f64
 }
 
 /// One connection of `lan_throughput`: (bytes the other side got, seconds).
-async fn sink_stream(ip: Ipv4Addr, key: [u8; 32], secs: f64) -> Option<(u64, f64)> {
-    {
-        let s = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(SocketAddr::from((ip, PORT))))
+async fn sink_stream(node: Arc<Node>, ip: Ipv4Addr, secs: f64) -> Option<(u64, f64)> {
+    let dial = || async {
+        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(SocketAddr::from((ip, PORT))))
             .await
             .ok()?
-            .ok()?;
-        let (r, mut w) = s.into_split();
-        let mut r = BufReader::new(r);
-        let mut nonce = [0u8; 32];
-        tokio::time::timeout(Duration::from_secs(2), r.read_exact(&mut nonce))
-            .await
-            .ok()?
-            .ok()?;
-        w.write_all(&auth_tag(&key, &nonce)).await.ok()?;
-        w.write_all(b"\"sink\"\n").await.ok()?;
-        let buf = vec![0u8; 1 << 20];
-        let start = Instant::now();
-        while start.elapsed().as_secs_f64() < secs {
-            w.write_all(&buf).await.ok()?;
-        }
-        w.shutdown().await.ok()?;
-        // Older nodes don't know the test: they just close.
-        let got = tokio::time::timeout(Duration::from_secs(10), r.read_u64())
-            .await
-            .ok()?
-            .ok()?;
-        Some((got, start.elapsed().as_secs_f64()))
+            .ok()
+    };
+    let mut c = match greet(&node, dial().await?, true).await {
+        Ok(c) => c,
+        // A node older than 0.33.1 (see `connect`).
+        Err(_) => greet(&node, dial().await?, false).await.ok()?,
+    };
+    c.w.write_all(b"\"sink\"\n").await.ok()?;
+    let buf = vec![0u8; 1 << 20];
+    let start = Instant::now();
+    while start.elapsed().as_secs_f64() < secs {
+        c.w.write_all(&buf).await.ok()?;
     }
+    c.w.shutdown().await.ok()?;
+    // Older nodes don't know the test: they just close.
+    let got = tokio::time::timeout(Duration::from_secs(10), c.lines.read_u64())
+        .await
+        .ok()?
+        .ok()?;
+    Some((got, start.elapsed().as_secs_f64()))
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -837,5 +916,19 @@ mod tests {
             assert!(inside(&root, "out/x.txt", &mut vec![]).is_err());
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn manifests_have_names_records_may_carry() {
+        let m = |name: &str| Manifest {
+            name: name.into(),
+            chunk_size: CHUNK,
+            total: 0,
+            files: vec![],
+        };
+        assert!(m("model v2 (final)").validate().is_ok());
+        assert!(m("line\nbreak").validate().is_err());
+        assert!(m("\x1b[31mred").validate().is_err());
+        assert!(m(&"x".repeat(129)).validate().is_err());
     }
 }

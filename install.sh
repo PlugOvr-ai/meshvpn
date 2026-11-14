@@ -203,8 +203,10 @@ if [ -n "$FULL" ]; then
     fetch "$BASE/$RUN.sha256" "$TMP/$RUN.sha256" || die "download failed: $BASE/$RUN.sha256"
     if command -v sha256sum >/dev/null 2>&1; then
         (cd "$TMP" && sha256sum -c "$RUN.sha256" >/dev/null) || die "checksum mismatch - download corrupted?"
+    elif command -v shasum >/dev/null 2>&1; then
+        (cd "$TMP" && shasum -a 256 -c "$RUN.sha256" >/dev/null) || die "checksum mismatch - download corrupted?"
     else
-        say "(sha256sum not found, skipping checksum verification)"
+        die "neither sha256sum nor shasum is installed: can't check the download (install coreutils)"
     fi
     # Without root it installs for this user alone, by itself.
     if [ -n "$ROOTLESS" ]; then
