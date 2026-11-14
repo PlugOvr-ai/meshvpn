@@ -302,15 +302,82 @@ fn auth_tag(key: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     *blake3::keyed_hash(&blake3::derive_key("meshvpn share auth v1", key), nonce).as_bytes()
 }
 
+/// Tags on the answers of one connection: each over its number on the connection, its length
+/// and its bytes, so none can be forged, changed, replayed or reordered by whoever sits on the
+/// path without the network key.
+#[derive(Clone)]
+pub(crate) struct Mac {
+    key: [u8; 32],
+    n: u64,
+}
+
+impl Mac {
+    fn new(net_key: &[u8; 32], server: &[u8; 32], client: &[u8; 32], id: &crate::keys::NodeId) -> Mac {
+        let mut h = blake3::Hasher::new_keyed(&blake3::derive_key("meshvpn share answers v1", net_key));
+        h.update(server).update(client).update(&id.0);
+        Mac {
+            key: *h.finalize().as_bytes(),
+            n: 0,
+        }
+    }
+
+    /// The tag of the next answer: `len` (its length, or `MISSING`) and its bytes.
+    pub(crate) fn tag(&mut self, len: u64, data: &[u8]) -> [u8; 16] {
+        let mut h = blake3::Hasher::new_keyed(&self.key);
+        h.update(&self.n.to_be_bytes()).update(&len.to_be_bytes()).update(data);
+        self.n += 1;
+        h.finalize().as_bytes()[..16].try_into().unwrap()
+    }
+
+    fn check(&mut self, len: u64, data: &[u8], tag: &[u8; 16]) -> Result<()> {
+        let want = self.tag(len, data);
+        // (all bytes compared, however early one differs)
+        if want.iter().zip(tag).fold(0u8, |acc, (a, b)| acc | (a ^ b)) != 0 {
+            bail!("an answer that doesn't carry the network's tag");
+        }
+        Ok(())
+    }
+}
+
+/// Every answer goes out within this long (a client that doesn't read holds nothing longer).
+const WRITE_WITHIN: Duration = Duration::from_secs(60);
+
+/// One answer: its length (or `MISSING`), its bytes and, with `mac`, the tag.
+async fn answer(w: &mut tokio::net::tcp::OwnedWriteHalf, mac: &mut Option<Mac>, data: Option<&[u8]>) -> Result<()> {
+    let len = data.map_or(MISSING, |d| d.len() as u64);
+    let data = data.unwrap_or(&[]);
+    let tag = mac.as_mut().map(|m| m.tag(len, data));
+    let send = async {
+        w.write_all(&len.to_be_bytes()).await?;
+        w.write_all(data).await?;
+        if let Some(t) = tag {
+            w.write_all(&t).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    tokio::time::timeout(WRITE_WITHIN, send)
+        .await
+        .map_err(|_| anyhow!("the client doesn't read"))??;
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Req {
     /// The first line of every connection: which node the client is, signed over the server's
     /// nonce. The network key alone opens nothing - a banned node still has one, and so does
     /// whoever holds an invite that was used long ago.
+    ///
+    /// `nonce` (the client's) and `mac`: every answer after the hello carries a tag of a key
+    /// both derive from the network key and both nonces (`Mac`). The client asks for it on a
+    /// LAN path, where nothing else vouches for the answers; volume requests need it there.
     Hello {
         id: crate::keys::NodeId,
         sig: String,
+        #[serde(default)]
+        nonce: Option<String>,
+        #[serde(default)]
+        mac: bool,
     },
     Manifest {
         id: String,
@@ -432,32 +499,67 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
     s.write_all(&nonce).await?;
     let mut tag = [0u8; 32];
     tokio::time::timeout(GREETING, s.read_exact(&mut tag)).await??;
-    let Some((version, _)) = node
+    let Some((version, key)) = node
         .network_key_versions()
         .into_iter()
         .find(|(_, k)| auth_tag(k, &nonce) == tag)
     else {
         bail!("not a member of this network");
     };
+    // Through the mesh (its address, or the userspace stack from loopback): the tunnel vouches
+    // for the answers. Over a LAN, the tags do.
+    let tunnel = s
+        .peer_addr()
+        .is_ok_and(|a| crate::node::is_overlay(a.ip()) || a.ip().is_loopback());
     let (r, mut w) = s.into_split();
     let mut r = BufReader::new(r);
     let hello = tokio::time::timeout(GREETING, read_line(&mut r))
         .await??
         .ok_or_else(|| anyhow!("closed before the hello"))?;
+    let mut mac = None;
     let peer = match serde_json::from_slice::<Req>(&hello)? {
-        Req::Hello { id, sig } if node.share_admits(&id, version, &nonce, &sig) => {
-            w.write_all(&0u64.to_be_bytes()).await?;
+        Req::Hello {
+            id,
+            sig,
+            nonce: theirs,
+            mac: tags,
+        } if node.share_admits(&id, version, &nonce, &sig) => {
+            if tags {
+                let theirs = theirs
+                    .as_deref()
+                    .and_then(|n| crate::keys::Key32::from_hex(n).ok())
+                    .ok_or_else(|| anyhow!("tags asked for without a nonce"))?;
+                mac = Some(Mac::new(&key, &nonce, &theirs.0, &id));
+            }
+            answer(&mut w, &mut mac, Some(&[])).await?;
             id
         }
         Req::Hello { id, .. } => bail!("{id} is not admitted to this network"),
         _ => bail!("no hello (a node older than 0.33.1?)"),
     };
+    let vouched = tunnel || mac.is_some();
     #[cfg(target_os = "linux")]
     let who = |user: Option<String>| crate::volume::Who { node: peer, user };
     #[cfg(not(target_os = "linux"))]
     let _ = peer;
     while let Some(line) = tokio::time::timeout(IDLE, read_line(&mut r)).await?? {
-        let data: Option<Vec<u8>> = match serde_json::from_slice::<Req>(&line)? {
+        let req = serde_json::from_slice::<Req>(&line)?;
+        // Volume answers decide what nodes keep and show: never unvouched for.
+        if !vouched
+            && matches!(
+                req,
+                Req::VolHead { .. }
+                    | Req::VolManifest { .. }
+                    | Req::VolState { .. }
+                    | Req::VolNudge { .. }
+                    | Req::VolRead { .. }
+                    | Req::VolPut { .. }
+                    | Req::VolCommit { .. }
+            )
+        {
+            bail!("volume requests over a LAN need tagged answers (a node older than 0.34.2?)");
+        }
+        let data: Option<Vec<u8>> = match req {
             Req::Hello { .. } => bail!("a second hello"),
             Req::Sink => {
                 let mut buf = vec![0u8; 1 << 20];
@@ -477,7 +579,12 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
             #[cfg(target_os = "linux")]
             Req::VolHead { vol, user } => node.volumes.head(&vol, &who(user)),
             #[cfg(target_os = "linux")]
-            Req::VolManifest { vol, user } => node.volumes.manifest_bytes(&vol, &who(user)),
+            Req::VolManifest { vol, user } => {
+                // From the one copy every node is sent (none of its own per request).
+                let bytes = node.volumes.manifest_bytes(&vol, &who(user));
+                answer(&mut w, &mut mac, bytes.as_deref().map(Vec::as_slice)).await?;
+                continue;
+            }
             #[cfg(target_os = "linux")]
             Req::VolState { vol, user } => node.volumes.state(&vol, &who(user)),
             #[cfg(target_os = "linux")]
@@ -494,16 +601,26 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
                 off,
                 len,
             } => {
-                static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+                // A few at once, and a few per node: slow readers don't hold up the others.
+                static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
                 let _permit = READS.acquire().await;
+                let _mine = peer_reads(peer).acquire_owned().await;
                 let (n, who) = (node.clone(), who(user));
                 // Answered from the file straight onto the socket (on a thread: the disk may
-                // be slow); nothing else uses the socket meanwhile.
-                let sock = std::os::fd::AsRawFd::as_raw_fd(w.as_ref());
-                let sent =
-                    tokio::task::spawn_blocking(move || n.volumes.send_local(sock, &vol, &who, &id, chunk, off, len))
-                        .await??;
-                if sent {
+                // be slow), through a descriptor of its own; nothing else writes meanwhile.
+                // SAFETY: dup of a descriptor we own; the result is checked and then owned.
+                let sock = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(w.as_ref())) };
+                if sock < 0 {
+                    bail!("dup: {}", std::io::Error::last_os_error());
+                }
+                let sock = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(sock) };
+                let m = mac.take();
+                let (sent, m) = tokio::task::spawn_blocking(move || {
+                    n.volumes.send_local(&sock, &vol, &who, &id, chunk, off, len, m)
+                })
+                .await?;
+                mac = m;
+                if sent? {
                     continue;
                 }
                 None
@@ -520,6 +637,16 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
                 if len as u64 > 64 << 20 {
                     bail!("chunk too large");
                 }
+                // Whether it would be taken, before reading it.
+                let check = {
+                    let (n, who, vol, id) = (node.clone(), who(user.clone()), vol.clone(), id.clone());
+                    tokio::task::spawn_blocking(move || n.volumes.put_check(&vol, &who, &id, chunk, len)).await?
+                };
+                if let Err(e) = check {
+                    debug!("volume chunk refused: {e:#}");
+                    answer(&mut w, &mut mac, None).await?;
+                    return Ok(()); // (its bytes are not read: the connection ends)
+                }
                 let mut data = vec![0u8; len as usize];
                 tokio::time::timeout(Duration::from_secs(60), r.read_exact(&mut data)).await??;
                 let (n, who) = (node.clone(), who(user));
@@ -535,6 +662,15 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
             Req::VolCommit { vol, user, len } => {
                 if len > 64 << 20 {
                     bail!("commit too large");
+                }
+                // Refused before it is read (its bytes are not read: the connection ends).
+                if let Err(e) = node.volumes.commit_check(&vol, &who(user.clone())) {
+                    let a = serde_json::json!({
+                        "error": format!("{e:#}"),
+                        "retry": e.downcast_ref::<crate::volume::NotLead>().is_some(),
+                    });
+                    answer(&mut w, &mut mac, Some(a.to_string().as_bytes())).await?;
+                    return Ok(());
                 }
                 let mut data = vec![0u8; len as usize];
                 tokio::time::timeout(Duration::from_secs(60), r.read_exact(&mut data)).await??;
@@ -592,15 +728,23 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
                 _ => None,
             },
         };
-        match data {
-            Some(d) => {
-                w.write_all(&(d.len() as u64).to_be_bytes()).await?;
-                w.write_all(&d).await?;
-            }
-            None => w.write_all(&MISSING.to_be_bytes()).await?,
-        }
+        answer(&mut w, &mut mac, data.as_deref()).await?;
     }
     Ok(())
+}
+
+/// The chunk reads one node may have going here at once.
+#[cfg(target_os = "linux")]
+fn peer_reads(peer: crate::keys::NodeId) -> Arc<tokio::sync::Semaphore> {
+    static ALL: std::sync::LazyLock<Mutex<HashMap<crate::keys::NodeId, Arc<tokio::sync::Semaphore>>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    let mut all = ALL.lock().unwrap();
+    if all.len() > 1024 {
+        all.retain(|_, s| Arc::strong_count(s) > 1);
+    }
+    all.entry(peer)
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(16)))
+        .clone()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -618,6 +762,8 @@ pub struct Holder {
 struct Conn {
     lines: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
     w: tokio::net::tcp::OwnedWriteHalf,
+    /// The answers carry tags (a LAN path).
+    mac: Option<Mac>,
 }
 
 async fn dial(node: &Node, h: &Holder) -> Result<TcpStream> {
@@ -629,8 +775,9 @@ async fn dial(node: &Node, h: &Holder) -> Result<TcpStream> {
 }
 
 /// The client's side of the greeting: a tag of the network key over the server's nonce, then
-/// (`hello`) which node this is, signed over the same nonce.
-async fn greet(node: &Node, stream: TcpStream, hello: bool) -> Result<Conn> {
+/// (`hello`) which node this is, signed over the same nonce; with `tags` (a LAN path) the
+/// answers carry tags from then on.
+async fn greet(node: &Node, stream: TcpStream, hello: bool, tags: bool) -> Result<Conn> {
     stream.set_nodelay(true).ok();
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
@@ -642,10 +789,21 @@ async fn greet(node: &Node, stream: TcpStream, hello: bool) -> Result<Conn> {
         .next()
         .ok_or_else(|| anyhow!("no network key"))?;
     w.write_all(&auth_tag(&key, &nonce)).await?;
-    let mut c = Conn { lines: r, w };
+    let mut c = Conn { lines: r, w, mac: None };
     if hello {
         let (id, sig) = node.share_proof(&nonce);
-        match tokio::time::timeout(GREETING, request(&mut c, &Req::Hello { id, sig })).await {
+        let mut mine = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut mine);
+        if tags {
+            c.mac = Some(Mac::new(&key, &nonce, &mine, &id));
+        }
+        let hello = Req::Hello {
+            id,
+            sig,
+            nonce: Some(crate::keys::Key32(mine).hex()),
+            mac: tags,
+        };
+        match tokio::time::timeout(GREETING, request(&mut c, &hello)).await {
             Ok(Ok(Some(_))) => {}
             _ => bail!("the hello was not accepted"),
         }
@@ -654,51 +812,72 @@ async fn greet(node: &Node, stream: TcpStream, hello: bool) -> Result<Conn> {
 }
 
 async fn connect(node: &Node, h: &Holder) -> Result<Conn> {
-    match greet(node, dial(node, h).await?, true).await {
+    // Tags on a LAN path; through the mesh the tunnel vouches for the answers.
+    match greet(node, dial(node, h).await?, true, h.lan_ip.is_some()).await {
         Ok(c) => Ok(c),
         // A node older than 0.33.1 doesn't know the hello and closes at it: as before, then.
-        Err(_) => greet(node, dial(node, h).await?, false).await,
+        Err(_) => greet(node, dial(node, h).await?, false, false).await,
     }
 }
 
-/// The answer to `req` after `out`, without a buffer of its own; false: there is none.
+/// Answers are this large at most (the file lists of volumes: `ANSWER_MAX_LIST`).
+const ANSWER_MAX: u64 = 128 << 20;
 #[cfg(target_os = "linux")]
-async fn request_into(c: &mut Conn, req: &Req, out: &mut Vec<u8>) -> Result<bool> {
-    let mut line = serde_json::to_vec(req)?;
-    line.push(b'\n');
-    c.w.write_all(&line).await?;
+const ANSWER_MAX_LIST: u64 = 640 << 20;
+
+/// The answer after `out` (`max` bytes at most), its tag checked; false: there is none.
+async fn read_answer(c: &mut Conn, out: &mut Vec<u8>, max: u64) -> Result<bool> {
     let len = c.lines.read_u64().await?;
-    if len == MISSING {
-        return Ok(false);
-    }
-    if len > 128 * 1024 * 1024 {
+    if len != MISSING && len > max {
         bail!("oversized answer");
     }
     let start = out.len();
-    // (read_to_end looks for more after the last byte: room for that, or it grows the buffer)
-    out.reserve(len as usize + 64);
-    let got = (&mut c.lines).take(len).read_to_end(out).await?;
-    if got as u64 != len {
-        out.truncate(start);
-        bail!("the answer ended early");
+    if len != MISSING {
+        // (read_to_end looks for more after the last byte: room for that, or it grows the buffer)
+        out.reserve(len as usize + 64);
+        let got = (&mut c.lines).take(len).read_to_end(out).await?;
+        if got as u64 != len {
+            out.truncate(start);
+            bail!("the answer ended early");
+        }
     }
-    Ok(true)
+    if let Some(m) = &mut c.mac {
+        let mut tag = [0u8; 16];
+        c.lines.read_exact(&mut tag).await?;
+        if let Err(e) = m.check(len, &out[start..], &tag) {
+            out.truncate(start);
+            return Err(e);
+        }
+    }
+    Ok(len != MISSING)
 }
 
-async fn request(c: &mut Conn, req: &Req) -> Result<Option<Vec<u8>>> {
+/// The answer to `req` after `out`, without a buffer of its own: `len` bytes exactly; false:
+/// there is none.
+#[cfg(target_os = "linux")]
+async fn request_into(c: &mut Conn, req: &Req, out: &mut Vec<u8>, len: u32) -> Result<bool> {
     let mut line = serde_json::to_vec(req)?;
     line.push(b'\n');
     c.w.write_all(&line).await?;
-    let len = c.lines.read_u64().await?;
-    if len == MISSING {
-        return Ok(None);
+    let start = out.len();
+    let got = read_answer(c, out, len as u64).await?;
+    if got && out.len() - start != len as usize {
+        out.truncate(start);
+        bail!("an answer of another length");
     }
-    if len > 128 * 1024 * 1024 {
-        bail!("oversized answer");
-    }
-    let mut buf = vec![0u8; len as usize];
-    c.lines.read_exact(&mut buf).await?;
-    Ok(Some(buf))
+    Ok(got)
+}
+
+async fn request_max(c: &mut Conn, req: &Req, max: u64) -> Result<Option<Vec<u8>>> {
+    let mut line = serde_json::to_vec(req)?;
+    line.push(b'\n');
+    c.w.write_all(&line).await?;
+    let mut buf = vec![];
+    Ok(read_answer(c, &mut buf, max).await?.then_some(buf))
+}
+
+async fn request(c: &mut Conn, req: &Req) -> Result<Option<Vec<u8>>> {
+    request_max(c, req, ANSWER_MAX).await
 }
 
 /// Connections to other nodes' chunk servers for the volumes, kept open between reads.
@@ -752,8 +931,12 @@ impl Pool {
     }
 
     async fn ask(&self, node: &Node, peer: crate::keys::NodeId, req: &Req) -> Result<Option<Vec<u8>>> {
+        self.ask_max(node, peer, req, ANSWER_MAX).await
+    }
+
+    async fn ask_max(&self, node: &Node, peer: crate::keys::NodeId, req: &Req, max: u64) -> Result<Option<Vec<u8>>> {
         let mut c = self.conn(node, peer).await?;
-        let answer = request(&mut c, req).await?;
+        let answer = request_max(&mut c, req, max).await?;
         self.give_back(peer, c);
         Ok(answer)
     }
@@ -782,21 +965,10 @@ impl Pool {
         line.push(b'\n');
         line.extend_from_slice(body);
         c.w.write_all(&line).await?;
-        let len = c.lines.read_u64().await?;
-        if len == MISSING {
-            return Ok(None);
-        }
-        if len > 128 * 1024 * 1024 {
-            bail!("oversized answer");
-        }
-        let mut buf = vec![0u8; len as usize];
-        c.lines.read_exact(&mut buf).await?;
-        let mut conns = self.conns.lock().unwrap();
-        let idle = conns.entry(peer).or_default();
-        if idle.len() < 32 {
-            idle.push(c);
-        }
-        Ok(Some(buf))
+        let mut buf = vec![];
+        let got = read_answer(&mut c, &mut buf, ANSWER_MAX).await?;
+        self.give_back(peer, c);
+        Ok(got.then_some(buf))
     }
 
     /// Bytes of a chunk `peer` keeps, after `out`; false: it doesn't have them (for `user`).
@@ -822,7 +994,7 @@ impl Pool {
             len,
         };
         let mut c = self.conn(node, peer).await?;
-        let got = request_into(&mut c, &req, out).await?;
+        let got = request_into(&mut c, &req, out, len).await?;
         self.give_back(peer, c);
         Ok(got)
     }
@@ -856,7 +1028,7 @@ impl Pool {
             vol: vol.into(),
             user: user.map(String::from),
         };
-        self.ask(node, peer, &req).await
+        self.ask_max(node, peer, &req, ANSWER_MAX_LIST).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -926,10 +1098,11 @@ async fn sink_stream(node: Arc<Node>, ip: Ipv4Addr, secs: f64) -> Option<(u64, f
             .ok()?
             .ok()
     };
-    let mut c = match greet(&node, dial().await?, true).await {
+    // (the count at the end is not tagged: a measurement, it ends the connection)
+    let mut c = match greet(&node, dial().await?, true, false).await {
         Ok(c) => c,
         // A node older than 0.33.1 (see `connect`).
-        Err(_) => greet(&node, dial().await?, false).await.ok()?,
+        Err(_) => greet(&node, dial().await?, false, false).await.ok()?,
     };
     c.w.write_all(b"\"sink\"\n").await.ok()?;
     let buf = vec![0u8; 1 << 20];

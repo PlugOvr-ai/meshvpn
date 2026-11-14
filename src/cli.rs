@@ -4187,6 +4187,7 @@ fn uninstall(dir: &Path) -> Result<()> {
         return uninstall_user(dir);
     }
     require_root()?;
+    let iface = Config::load(dir).ok().map(|c| c.interface);
     #[cfg(windows)]
     {
         let _ = schtasks(&["/End", "/TN", "meshvpn"]);
@@ -4202,6 +4203,12 @@ fn uninstall(dir: &Path) -> Result<()> {
         for (pid, cmd) in stop_other_daemons(dir) {
             println!("Stopped meshvpn (pid {pid}: {cmd}).");
         }
+    }
+    // The exit's routes, if meshvpn could not take them away itself (it would be offline).
+    if cfg!(target_os = "linux")
+        && let Some(iface) = &iface
+    {
+        crate::node::clear_exit_routes(iface);
     }
     match networks::name(dir) {
         Some(n) => {

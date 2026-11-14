@@ -78,22 +78,34 @@ fn run(args: &[&str]) -> Result<()> {
 
 /// `iptables` rule `spec` in `table`/`chain`, added once (`add`) or removed (`!add`).
 fn iptables(table: &str, chain: &str, spec: &[&str], add: bool, insert: bool) -> Result<()> {
-    let exists = |args: &[&str]| run(&[&["iptables", "-w", "-t", table, "-C", chain], args].concat()).is_ok();
+    xtables("iptables", table, chain, spec, add, insert)
+}
+
+/// The same with `bin` (`iptables` or `ip6tables`).
+fn xtables(bin: &str, table: &str, chain: &str, spec: &[&str], add: bool, insert: bool) -> Result<()> {
+    let exists = |args: &[&str]| run(&[&[bin, "-w", "-t", table, "-C", chain], args].concat()).is_ok();
     let spec = [spec, &["-m", "comment", "--comment", COMMENT]].concat();
     if add {
         if !exists(&spec) {
             run(&[
-                &["iptables", "-w", "-t", table, if insert { "-I" } else { "-A" }, chain],
+                &[bin, "-w", "-t", table, if insert { "-I" } else { "-A" }, chain],
                 &spec[..],
             ]
             .concat())?;
         }
     } else {
         while exists(&spec) {
-            run(&[&["iptables", "-w", "-t", table, "-D", chain], &spec[..]].concat())?;
+            run(&[&[bin, "-w", "-t", table, "-D", chain], &spec[..]].concat())?;
         }
     }
     Ok(())
+}
+
+fn have_ip6tables() -> bool {
+    Command::new("ip6tables")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn need_iptables() -> Result<()> {
@@ -175,46 +187,82 @@ fn serve_exit(iface: &str, on: bool) -> Result<()> {
 }
 
 /// The client's side: default route into the mesh, except for meshvpn itself, LANs and
-/// connections that came in from outside.
+/// connections that came in from outside. Internet IPv6 isn't carried: it is blocked meanwhile
+/// (with ip6tables, which keeps replies to connections from outside working). When meshvpn
+/// ends without taking this away (it crashed), nothing goes out directly until it is back.
 fn use_exit(iface: &str, on: bool) -> Result<()> {
     need_iptables()?;
     let mark = format!("{FWMARK:#x}");
     // Replies on connections that came in from outside keep using the normal routes.
-    iptables(
-        "mangle",
-        "PREROUTING",
-        &[
-            "!",
-            "-i",
-            iface,
-            "-m",
-            "addrtype",
-            "--dst-type",
-            "LOCAL",
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "NEW",
-            "-j",
-            "CONNMARK",
-            "--set-mark",
-            &mark,
-        ],
-        on,
-        false,
-    )?;
-    iptables(
-        "mangle",
-        "OUTPUT",
-        &["-m", "connmark", "--mark", &mark, "-j", "MARK", "--set-mark", &mark],
-        on,
-        false,
-    )?;
-    let _ = run(&["ip", "rule", "del", "priority", "7868"]);
-    let _ = run(&["ip", "rule", "del", "priority", "7869"]);
-    let _ = run(&["ip", "route", "flush", "table", TABLE]);
+    let incoming = [
+        "!",
+        "-i",
+        iface,
+        "-m",
+        "addrtype",
+        "--dst-type",
+        "LOCAL",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "NEW",
+        "-j",
+        "CONNMARK",
+        "--set-mark",
+        &mark,
+    ];
+    let replies = ["-m", "connmark", "--mark", &mark, "-j", "MARK", "--set-mark", &mark];
+    iptables("mangle", "PREROUTING", &incoming, on, false)?;
+    iptables("mangle", "OUTPUT", &replies, on, false)?;
+    let v6 = have_ip6tables();
+    if v6 {
+        let _ = xtables("ip6tables", "mangle", "PREROUTING", &incoming, on, false);
+        let _ = xtables("ip6tables", "mangle", "OUTPUT", &replies, on, false);
+    }
+    for ip in [&["ip"][..], &["ip", "-6"][..]] {
+        let _ = run(&[ip, &["rule", "del", "priority", "7868"]].concat());
+        let _ = run(&[ip, &["rule", "del", "priority", "7869"]].concat());
+        let _ = run(&[ip, &["route", "flush", "table", TABLE]].concat());
+    }
+    if on && v6 {
+        let six = || -> Result<()> {
+            run(&["ip", "-6", "route", "replace", "unreachable", "default", "table", TABLE])?;
+            run(&[
+                "ip",
+                "-6",
+                "rule",
+                "add",
+                "priority",
+                "7868",
+                "table",
+                "main",
+                "suppress_prefixlength",
+                "0",
+            ])?;
+            run(&[
+                "ip", "-6", "rule", "add", "priority", "7869", "not", "fwmark", &mark, "table", TABLE,
+            ])
+        };
+        if let Err(e) = six() {
+            debug!("blocking internet IPv6 while the exit is used: {e:#}");
+        }
+    } else if on {
+        warn!("without ip6tables, internet IPv6 goes direct while the exit is used");
+    }
     if on {
         run(&["ip", "route", "replace", "default", "dev", iface, "table", TABLE])?;
+        // Left when the interface goes away with meshvpn: no internet rather than direct.
+        run(&[
+            "ip",
+            "route",
+            "add",
+            "unreachable",
+            "default",
+            "metric",
+            "4096",
+            "table",
+            TABLE,
+        ])?;
         // More specific routes (LANs, Docker, the mesh) still win over the exit's default.
         run(&[
             "ip",
@@ -232,6 +280,13 @@ fn use_exit(iface: &str, on: bool) -> Result<()> {
         ])?;
     }
     Ok(())
+}
+
+/// Takes the exit's routes away (`meshvpn uninstall`, in case meshvpn could not).
+pub(crate) fn clear_exit_routes(iface: &str) {
+    if Command::new("ip").arg("-V").output().is_ok() && need_iptables().is_ok() {
+        let _ = use_exit(iface, false);
+    }
 }
 
 impl Node {

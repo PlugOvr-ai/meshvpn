@@ -23,6 +23,7 @@ use crate::proto::*;
 
 mod admin;
 mod exit;
+pub(crate) use exit::clear_exit_routes;
 mod ext;
 mod gpu;
 mod join;
@@ -228,7 +229,7 @@ fn pair_hash(x: &NodeId, y: &NodeId) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-fn is_overlay(ip: IpAddr) -> bool {
+pub(crate) fn is_overlay(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => u32::from(v4) & u32::from(OVERLAY_NETMASK) == 0x6440_0000,
         _ => false,
@@ -241,9 +242,20 @@ struct Record {
     signed: SignedInfo,
     /// Details apart from the record (`info.split`), the newest we have.
     details: Option<(NodeDetails, SignedDetails)>,
-    /// When we last received a *newer* version of the record (None = loaded from disk).
+    /// When we last received a *newer* version of the record (None = loaded from disk), or a
+    /// neighbor said it heard from the node (`T_DIGEST2`).
     last_heard: Option<Instant>,
+    /// When this node first had a record of it (since this start): an older node keeps its
+    /// address against one that turned up later (`assign_ips`).
+    first_seen: Instant,
+    /// When we last received a newer version of the record itself: a neighbor's word that
+    /// the node is alive counts only while this is recent (a dead node signs nothing new).
+    renewed: Option<Instant>,
 }
+
+/// How long after the node's last new record a neighbor's word keeps it online: two
+/// heartbeats and a margin (honest nodes publish at least every `HEARTBEAT`).
+const VOUCHED_FOR: Duration = Duration::from_secs(2 * HEARTBEAT.as_secs() + 60);
 
 struct LinkEntry {
     link_id: u64,
@@ -259,7 +271,13 @@ struct LinkEntry {
     outbound: bool,
     /// Since when no rule of `wanted` keeps the link.
     unwanted_since: Option<Instant>,
+    /// Records and details it asked for in the current window (`T_WANT`, `T_WANT_DETAILS`).
+    asked: (Instant, usize),
 }
+
+/// The window for `LinkEntry::asked`: a neighbor gets about two copies of everything per
+/// window (a new node pulls all records once), not more.
+const ASK_WINDOW: Duration = Duration::from_secs(10);
 
 struct Backoff {
     next: Instant,
@@ -388,6 +406,8 @@ struct State {
     /// New versions of each node's record we take (see `record_tokens`): tokens left, when.
     record_rate: HashMap<NodeId, (f32, Instant)>,
     details_rate: HashMap<NodeId, (f32, Instant)>,
+    /// Open networks: nodes not known before that we take (`NEW_NODES_*`): tokens left, when.
+    new_nodes: Option<(f32, Instant)>,
     /// When we last sent a packet to each node (or a command asked for a link to it): in a big
     /// network, links and UDP paths are kept only to these and to the `structural` ones.
     talking: HashMap<NodeId, Instant>,
@@ -998,26 +1018,55 @@ const MAX_BURNED_IPS: usize = 4096;
 /// burned: it stays nobody's when only one claimant is left, so no one takes over another node's
 /// address by claiming it too. Both claimants move to their next candidate (see `rebuild`).
 #[allow(clippy::type_complexity)]
+/// Open networks: nodes at most (below where one digest no longer holds them all), and new
+/// ones taken at once and per second after that.
+const MAX_OPEN_NODES: usize = 1500;
+const NEW_NODES_BURST: f32 = 512.0;
+const NEW_NODES_RATE: f32 = 4.0;
+
+/// Addresses several nodes claim, with them.
+type Conflicts = Vec<(Ipv4Addr, Vec<NodeId>)>;
+
+/// A node known here for this much longer than another that claims its address keeps it:
+/// identities that turn up later (made for it, in an open network) take nothing.
+const SENIOR_BY: Duration = Duration::from_secs(600);
+
+/// Who has which address. `claims`: (node, address, since when it is known here); `my_since`:
+/// since when this node has had `my_ip`. An address two nodes claim belongs to nobody (and is
+/// `burned`: not taken again), unless one of them was here `SENIOR_BY` before the others: then
+/// it stays that one's, and the others get nothing.
 fn assign_ips(
-    claims: impl Iterator<Item = (NodeId, Ipv4Addr)>,
+    claims: impl Iterator<Item = (NodeId, Ipv4Addr, Instant)>,
     my_ip: Ipv4Addr,
+    my_since: Instant,
     burned: &mut HashSet<Ipv4Addr>,
-) -> (HashMap<Ipv4Addr, NodeId>, Vec<(Ipv4Addr, Vec<NodeId>)>) {
-    let mut by_ip: HashMap<Ipv4Addr, Vec<NodeId>> = HashMap::new();
-    for (id, ip) in claims {
-        by_ip.entry(ip).or_default().push(id);
+) -> (HashMap<Ipv4Addr, NodeId>, Conflicts) {
+    let mut by_ip: HashMap<Ipv4Addr, Vec<(NodeId, Instant)>> = HashMap::new();
+    for (id, ip, since) in claims {
+        by_ip.entry(ip).or_default().push((id, since));
     }
     let mut conflicts = vec![];
     let mut ip_map = HashMap::new();
     for (ip, mut owners) in by_ip {
+        owners.sort_by_key(|(_, since)| *since);
+        let first = owners[0].1;
+        // Ours, and every other claimant came much later: still ours.
+        if ip == my_ip && my_since + SENIOR_BY <= first {
+            continue;
+        }
+        if ip != my_ip && owners.len() > 1 && first + SENIOR_BY <= owners[1].1 && !burned.contains(&ip) {
+            ip_map.insert(ip, owners[0].0);
+            continue;
+        }
         if (ip == my_ip || owners.len() > 1) && burned.len() < MAX_BURNED_IPS {
             burned.insert(ip);
         }
         if ip == my_ip || owners.len() > 1 || burned.contains(&ip) {
-            owners.sort();
-            conflicts.push((ip, owners));
+            let mut ids: Vec<NodeId> = owners.into_iter().map(|(id, _)| id).collect();
+            ids.sort();
+            conflicts.push((ip, ids));
         } else {
-            ip_map.insert(ip, owners[0]);
+            ip_map.insert(ip, owners[0].0);
         }
     }
     conflicts.sort();
@@ -1419,6 +1468,22 @@ impl Node {
         if !Self::admitted(st, &info.id) {
             return None; // managed network, and this node has no admission (yet)
         }
+        // In an open network anyone with the key can make identities: new ones only at a
+        // rate, and not without end (the others come with later digests).
+        if live && !Self::managed(st) && !st.records.contains_key(&info.id) {
+            if st.records.len() >= MAX_OPEN_NODES {
+                debug!("dropping a record of {}: {MAX_OPEN_NODES} nodes already", info.id);
+                return None;
+            }
+            let t = st.new_nodes.map_or(NEW_NODES_BURST, |(t, at)| {
+                (t + at.elapsed().as_secs_f32() * NEW_NODES_RATE).min(NEW_NODES_BURST)
+            });
+            if t < 1.0 {
+                debug!("dropping a record of {}: too many new nodes at once", info.id);
+                return None;
+            }
+            st.new_nodes = Some((t - 1.0, Instant::now()));
+        }
         if live && info.seq > now_ms() + 3_600_000 {
             debug!("dropping record from the future for {}", info.id);
             return None;
@@ -1443,13 +1508,16 @@ impl Node {
         if let Some((d, _)) = &details {
             info.apply(d);
         }
+        let first_seen = st.records.get(&id).map_or_else(Instant::now, |r| r.first_seen);
         st.records.insert(
             id,
             Record {
+                first_seen,
                 info,
                 signed,
                 details,
                 last_heard: (live && seen_before).then(Instant::now),
+                renewed: (live && seen_before).then(Instant::now),
             },
         );
         if live {
@@ -1468,13 +1536,21 @@ impl Node {
         let Ok(list) = serde_json::from_slice::<Vec<SignedInfo>>(payload) else {
             return;
         };
+        // Which node and version each one is, read before taking the lock.
+        let list: Vec<(Option<(NodeId, u64)>, SignedInfo)> = list.into_iter().map(|s| (s.peek(), s)).collect();
         let mut st = self.state.lock().unwrap();
         let mut changed = vec![];
         // Most records only bring a newer seq, load or measurements: routes, addresses and
         // names need recomputing (O(N^2)) only when what they're made of changed. The tick
         // recomputes them anyway every 10 s.
         let mut structural = false;
-        for s in list {
+        for (peek, s) in list {
+            // Copies of what we have, and nodes over their rate, cost nothing more.
+            if let Some((id, seq)) = peek
+                && (st.records.get(&id).is_some_and(|r| r.info.seq >= seq) || Self::record_tokens(&st, &id) < 1.0)
+            {
+                continue;
+            }
             let before = self.shape(&st, &s);
             if let Some(id) = self.ingest_id(&mut st, s.clone(), true) {
                 structural |= before != self.shape_of(&st, &id);
@@ -1662,6 +1738,9 @@ impl Node {
                     continue;
                 };
                 if let Some(r) = st.records.get_mut(id)
+                    // (or one signed recently, by its time: a record seen first after a restart)
+                    && (r.renewed.is_some_and(|t| t.elapsed() < VOUCHED_FOR)
+                        || r.info.seq > now_ms().saturating_sub(VOUCHED_FOR.as_millis() as u64))
                     && r.last_heard.is_none_or(|t| t < at)
                 {
                     r.last_heard = Some(at);
@@ -1716,16 +1795,34 @@ impl Node {
     }
 
     /// A neighbor asks for records after comparing digests.
+    /// How many more records (or details) `from` may ask for now (`ASK_WINDOW`); counts them.
+    fn ask_room(st: &mut State, from: &NodeId, asked: usize) -> usize {
+        let budget = 2 * st.records.len() + 64;
+        let Some(l) = st.links.get_mut(from) else { return 0 };
+        if l.asked.0.elapsed() >= ASK_WINDOW {
+            l.asked = (Instant::now(), 0);
+        }
+        let room = budget.saturating_sub(l.asked.1).min(asked);
+        l.asked.1 += room;
+        room
+    }
+
     fn handle_want(&self, from: NodeId, payload: &[u8]) {
-        let st = self.state.lock().unwrap();
-        let Some(l) = st.links.get(&from) else { return };
+        let mut st = self.state.lock().unwrap();
         let mut asked = HashSet::new();
-        let give: Vec<SignedInfo> = payload
+        let ids: Vec<[u8; 32]> = payload
             .as_chunks::<32>()
             .0
             .iter()
-            // Each node once, however often the request names it.
             .filter(|c| asked.insert(**c))
+            .copied()
+            .collect();
+        // The rest comes with the next digest.
+        let room = Self::ask_room(&mut st, &from, ids.len());
+        let Some(l) = st.links.get(&from) else { return };
+        let give: Vec<SignedInfo> = ids
+            .iter()
+            .take(room)
             .filter_map(|c| {
                 let id = crate::keys::Key32(*c);
                 if id == self.ident.id {
@@ -1799,15 +1896,20 @@ impl Node {
     }
 
     fn handle_want_details(&self, from: NodeId, payload: &[u8]) {
-        let st = self.state.lock().unwrap();
-        let Some(l) = st.links.get(&from) else { return };
+        let mut st = self.state.lock().unwrap();
         let mut asked = HashSet::new();
-        let give: Vec<SignedDetails> = payload
+        let ids: Vec<[u8; 32]> = payload
             .as_chunks::<32>()
             .0
             .iter()
-            // Each node once, however often the request names it.
             .filter(|c| asked.insert(**c))
+            .copied()
+            .collect();
+        let room = Self::ask_room(&mut st, &from, ids.len());
+        let Some(l) = st.links.get(&from) else { return };
+        let give: Vec<SignedDetails> = ids
+            .iter()
+            .take(room)
             .filter_map(|c| {
                 let id = crate::keys::Key32(*c);
                 if id == self.ident.id {
@@ -2103,8 +2205,8 @@ impl Node {
     }
 
     /// The accounts of this machine that `user` on node `from` may log in as by SSH (the rules
-    /// of `authorized_keys`): what it may work with here as that user (volumes). Only a user
-    /// that publishes a key could log in at all.
+    /// of `authorized_keys` that name the node): what it may work with here as that user
+    /// (volumes). Only a user that publishes a key could log in at all.
     #[cfg(target_os = "linux")]
     pub fn ssh_accounts(&self, from: &NodeId, user: &str) -> Vec<String> {
         let access = self.ext_ssh_access();
@@ -2131,13 +2233,11 @@ impl Node {
                 out.extend(r.users.iter().cloned());
             }
         }
-        for k in &st.ssh_allow_keys {
-            if keys.contains(&k.key.as_str()) {
-                out.extend(k.users.iter().cloned());
-            }
-        }
+        // Rules by key alone don't count: the SSH server checks that the client holds the key,
+        // but here only the node speaks, and any node can publish someone else's public key.
+        // An extension's key rule counts when it names this node's address.
         for k in &access.keys {
-            if keys.contains(&k.key.as_str()) && (k.from.is_empty() || k.from.contains(&rec.info.ip())) {
+            if keys.contains(&k.key.as_str()) && k.from.contains(&rec.info.ip()) {
                 out.push(k.user.clone());
             }
         }
@@ -3062,11 +3162,15 @@ impl Node {
 
     /// Rebuilds the IP map and the routing table.
     fn rebuild(&self, st: &mut State) {
-        let claims: Vec<(NodeId, Ipv4Addr)> = st.records.values().map(|r| (r.info.id, r.info.ip())).collect();
-        let (ip_map, conflicts) = assign_ips(claims.iter().copied(), self.my_ip, &mut st.burned_ips);
+        let claims: Vec<(NodeId, Ipv4Addr, Instant)> = st
+            .records
+            .values()
+            .map(|r| (r.info.id, r.info.ip(), r.first_seen))
+            .collect();
+        let (ip_map, conflicts) = assign_ips(claims.iter().copied(), self.my_ip, self.started, &mut st.burned_ips);
         // Ours is contested: the next candidate nobody claims, from the next start (at once, see tick).
         if st.burned_ips.contains(&self.my_ip) && st.next_ip_index == st.ip_index {
-            let taken: HashSet<Ipv4Addr> = claims.iter().map(|(_, ip)| *ip).collect();
+            let taken: HashSet<Ipv4Addr> = claims.iter().map(|(_, ip, _)| *ip).collect();
             let next = (st.ip_index + 1..IP_CANDIDATES).find(|&i| {
                 let ip = overlay_ip_at(&self.ident.id, i);
                 !taken.contains(&ip) && !st.burned_ips.contains(&ip)
@@ -3296,7 +3400,7 @@ impl Node {
                 let _ = tun.send(&pkt).await;
             }
             PacketIo::Userspace(tx) => {
-                let _ = tx.send(crate::userspace::Cmd::Packet(pkt));
+                crate::userspace::offer(tx, pkt);
             }
         }
     }
@@ -3405,7 +3509,9 @@ impl Node {
     async fn accept_loop(self: Arc<Self>, listener: TcpListener) {
         // Connections still in their handshake (anyone can open them): a limited number, and
         // only a few per address, so they can't use up memory and descriptors.
-        let handshakes = Arc::new(tokio::sync::Semaphore::new(256));
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES));
+        // (per address or IPv6 /64, and per network around it: one holder of a few addresses
+        // or of an IPv6 prefix doesn't take all the slots)
         let per_ip: Arc<Mutex<HashMap<IpAddr, u32>>> = Arc::default();
         loop {
             match listener.accept().await {
@@ -3417,13 +3523,16 @@ impl Node {
                         continue;
                     };
                     let src = per_source(addr.ip());
+                    let net = per_network(addr.ip());
                     {
                         let mut m = per_ip.lock().unwrap();
-                        let n = m.entry(src).or_default();
-                        if *n >= 16 {
+                        if m.get(&src).copied().unwrap_or(0) >= HANDSHAKES_PER_ADDRESS
+                            || m.get(&net).copied().unwrap_or(0) >= HANDSHAKES_PER_NETWORK
+                        {
                             continue;
                         }
-                        *n += 1;
+                        *m.entry(src).or_default() += 1;
+                        *m.entry(net).or_default() += 1;
                     }
                     let node = self.clone();
                     let per_ip = per_ip.clone();
@@ -3432,10 +3541,12 @@ impl Node {
                         drop(permit);
                         {
                             let mut m = per_ip.lock().unwrap();
-                            if let Some(n) = m.get_mut(&src) {
-                                *n -= 1;
-                                if *n == 0 {
-                                    m.remove(&src);
+                            for k in [src, net] {
+                                if let Some(n) = m.get_mut(&k) {
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        m.remove(&k);
+                                    }
                                 }
                             }
                         }
@@ -3637,6 +3748,7 @@ impl Node {
                 digest_at: None,
                 outbound: initiator,
                 unwanted_since: None,
+                asked: (Instant::now(), 0),
             };
             st.links.insert(peer, entry);
             // Said again right away if it still holds (the peer's roster comes first).
@@ -5804,11 +5916,47 @@ fn dialable(endpoint: &str) -> bool {
 /// An address another node may make us connect or send to.
 pub(crate) fn address_dialable(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()),
+        IpAddr::V4(ip) => {
+            !(ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast())
+        }
         IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
             Some(v4) => address_dialable(IpAddr::V4(v4)),
-            None => !(ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80),
+            None => {
+                !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || (ip.segments()[0] & 0xffc0) == 0xfe80)
+            }
         },
+    }
+}
+
+/// Connections in their handshake at most, per address (`per_source`), per network around it
+/// (`per_network`).
+const HANDSHAKES: usize = 1024;
+const HANDSHAKES_PER_ADDRESS: u32 = 16;
+const HANDSHAKES_PER_NETWORK: u32 = 32;
+
+/// The network a connection counts against too: the IPv4 /24, the IPv6 /48 (a key distinct
+/// from every `per_source` key: the last bits are set).
+fn per_network(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0xffff))
+        }
+        IpAddr::V6(v6) => per_network(IpAddr::V4(v6.to_ipv4_mapped().unwrap())),
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // As an IPv6 key, so it never equals an IPv4 address of `per_source`.
+            IpAddr::V6(Ipv6Addr::new(
+                0,
+                0,
+                0,
+                0,
+                0,
+                0xfffe,
+                u16::from_be_bytes([o[0], o[1]]),
+                u16::from(o[2]) << 8,
+            ))
+        }
     }
 }
 
@@ -5938,11 +6086,13 @@ mod tests {
         };
         let c = crate::keys::Key32(crate::keys::random32());
         let mine = crate::keys::Key32(crate::keys::random32());
-        let claim = |id: &NodeId| (*id, overlay_ip(id));
+        let t = Instant::now();
+        let claim = |id: &NodeId| (*id, overlay_ip(id), t);
         let mut burned = HashSet::new();
         let (map, conflicts) = assign_ips(
             [claim(&a), claim(&b), claim(&c)].into_iter(),
             overlay_ip(&mine),
+            t,
             &mut burned,
         );
         assert_eq!(map.get(&overlay_ip(&c)), Some(&c));
@@ -5951,15 +6101,35 @@ mod tests {
         assert_eq!(conflicts[0].0, overlay_ip(&a));
         // b moves on; a, left alone with the address, still doesn't get it (it is burned).
         let (map, _) = assign_ips(
-            [claim(&a), (b, overlay_ip_at(&b, 1)), claim(&c)].into_iter(),
+            [claim(&a), (b, overlay_ip_at(&b, 1), t), claim(&c)].into_iter(),
             overlay_ip(&mine),
+            t,
             &mut burned,
         );
         assert!(!map.contains_key(&overlay_ip(&a)));
         assert_eq!(map.get(&overlay_ip_at(&b, 1)), Some(&b));
         // Someone claiming our own address gets nothing either.
-        let (map, conflicts) = assign_ips([claim(&c)].into_iter(), overlay_ip(&c), &mut HashSet::new());
+        let (map, conflicts) = assign_ips([claim(&c)].into_iter(), overlay_ip(&c), t, &mut HashSet::new());
         assert!(map.is_empty() && conflicts.len() == 1);
+        // ... unless it turned up much later: then ours stays ours, nothing is burned.
+        let later = t + SENIOR_BY;
+        let mut burned = HashSet::new();
+        let (map, conflicts) = assign_ips(
+            [(c, overlay_ip(&mine), later)].into_iter(),
+            overlay_ip(&mine),
+            t,
+            &mut burned,
+        );
+        assert!(map.is_empty() && conflicts.is_empty() && burned.is_empty());
+        // A node known long before the one that claims its address keeps it.
+        let (map, conflicts) = assign_ips(
+            [(a, overlay_ip(&a), t), (b, overlay_ip(&a), later)].into_iter(),
+            overlay_ip(&mine),
+            t,
+            &mut burned,
+        );
+        assert_eq!(map.get(&overlay_ip(&a)), Some(&a));
+        assert!(conflicts.is_empty() && burned.is_empty());
     }
 
     #[test]

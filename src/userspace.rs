@@ -53,6 +53,30 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> LocalStream
 
 pub type StackTx = mpsc::UnboundedSender<Cmd>;
 
+/// Packets waiting for the stack (`offer`): more are dropped, as a full queue would.
+static QUEUED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_QUEUED: usize = 4096;
+/// Connections at most, ones still being opened, and new ones per source address in
+/// `SYN_WINDOW` (each costs two socket buffers).
+const MAX_CONNS: usize = 1024;
+const MAX_OPENING: usize = 128;
+const MAX_SYNS_PER_SOURCE: usize = 32;
+const SYN_WINDOW: Duration = Duration::from_secs(10);
+/// A listener opened for a SYN that never reached it goes after this long.
+const LISTEN_FOR: Duration = Duration::from_secs(30);
+
+/// A packet from the mesh for the stack (dropped while too many wait).
+pub fn offer(tx: &StackTx, pkt: Vec<u8>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if QUEUED.load(Relaxed) >= MAX_QUEUED {
+        return;
+    }
+    QUEUED.fetch_add(1, Relaxed);
+    if tx.send(Cmd::Packet(pkt)).is_err() {
+        QUEUED.fetch_sub(1, Relaxed);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The virtual network device between smoltcp and the mesh
 
@@ -122,6 +146,7 @@ struct Conn {
     closing: bool,
     /// Data for the local side.
     to_local: Option<mpsc::Sender<Vec<u8>>>,
+    opened: Instant,
 }
 
 impl Conn {
@@ -135,6 +160,7 @@ impl Conn {
             local_eof: false,
             closing: false,
             to_local: None,
+            opened: Instant::now(),
         }
     }
 }
@@ -187,13 +213,6 @@ fn new_socket() -> tcp::Socket<'static> {
 /// Is a service listening on `port` here (on all addresses or loopback)?
 pub fn listening_locally(port: u16) -> bool {
     listening(port, true)
-}
-
-/// Is a service listening on `port` on all addresses? Only those are reachable from the mesh,
-/// as in kernel mode: a service bound to 127.0.0.1 (such as meshvpn's own SOCKS proxy) is
-/// meant to be local. Otherwise the stack answers the SYN with a reset ("connection refused").
-pub fn listening_on_all(port: u16) -> bool {
-    listening(port, false)
 }
 
 #[cfg(target_os = "linux")]
@@ -294,6 +313,8 @@ struct Stack {
     started: Instant,
     wake: Arc<Notify>,
     tx: StackTx,
+    /// Whether a port is listening here (port, loopback too): looked up once a second at most.
+    listening: HashMap<(u16, bool), (bool, Instant)>,
 }
 
 impl Stack {
@@ -301,13 +322,42 @@ impl Stack {
         SmolInstant::from_micros(self.started.elapsed().as_micros() as i64)
     }
 
+    /// `listening_on_all` / `listening_locally`, kept for a second.
+    fn listens(&mut self, port: u16, loopback_too: bool) -> bool {
+        if let Some((yes, at)) = self.listening.get(&(port, loopback_too))
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return *yes;
+        }
+        let yes = listening(port, loopback_too);
+        if self.listening.len() > 4096 {
+            self.listening.clear();
+        }
+        self.listening.insert((port, loopback_too), (yes, Instant::now()));
+        yes
+    }
+
+    /// Room for one more incoming connection from `src`.
+    fn room_for(&self, src: Ipv4Addr) -> bool {
+        let opening: usize = self.listeners.values().map(Vec::len).sum();
+        let recent = self
+            .seen_syns
+            .iter()
+            .filter(|((s, _, _), t)| *s == src && t.elapsed() < SYN_WINDOW)
+            .count();
+        self.conns.len() < MAX_CONNS && opening < MAX_OPENING && recent < MAX_SYNS_PER_SOURCE
+    }
+
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Packet(p) => {
-                if let Some(key @ (_, _, port)) = syn(&p)
+                QUEUED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(key @ (src, _, port)) = syn(&p)
                     && !self.seen_syns.contains_key(&key)
+                    && self.room_for(src)
                     // SSH also when sshd only listens on loopback (it authenticates anyway).
-                    && (listening_on_all(port) || (port == 22 && (self.node.ssh_builtin_userspace() || listening_locally(22))))
+                    && (self.listens(port, false)
+                        || (port == 22 && (self.node.ssh_builtin_userspace() || self.listens(22, true))))
                 {
                     // Accept on any port: open a listener just in time for this connection.
                     let mut s = new_socket();
@@ -507,6 +557,20 @@ impl Stack {
                 }
             }
 
+            // A listener whose SYN never came (dropped on the way) doesn't wait for good.
+            if state == tcp::State::Listen && conn.opened.elapsed() > LISTEN_FOR {
+                if let Kind::Inbound { port, .. } = conn.kind
+                    && let Some(list) = self.listeners.get_mut(&port)
+                {
+                    list.retain(|x| *x != h);
+                    if list.is_empty() {
+                        self.listeners.remove(&port);
+                    }
+                }
+                self.conns.remove(&h);
+                self.sockets.remove(h);
+                continue;
+            }
             // Done: closed, and everything received was passed on.
             if state == tcp::State::Closed && !sock.can_recv() {
                 if let Kind::Outbound { local_port, .. } = conn.kind {
@@ -569,6 +633,7 @@ pub fn start(node_ip: Ipv4Addr, prefix: u8, mtu: usize) -> (StackTx, impl FnOnce
                 started,
                 wake: Arc::new(Notify::new()),
                 tx: tx2,
+                listening: HashMap::new(),
             };
             loop {
                 let now = stack.now();

@@ -190,8 +190,21 @@ impl Manifest {
         if !(64 * 1024..=64 * 1024 * 1024).contains(&self.chunk) || self.files.len() > MAX_FILES {
             bail!("bad file list");
         }
+        if self.version > MAX_VERSION {
+            bail!("bad file list (version)");
+        }
+        let mut ids = HashSet::with_capacity(self.files.len());
+        let mut size = 0usize;
         for f in &self.files {
             check_entry(f, self.chunk)?;
+            // One entry per id: rights are checked on the entry of the id that is read.
+            if !ids.insert(f.id128()) {
+                bail!("bad file list: {} has the id of another file", f.path);
+            }
+            size += entry_size(f);
+        }
+        if size > MAX_LIST_BYTES {
+            bail!("the file list is too large ({} MB)", size >> 20);
         }
         Ok(())
     }
@@ -209,10 +222,19 @@ impl Manifest {
         if c.add.len() > COMMIT_FILES {
             bail!("too many files in one commit");
         }
+        if c.add.is_empty() && c.remove.is_empty() {
+            bail!("nothing to change");
+        }
+        // A file copied in has an id of its own: never one the list has (whose chunks are
+        // another file's, and its rights).
+        let mut ids: HashSet<u128> = self.files.iter().map(Entry::id128).collect();
         for e in &c.add {
             check_entry(e, self.chunk)?;
             if e.src {
                 bail!("{}: files copied in are not from the storage", e.path);
+            }
+            if !ids.insert(e.id128()) {
+                bail!("{}: its id is in use", e.path);
             }
         }
         // Built aside: a commit that doesn't fit leaves the list as it was.
@@ -225,22 +247,45 @@ impl Manifest {
         files.retain(|f| !added.contains(f.path.as_str()));
         files.extend(c.add.iter().cloned());
         files.sort_by(|a, b| a.path.cmp(&b.path));
+        if c.add.is_empty() && files.len() == self.files.len() {
+            bail!("nothing to remove");
+        }
+        if files.iter().map(entry_size).sum::<usize>() > MAX_LIST_BYTES {
+            bail!("the volume's file list would be too large: remove files first");
+        }
         fuse::Tree::build(&files)?;
+        let version = self.version + 1;
+        if version > MAX_VERSION {
+            bail!("the file list has too many versions");
+        }
         self.files = files;
-        self.version += 1;
+        self.version = version;
         Ok(())
     }
 }
 
 fn check_entry(f: &Entry, chunk: u64) -> Result<()> {
-    if !valid_path(&f.path) || f.id.len() != 32 || !f.id.bytes().all(|b| b.is_ascii_hexdigit()) {
+    // Lowercase only: one spelling per id (the store goes by the number).
+    if !valid_path(&f.path) || f.id.len() != 32 || !f.id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         bail!("bad entry {:?}", f.path);
+    }
+    if f.size > chunk * u64::from(u32::MAX) {
+        bail!("{}: too large", f.path);
     }
     if !f.src && f.hashes.len() as u64 != f.size.div_ceil(chunk) {
         bail!("{}: the chunk list doesn't match the size", f.path);
     }
     Ok(())
 }
+
+/// About what an entry takes in the file list as sent (JSON).
+fn entry_size(e: &Entry) -> usize {
+    160 + e.path.len() + e.owner.as_ref().map_or(0, String::len) + 67 * e.hashes.len()
+}
+
+/// The file list as sent at most (every node fetches it whole), and its versions.
+const MAX_LIST_BYTES: usize = 512 << 20;
+const MAX_VERSION: u64 = 1 << 52;
 
 /// Files copied in (`add`) and paths removed (files, or directories with everything in them).
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -444,7 +489,8 @@ fn may_change(e: &Entry, a: &Creds) -> bool {
 /// Runs `f` with the file-system rights of `creds` (this thread only: Linux's fsuid, fsgid and
 /// groups are per thread), so that the daemon opens and makes files as the user would - never
 /// with root's rights on a user's behalf.
-pub fn with_creds<T>(creds: Option<&Creds>, f: impl FnOnce() -> T) -> T {
+/// Fails if the switch didn't take (user namespaces, seccomp): never runs `f` as root then.
+pub fn with_creds<T>(creds: Option<&Creds>, f: impl FnOnce() -> Result<T>) -> Result<T> {
     #[cfg(not(target_arch = "arm"))]
     use libc::{SYS_setfsgid as SETFSGID, SYS_setfsuid as SETFSUID, SYS_setgroups as SETGROUPS};
     #[cfg(target_arch = "arm")]
@@ -463,11 +509,17 @@ pub fn with_creds<T>(creds: Option<&Creds>, f: impl FnOnce() -> T) -> T {
     }
     let _back = Back;
     // SAFETY: as above; the groups outlive the call. The raw syscalls, not libc's wrappers:
-    // those change every thread of the process.
-    unsafe {
-        libc::syscall(SETGROUPS, c.groups.len(), c.groups.as_ptr());
-        libc::syscall(SETFSGID, c.gid);
-        libc::syscall(SETFSUID, c.uid);
+    // those change every thread of the process. setfsuid/setfsgid report no errors: asked
+    // with -1 they only say what is in force, which must be what was asked for.
+    let ok = unsafe {
+        libc::syscall(SETGROUPS, c.groups.len(), c.groups.as_ptr()) == 0 && {
+            libc::syscall(SETFSGID, c.gid);
+            libc::syscall(SETFSUID, c.uid);
+            libc::syscall(SETFSGID, u32::MAX) as u32 == c.gid && libc::syscall(SETFSUID, u32::MAX) as u32 == c.uid
+        }
+    };
+    if !ok {
+        bail!("could not take on the user's rights (uid {}) here", c.uid);
     }
     f()
 }
@@ -569,7 +621,10 @@ impl Store {
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(".{chunk}.{}", rand::random::<u32>()));
         std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        // Never over a chunk that is there (a link fails if the name exists).
+        let linked = std::fs::hard_link(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+        linked.with_context(|| format!("chunk {chunk} of {id:032x} is here already"))?;
         self.have.write().unwrap().insert((id, chunk));
         Ok(())
     }
@@ -631,7 +686,9 @@ impl Store {
         }
         let total = s.f_blocks as u64 * s.f_frsize as u64;
         let free = s.f_bavail as u64 * s.f_frsize as u64;
-        free > (total / 10).max(1 << 30)
+        // Inodes too (each chunk takes one; file systems without a count report 0).
+        let inodes = s.f_files == 0 || s.f_favail as u64 > s.f_files as u64 / 10;
+        free > (total / 10).max(1 << 30) && inodes
     }
 
     fn bytes(&self) -> u64 {
@@ -691,10 +748,34 @@ const ANSWERED: Duration = Duration::from_secs(5);
 /// How long a commit waits for most of the nodes to have it.
 const SPREAD: Duration = Duration::from_secs(10);
 
+/// The file list in force, and which entry each file id is (ids are unique: `validate`).
+struct Current {
+    m: Manifest,
+    ids: HashMap<u128, usize>,
+}
+
+impl Current {
+    fn of(m: Manifest) -> Current {
+        let ids = m.files.iter().enumerate().map(|(i, e)| (e.id128(), i)).collect();
+        Current { m, ids }
+    }
+
+    fn entry(&self, id: u128) -> Option<&Entry> {
+        self.ids.get(&id).map(|&i| &self.m.files[i])
+    }
+}
+
+impl std::ops::Deref for Current {
+    type Target = Manifest;
+    fn deref(&self) -> &Manifest {
+        &self.m
+    }
+}
+
 /// The file list as it is sent, with its version and hash.
 struct Wire {
     version: u64,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     hash: String,
 }
 
@@ -704,7 +785,7 @@ impl Wire {
         let hash = blake3::hash(&bytes).to_hex().to_string();
         Ok(Wire {
             version: m.version,
-            bytes,
+            bytes: Arc::new(bytes),
             hash,
         })
     }
@@ -739,14 +820,35 @@ impl Stats {
 }
 
 fn open_source(source: &str, f: &Entry) -> Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let path = Path::new(source).join(&f.path);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    // Part by part from the source, following no link on the way: a directory someone swapped
+    // for a link (to /etc) leads nowhere. And within the source's file system only.
+    let open_at = |dir: Option<&OwnedFd>, name: &str, flags: i32| -> Result<OwnedFd> {
+        let c = std::ffi::CString::new(name)?;
+        let at = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+        // SAFETY: a valid C string and descriptor; the result is checked and then owned.
+        let fd = unsafe { libc::openat(at, c.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(anyhow!(std::io::Error::last_os_error()))
+                .with_context(|| format!("opening {}", path.display()));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let root = open_at(None, source, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let dev = std::fs::File::from(root.try_clone()?).metadata()?.dev();
+    let parts: Vec<&str> = f.path.split('/').collect();
+    let mut dir = root;
+    for p in &parts[..parts.len() - 1] {
+        dir = open_at(Some(&dir), p, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+    }
+    let file = std::fs::File::from(open_at(
+        Some(&dir),
+        parts[parts.len() - 1],
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )?);
     let m = file.metadata()?;
-    if !m.is_file() || m.len() != f.size || mtime_ns(&m) != f.mtime_ns {
+    if !m.is_file() || m.dev() != dev || m.len() != f.size || mtime_ns(&m) != f.mtime_ns {
         bail!("{} changed on the storage since the volume was made", path.display());
     }
     Ok(file)
@@ -762,7 +864,7 @@ struct Vol {
     pool: Arc<crate::share::Pool>,
     store: Option<Arc<Store>>,
     stats: Stats,
-    man: RwLock<Arc<Manifest>>,
+    man: RwLock<Arc<Current>>,
     wire: RwLock<Arc<Wire>>,
     /// Source files opened (and checked) for reads: a few (each is a descriptor).
     open_src: Mutex<HashMap<String, Arc<std::fs::File>>>,
@@ -771,7 +873,15 @@ struct Vol {
     fetched: Mutex<HashMap<NodeId, u64>>,
     /// Fetching a new version the lead told of (one at a time).
     nudged: AtomicBool,
+    /// Commits taken (`COMMIT_*`): tokens left, when.
+    commits: Mutex<Option<(f32, Instant)>>,
 }
+
+/// Commits a volume takes at once, and per second after that.
+const COMMIT_BURST: f32 = 20.0;
+const COMMIT_RATE: f32 = 2.0;
+/// A chunk goes out within this long (a reader that doesn't read holds nothing longer).
+const SEND_WITHIN: Duration = Duration::from_secs(30);
 
 impl Vol {
     fn new(
@@ -790,11 +900,12 @@ impl Vol {
             store,
             stats: Stats::default(),
             wire: RwLock::new(Arc::new(Wire::of(&m)?)),
-            man: RwLock::new(Arc::new(m)),
+            man: RwLock::new(Arc::new(Current::of(m))),
             open_src: Mutex::new(HashMap::new()),
             lead: Mutex::new(Lead::default()),
             fetched: Mutex::new(HashMap::new()),
             nudged: AtomicBool::new(false),
+            commits: Mutex::new(None),
         })
     }
 
@@ -813,7 +924,7 @@ impl Vol {
         self.lead.lock().unwrap().leading
     }
 
-    fn manifest(&self) -> Arc<Manifest> {
+    fn manifest(&self) -> Arc<Current> {
         self.man.read().unwrap().clone()
     }
 
@@ -924,7 +1035,7 @@ impl Vol {
         if let Some(mount) = mount {
             mount.update(tree);
         }
-        *self.man.write().unwrap() = Arc::new(m);
+        *self.man.write().unwrap() = Arc::new(Current::of(m));
         *self.wire.write().unwrap() = Arc::new(wire);
         Ok(())
     }
@@ -1171,7 +1282,7 @@ impl Volumes {
         serde_json::to_vec(&v.state()).ok()
     }
 
-    pub fn manifest_bytes(&self, key: &str, who: &Who) -> Option<Vec<u8>> {
+    pub fn manifest_bytes(&self, key: &str, who: &Who) -> Option<Arc<Vec<u8>>> {
         let v = self.vol(key)?;
         if !self.sees(&v, who) {
             return None;
@@ -1185,76 +1296,36 @@ impl Volumes {
         Some(w.bytes.clone())
     }
 
-    /// Sends bytes of a chunk this node keeps on `sock` (the chunk server's connection: the
-    /// length, then the bytes, straight from the file - no copy here), if it is here and for
-    /// `who`: a user reads only what its account here may read; the volume's nodes read for
-    /// their mounts, where the kernel checks. Ok(false): not sent (nothing was written).
-    /// Blocking: called on a thread of its own.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_local(
-        &self,
-        sock: i32,
-        key: &str,
-        who: &Who,
-        id: &str,
-        chunk: u32,
-        within: u64,
-        len: u32,
-    ) -> std::io::Result<bool> {
-        let Some(v) = self.vol(key) else { return Ok(false) };
-        if len as u64 > v.manifest().chunk {
-            return Ok(false);
-        }
-        if !(who.user.is_none() && v.def.nodes.contains(&who.node)) {
-            let Ok((_, creds)) = account(&v.node, who) else {
-                return Ok(false);
-            };
-            let m = v.manifest();
-            if !m.files.iter().find(|f| f.id == id).is_some_and(|e| may_read(e, &creds)) {
-                return Ok(false);
-            }
-        }
-        let Ok(id) = u128::from_str_radix(id, 16) else {
-            return Ok(false);
-        };
-        let Some(Ok(f)) = v.store.as_ref().and_then(|s| s.open_chunk(id, chunk)) else {
-            return Ok(false);
-        };
-        if f.metadata()?.len() < within + len as u64 {
-            return Ok(false);
-        }
-        send_all(sock, &(len as u64).to_be_bytes())?;
-        sendfile_all(sock, &f, within, len as u64)?;
-        Ok(true)
-    }
-
-    /// A chunk copied in: kept if this node is one of the volume's, `who` has SSH access here,
-    /// there is room, and it is what its hash says.
-    pub fn put(&self, key: &str, who: &Who, id: &str, chunk: u32, hash: &str, data: &[u8]) -> Result<()> {
+    /// Would a chunk of `len` bytes be taken (`put`)? Asked before its bytes are read.
+    pub fn put_check(&self, key: &str, who: &Who, id: &str, chunk: u32, len: u32) -> Result<()> {
         let v = self.vol(key).ok_or_else(|| anyhow!("no volume {key} here"))?;
         account(&v.node, who)?;
         let store = v
             .store
             .as_ref()
             .ok_or_else(|| anyhow!("this node doesn't keep {key}"))?;
-        if data.len() as u64 > v.manifest().chunk || blake3::hash(data).to_hex().as_str() != hash {
-            bail!("the chunk is not what its hash says");
+        if len == 0 || len as u64 > v.manifest().chunk {
+            bail!("a chunk of {len} bytes");
+        }
+        if id.len() != 32 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            bail!("bad id");
         }
         let id = u128::from_str_radix(id, 16)?;
+        // Files in the list don't change: their chunks are never replaced.
+        if v.manifest().entry(id).is_some() || store.has(id, chunk) {
+            bail!("chunk {chunk} of {id:032x} is here already");
+        }
         if !store.room() {
             bail!("the disk of {} is nearly full", v.node.node_names(&[v.me]).join(""));
         }
-        store.put(id, chunk, data)
+        Ok(())
     }
 
-    /// A commit, on the node that keeps the file list, for `who` (it needs SSH access here; the
-    /// files become its account's, and it may replace and remove only its own). Returns the
-    /// new version.
-    pub async fn commit(&self, key: &str, who: &Who, mut c: Commit) -> Result<u64> {
-        let _one = self.commit_lock.lock().await;
+    /// Would a commit from `who` be taken here (`commit`)? Asked before it is read.
+    pub fn commit_check(&self, key: &str, who: &Who) -> Result<()> {
         let v = self.vol(key).ok_or_else(|| anyhow!("no volume {key} here"))?;
-        let lead = v.lead.lock().unwrap().node;
         if !v.leading() {
+            let lead = v.lead.lock().unwrap().node;
             let why = match lead {
                 Some(l) if l != v.me => format!(
                     "{} keeps the file list of {}",
@@ -1268,6 +1339,129 @@ impl Volumes {
             };
             return Err(NotLead(why).into());
         }
+        account(&v.node, who)?;
+        Ok(())
+    }
+
+    /// Sends bytes of a chunk this node keeps on `sock` (the chunk server's connection: the
+    /// length, the bytes and, with `mac`, their tag), if it is here and for `who`: a user reads
+    /// only what its account here may read; the volume's nodes read for their mounts, where the
+    /// kernel checks. Ok(false): not sent (nothing was written). Without tags (through the
+    /// mesh) straight from the file, with tags read and tagged first. Blocking: called on a
+    /// thread of its own. Returns `mac` for the next answer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_local(
+        &self,
+        sock: &std::os::fd::OwnedFd,
+        key: &str,
+        who: &Who,
+        id: &str,
+        chunk: u32,
+        within: u64,
+        len: u32,
+        mut mac: Option<crate::share::Mac>,
+    ) -> (std::io::Result<bool>, Option<crate::share::Mac>) {
+        let r = self.send_chunk(sock, key, who, id, chunk, within, len, &mut mac);
+        (r, mac)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_chunk(
+        &self,
+        sock: &std::os::fd::OwnedFd,
+        key: &str,
+        who: &Who,
+        id: &str,
+        chunk: u32,
+        within: u64,
+        len: u32,
+        mac: &mut Option<crate::share::Mac>,
+    ) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let Some(v) = self.vol(key) else { return Ok(false) };
+        let m = v.manifest();
+        let Some(end) = within.checked_add(len as u64) else {
+            return Ok(false);
+        };
+        if len as u64 > m.chunk || end > m.chunk {
+            return Ok(false);
+        }
+        let Ok(id) = u128::from_str_radix(id, 16) else {
+            return Ok(false);
+        };
+        if !(who.user.is_none() && v.def.nodes.contains(&who.node)) {
+            let Ok((_, creds)) = account(&v.node, who) else {
+                return Ok(false);
+            };
+            if !m.entry(id).is_some_and(|e| may_read(e, &creds)) {
+                return Ok(false);
+            }
+        }
+        let Some(Ok(f)) = v.store.as_ref().and_then(|s| s.open_chunk(id, chunk)) else {
+            return Ok(false);
+        };
+        if f.metadata()?.len() < end {
+            return Ok(false);
+        }
+        let deadline = Instant::now() + SEND_WITHIN;
+        match mac {
+            None => {
+                send_all(fd, &(len as u64).to_be_bytes(), deadline)?;
+                sendfile_all(fd, &f, within, len as u64, deadline)?;
+            }
+            Some(mac) => {
+                thread_local! {
+                    static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                BUF.with_borrow_mut(|buf| -> std::io::Result<()> {
+                    buf.resize(len as usize, 0);
+                    f.read_exact_at(buf, within)?;
+                    let tag = mac.tag(len as u64, buf);
+                    send_all(fd, &(len as u64).to_be_bytes(), deadline)?;
+                    send_all(fd, buf, deadline)?;
+                    send_all(fd, &tag, deadline)
+                })?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// A chunk copied in: kept if this node is one of the volume's, `who` has SSH access here,
+    /// there is room, and it is what its hash says.
+    pub fn put(&self, key: &str, who: &Who, id: &str, chunk: u32, hash: &str, data: &[u8]) -> Result<()> {
+        self.put_check(key, who, id, chunk, data.len() as u32)?;
+        let v = self.vol(key).ok_or_else(|| anyhow!("no volume {key} here"))?;
+        let store = v
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow!("this node doesn't keep {key}"))?;
+        if blake3::hash(data).to_hex().as_str() != hash {
+            bail!("the chunk is not what its hash says");
+        }
+        store.put(u128::from_str_radix(id, 16)?, chunk, data)
+    }
+
+    /// A commit, on the node that keeps the file list, for `who` (it needs SSH access here; the
+    /// files become its account's, and it may replace and remove only its own). Returns the
+    /// new version.
+    pub async fn commit(&self, key: &str, who: &Who, mut c: Commit) -> Result<u64> {
+        self.commit_check(key, who)?;
+        // Every version is sent whole to every node: not more than a few a second.
+        {
+            let v = self.vol(key).ok_or_else(|| anyhow!("no volume {key} here"))?;
+            let mut rate = v.commits.lock().unwrap();
+            let t = rate.map_or(COMMIT_BURST, |(t, at)| {
+                (t + at.elapsed().as_secs_f32() * COMMIT_RATE).min(COMMIT_BURST)
+            });
+            if t < 1.0 {
+                bail!("too many changes of {} at once: try again in a moment", v.def.name);
+            }
+            *rate = Some((t - 1.0, Instant::now()));
+        }
+        let _one = self.commit_lock.lock().await;
+        self.commit_check(key, who)?;
+        let v = self.vol(key).ok_or_else(|| anyhow!("no volume {key} here"))?;
         let (name, creds) = account(&v.node, who)?;
         let mut m = (*v.manifest()).clone();
         let added: HashSet<&str> = c.add.iter().map(|e| e.path.as_str()).collect();
@@ -1902,6 +2096,13 @@ impl Volumes {
         let vname = name.to_string();
         let (count, bytes) = tokio::task::spawn_blocking(move || -> Result<(usize, u64)> {
             with_creds(creds.as_ref(), || -> Result<(usize, u64)> {
+                // As root: not into a directory others can change (they could swap a part
+                // of the path for a link while the files are written).
+                if creds.is_none() {
+                    // SAFETY: plain getter.
+                    let me = unsafe { libc::geteuid() };
+                    crate::share::safe_destination(&dest, (me != 0).then_some(me))?;
+                }
                 std::fs::create_dir_all(&dest).with_context(|| dest.display().to_string())?;
                 let dest = dest.canonicalize()?;
                 let mut created = vec![];
@@ -1910,11 +2111,12 @@ impl Volumes {
                 for (e, rel) in &picked {
                     let target = crate::share::inside(&dest, rel, &mut created)?;
                     let mut o = std::fs::OpenOptions::new();
+                    // Its own mode (the umask applies): a private file stays private here.
                     o.write(true)
                         .create(true)
                         .truncate(true)
                         .custom_flags(libc::O_NOFOLLOW)
-                        .mode(0o644);
+                        .mode(e.mode & 0o777);
                     let file = o.open(&target).with_context(|| target.display().to_string())?;
                     let mut off = 0;
                     while off < e.size {
@@ -2010,10 +2212,10 @@ async fn upload_file(
     let file = Arc::new(
         tokio::task::spawn_blocking(move || {
             with_creds(creds.as_ref(), || {
-                std::fs::OpenOptions::new()
+                Ok(std::fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW)
-                    .open(&opened)
+                    .open(&opened)?)
             })
         })
         .await?
@@ -2124,15 +2326,19 @@ fn decide(
     (lead, from, votes > nodes.len() / 2)
 }
 
-/// Waits (blocking) until the non-blocking socket `fd` takes more.
-fn writable(fd: i32) -> std::io::Result<()> {
+/// Waits (blocking) until the non-blocking socket `fd` takes more, until `deadline` at most.
+fn writable(fd: i32, deadline: Instant) -> std::io::Result<()> {
     let mut p = libc::pollfd {
         fd,
         events: libc::POLLOUT,
         revents: 0,
     };
+    let ms = deadline.saturating_duration_since(Instant::now()).as_millis() as i32;
+    if ms == 0 {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
     // SAFETY: one valid pollfd.
-    match unsafe { libc::poll(&mut p, 1, 30_000) } {
+    match unsafe { libc::poll(&mut p, 1, ms) } {
         0 => Err(std::io::ErrorKind::TimedOut.into()),
         n if n < 0 => Err(std::io::Error::last_os_error()),
         _ => Ok(()),
@@ -2140,22 +2346,22 @@ fn writable(fd: i32) -> std::io::Result<()> {
 }
 
 /// Whether to try again (after waiting for `fd` to take more).
-fn again(fd: i32) -> std::io::Result<()> {
+fn again(fd: i32, deadline: Instant) -> std::io::Result<()> {
     let e = std::io::Error::last_os_error();
     match e.raw_os_error() {
-        Some(libc::EAGAIN) => writable(fd),
+        Some(libc::EAGAIN) => writable(fd, deadline),
         Some(libc::EINTR) => Ok(()),
         _ => Err(e),
     }
 }
 
 /// All of `buf` onto the non-blocking socket `fd`, waiting when it is full.
-fn send_all(fd: i32, mut buf: &[u8]) -> std::io::Result<()> {
+fn send_all(fd: i32, mut buf: &[u8], deadline: Instant) -> std::io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: the buffer is valid for its length.
         let n = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
         if n < 0 {
-            again(fd)?;
+            again(fd, deadline)?;
         } else {
             buf = &buf[n as usize..];
         }
@@ -2164,16 +2370,20 @@ fn send_all(fd: i32, mut buf: &[u8]) -> std::io::Result<()> {
 }
 
 /// `len` bytes of `f` from `off` onto the non-blocking socket `fd`, by the kernel (sendfile).
-fn sendfile_all(fd: i32, f: &std::fs::File, off: u64, len: u64) -> std::io::Result<()> {
+fn sendfile_all(fd: i32, f: &std::fs::File, off: u64, len: u64, deadline: Instant) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    let mut off = off as libc::off_t;
-    let end = off + len as libc::off_t;
+    let (Ok(mut off), Ok(end)) = (
+        libc::off_t::try_from(off),
+        libc::off_t::try_from(off.saturating_add(len)),
+    ) else {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    };
     while off < end {
         // SAFETY: valid descriptors; sendfile advances `off`.
         let n = unsafe { libc::sendfile(fd, f.as_raw_fd(), &mut off, (end - off) as usize) };
         match n {
             0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-            n if n < 0 => again(fd)?,
+            n if n < 0 => again(fd, deadline)?,
             _ => {}
         }
     }
@@ -2369,6 +2579,54 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.files.len(), 1);
+        // Another file's id (its chunks, under other rights), in any spelling: refused.
+        let mut theirs = entry("steal", 4);
+        theirs.id = m.files[0].id.clone();
+        assert!(
+            m.apply(&Commit {
+                add: vec![theirs.clone()],
+                remove: vec![]
+            })
+            .is_err()
+        );
+        theirs.id = theirs.id.to_uppercase();
+        assert!(
+            m.apply(&Commit {
+                add: vec![theirs],
+                remove: vec![]
+            })
+            .is_err()
+        );
+        let one = entry("twice", 1);
+        assert!(
+            m.apply(&Commit {
+                add: vec![
+                    one.clone(),
+                    Entry {
+                        path: "twice2".into(),
+                        ..one
+                    }
+                ],
+                remove: vec![]
+            })
+            .is_err()
+        );
+        // Nothing to do: no new version (every node would fetch the list for nothing).
+        assert!(m.apply(&Commit::default()).is_err());
+        assert!(
+            m.apply(&Commit {
+                add: vec![],
+                remove: vec!["not/there".into()]
+            })
+            .is_err()
+        );
+        assert_eq!(m.version, 4);
+        // A list with two entries of one id is refused.
+        let mut twice = m.clone();
+        let mut copy = twice.files[0].clone();
+        copy.path = "copy".into();
+        twice.files.push(copy);
+        assert!(twice.validate().is_err());
         // Paths that lead out, and chunk lists that don't fit.
         let mut bad = entry("x", 10);
         bad.path = "../etc/passwd".into();

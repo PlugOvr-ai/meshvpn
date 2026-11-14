@@ -248,10 +248,11 @@ sudo meshvpn exit off            # back to direct
 * In userspace mode, connections through the SOCKS proxy go through the exit.
 * The exit forwards only to public internet addresses - never into its own LAN or to cloud metadata
   addresses. It needs `iptables`; in a container, start it with `--sysctl net.ipv4.ip_forward=1`.
-* DNS keeps using the machine's resolver, and internet IPv6 isn't carried (only the mesh's own
-  IPv6 addresses are).
-* While the exit node is offline there is no internet (status shows a warning), so nothing leaks
-  out directly. The setting survives restarts.
+* DNS keeps using the machine's resolver. Internet IPv6 isn't carried: it is blocked while the exit is used
+  (needs `ip6tables`; without it, IPv6 goes direct), the mesh's own IPv6 addresses and LANs keep working.
+* While the exit node is offline there is no internet (status shows a warning), and if meshvpn ends without
+  cleaning up (it crashed) there is none until it is back, so nothing leaks out directly. Stopping meshvpn
+  (`systemctl stop`, uninstall) takes the routes away: traffic goes direct again. The setting survives restarts.
 
 ## Several networks on one machine
 
@@ -605,15 +606,17 @@ sudo meshvpn volume delete imagenet                   # every node unmounts it a
 * The files change only through `volume cp` and `volume rm`, never by writing into the mount, so every node sees the
   same files. A file copied in again replaces the old one everywhere; programs that have it open keep reading the
   old version.
-* **Who may do what:** a user works with a volume only if it could log in to the volume's nodes by SSH (`meshvpn ssh
-  allow`, see above). Files copied in belong to the account it logs in as there and keep their mode; the mount
+* **Who may do what:** a user works with a volume only if it could log in to the volume's nodes by SSH, by a rule that
+  names its node (`meshvpn ssh allow user@node`, see above; a rule for a key alone doesn't count here, since only the
+  node speaks for its users). Files copied in belong to the account it logs in as there and keep their mode; the mount
   shows owners and modes as they are, and the kernel enforces them. Files from the storage keep the storage's owners
   and modes. A user copies in only what it can read itself, copies out only what it may read, and replaces or removes
   only its own files. `cp` and `rm` need no sudo: the daemon opens and creates the user's files with the user's own
   rights. Only admins make and delete volumes, and only from network storage (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB,
   FUSE file systems such as sshfs), never from a node's local disk.
 * **Data path:** between nodes that share a LAN, chunks go straight over it (port 7871, the native interface, like
-  NCCL), authenticated but not encrypted; otherwise through the encrypted mesh.
+  NCCL), not encrypted: every answer carries a tag of the network key, so nobody on the LAN can change or forge
+  what the nodes read, but someone tapping the LAN can see the data. Otherwise through the encrypted mesh.
 * Without root (rootless install) the volume is mounted with `fusermount3` at `~/volumes/NAME` (the package fuse3),
   readable by the user only unless `user_allow_other` is set in `/etc/fuse.conf`; the chunks are in `~/.cache`. As
   root, the chunks are in `/var/lib/meshvpn/volumes`; a tenth of the disk (at least 1 GB) stays free.

@@ -18,7 +18,8 @@ impl Node {
             .filter_map(|(kind, (doc, _))| {
                 let name = kind.strip_prefix(KIND_PREFIX)?;
                 let def: Def = serde_json::from_str(&doc.data).ok()?;
-                (def.name == name).then_some(def)
+                // A name that is no valid volume name is no volume (it names paths here).
+                (def.name == name && def.check().is_ok()).then_some(def)
             })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));

@@ -10,6 +10,51 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.2] - 2026-11-14
+
+### Security
+- **Volumes:**
+  - A user with SSH access to the lead could read any file of a volume. A commit naming the id of another file
+    (from the file list) got that file's chunks under the user's own rights. Ids are now unique and lowercase,
+    and a commit can't reuse one.
+  - A user with SSH access to a node keeping chunks could replace the contents of any file, its storage files too.
+    Chunks are no longer overwritten, and no chunks are taken for files in the list.
+  - Volume access through `ssh allow` rules for a key alone needed only the public key: any node of the network
+    could publish it. Such rules no longer count for volumes; rules that name the node do.
+  - Over a LAN path, the answers of the chunk server were not authenticated, so someone on the LAN could forge file
+    lists, states and chunk data. Every answer now carries a tag of a key both nodes derive from the network key;
+    volume requests over a LAN need it (all nodes of a volume on 0.34.2).
+  - The root daemon followed links in directories of the network storage (a user who could write there served
+    `/etc/shadow`). Storage files are now opened part by part without links, within the storage's file system.
+  - An admin could delete paths on every node with a volume document under a crafted name. Invalid definitions
+    are ignored now.
+  - Limits so another node's requests cost it about its own traffic: empty commits refused, at most 2 commits a
+    second (20 at once); the file list 512 MB at most (one of 640 MB can be fetched now: 128 MB was too small
+    for 1 million files); every answer sent within 60 s, a chunk within 30 s; at most 16 chunk reads per node at
+    once; chunk uploads checked before their bytes are read; inodes counted as free space; arithmetic on offsets
+    checked.
+  - Copied out, files keep their mode (were 0644), and root copies out only into directories others can't change.
+    The daemon checks that it took on the user's rights before touching the user's files.
+- **UDP probes:** a node probes at most 16 addresses per peer (3 ports per address, no multicast). A peer that
+  answers none for 2 minutes is probed every 5 minutes, and a record that keeps changing no longer keeps the
+  probing fast. One member's record could make every node probe a stranger's address.
+- **Liveness:** a neighbor's word that a node is alive counts only while that node's own record is recent. One
+  member could keep dead nodes online everywhere.
+- **Gossip:** copies of known records are dropped before any work under the lock, and requests for records
+  and details are limited per link (about two copies of everything per 10 s).
+- **Open networks:** new identities at most 4 a second (512 at once) and 1500 nodes in all. A node known
+  for 10 minutes keeps its address against one that turns up later: identities made for that address took all of
+  a node's addresses.
+- **Userspace mode:** at most 1024 connections, 128 being opened, 32 new ones per address in 10 s; listeners
+  for SYNs that never came go after 30 s; at most 4096 packets wait for the stack.
+- **Handshakes:** 1024 slots, 16 per address, 32 per IPv4 /24 or IPv6 /48 (were 256 and 16 per address).
+- The tags cost CPU on the LAN path: the serving node reads and hashes chunks instead of sending them straight
+  from the file. Benchmark (two containers): eight readers 4.7 GB/s (0.34.1: 7.8, 0.34.0: 3.4), one 1.1 GB/s.
+  Through the mesh, chunks still go straight from the file.
+- **Exit:** while an exit is used, internet IPv6 is blocked (it went direct; needs `ip6tables`). If meshvpn
+  crashes, nothing goes out directly until it is back; stopping it takes the routes away as before, and
+  `uninstall` removes them in any case.
+
 ## [0.34.1] - 2026-11-14
 
 ### Added

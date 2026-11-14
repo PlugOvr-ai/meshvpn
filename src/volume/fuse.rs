@@ -72,7 +72,7 @@ impl Tree {
             },
         );
         children.insert(ROOT, BTreeMap::new());
-        let mut bytes = 0;
+        let mut bytes: u64 = 0;
         for f in files {
             let parts: Vec<&str> = f.path.split('/').collect();
             let mut cur = ROOT;
@@ -100,7 +100,7 @@ impl Tree {
                     bail!("inode number clash at {}", f.path);
                 }
                 if last {
-                    bytes += f.size;
+                    bytes = bytes.saturating_add(f.size);
                     nodes.insert(
                         n,
                         TNode {

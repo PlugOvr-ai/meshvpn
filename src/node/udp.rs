@@ -44,6 +44,15 @@ pub(super) const PATH_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(10);
 /// Below the ~30 s after which NATs forget an idle UDP mapping, so both sides' holes overlap.
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// A peer that answered none of its candidates for this long is probed far less often (its
+/// addresses may not be its own: a member must not keep every node probing a stranger).
+const PROBE_GIVE_UP: Duration = Duration::from_secs(120);
+const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(300);
+/// A changed candidate list starts the fast probing again at most this often.
+const PROBE_RESTART: Duration = Duration::from_secs(60);
+/// Candidates probed per peer at most, and ports per address.
+const MAX_CANDIDATES: usize = 16;
+const MAX_PORTS_PER_ADDRESS: usize = 3;
 /// Probes this far behind the sender's newest (by its clock) are taken for replays.
 const PROBE_REPLAY_MS: u64 = 120_000;
 /// Unfinished split datagrams, in all and per sending address.
@@ -93,6 +102,8 @@ pub(super) struct Probing {
     interval: Duration,
     /// Candidates the interval was computed for (restart quickly when they change).
     candidates: Vec<SocketAddr>,
+    /// Since when this peer has been probed without an answer (restarted with the list).
+    since: Instant,
 }
 
 fn mac(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
@@ -206,11 +217,29 @@ impl Node {
                 }
             }
         }
-        out.extend(info.udp6.iter().filter_map(|c| c.parse::<SocketAddr>().ok()));
+        let v6: Vec<SocketAddr> = info.udp6.iter().filter_map(|c| c.parse::<SocketAddr>().ok()).collect();
         out.retain(|a| !is_overlay(a.ip()) && super::address_dialable(a.ip()));
-        out.sort();
-        out.dedup();
-        out
+        // The node's own addresses first; a few ports per address; a few addresses in all
+        // (the IPv6 ones keep their room).
+        let mut picked: Vec<SocketAddr> = vec![];
+        let add = |picked: &mut Vec<SocketAddr>, a: SocketAddr, max: usize| {
+            let same_ip = picked.iter().filter(|p| p.ip() == a.ip()).count();
+            if picked.len() < max && !picked.contains(&a) && same_ip < MAX_PORTS_PER_ADDRESS {
+                picked.push(a);
+            }
+        };
+        let v6_room = v6.len().min(4);
+        for a in out {
+            add(&mut picked, a, MAX_CANDIDATES - v6_room);
+        }
+        for a in v6
+            .into_iter()
+            .filter(|a| !is_overlay(a.ip()) && super::address_dialable(a.ip()))
+        {
+            add(&mut picked, a, MAX_CANDIDATES);
+        }
+        picked.sort();
+        picked
     }
 
     fn probe_datagram(
@@ -348,17 +377,27 @@ impl Node {
                         next: now,
                         interval: Duration::from_secs(2),
                         candidates: candidates.clone(),
+                        since: now,
                     });
                     if pr.candidates != candidates {
                         pr.candidates = candidates.clone();
-                        pr.interval = Duration::from_secs(2);
-                        pr.next = now;
+                        // (a record that keeps changing doesn't keep the probing fast)
+                        if pr.since.elapsed() >= PROBE_RESTART {
+                            pr.interval = Duration::from_secs(2);
+                            pr.next = now;
+                            pr.since = now;
+                        }
                     }
                     if pr.next > now {
                         continue;
                     }
+                    let max = if pr.since.elapsed() < PROBE_GIVE_UP {
+                        MAX_PROBE_INTERVAL
+                    } else {
+                        SLOW_PROBE_INTERVAL
+                    };
                     pr.next = now + pr.interval;
-                    pr.interval = (pr.interval * 2).min(MAX_PROBE_INTERVAL);
+                    pr.interval = (pr.interval * 2).min(max);
                     candidates
                 }
             };
@@ -989,9 +1028,8 @@ mod tests {
         assert!(path_rank(&a("[2001:db8::1]:7870")) < path_rank(&a("80.1.2.3:7870")));
     }
 
-    #[test]
-    fn candidates_include_port_guesses() {
-        let info = NodeInfo {
+    fn info() -> NodeInfo {
+        NodeInfo {
             id: crate::keys::Key32([1; 32]),
             noise_pub: crate::keys::Key32([2; 32]),
             name: "a".into(),
@@ -1019,11 +1057,31 @@ mod tests {
             split: false,
             details: 0,
             ip_index: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn candidates_include_port_guesses() {
+        let info = info();
         let c: Vec<String> = Node::peer_candidates(&info).iter().map(|a| a.to_string()).collect();
         assert!(c.contains(&"192.168.10.3:7870".to_string()));
         assert!(c.contains(&"198.51.100.2:18972".to_string()), "reflexive address");
         assert!(c.contains(&"198.51.100.2:7870".to_string()), "port guess: {c:?}");
         assert!(c.contains(&"203.0.113.9:7870".to_string()), "endpoint host: {c:?}");
+    }
+
+    #[test]
+    fn candidates_are_capped() {
+        let mut info = info();
+        // One stranger's address on many ports, many addresses, multicast, IPv6.
+        info.udp = (0..8).map(|i| format!("203.0.113.7:{}", 1000 + i)).collect();
+        info.endpoints = (1..30).map(|i| format!("198.51.100.{i}:7870")).collect();
+        info.udp.push("224.0.0.1:7870".into());
+        info.udp6 = vec!["[2001:db8::1]:7870".into()];
+        let c = Node::peer_candidates(&info);
+        assert!(c.len() <= MAX_CANDIDATES, "{c:?}");
+        assert!(c.iter().filter(|a| a.ip().to_string() == "203.0.113.7").count() <= MAX_PORTS_PER_ADDRESS);
+        assert!(!c.iter().any(|a| a.ip().is_multicast()));
+        assert!(c.iter().any(|a| a.is_ipv6()), "IPv6 keeps its room: {c:?}");
     }
 }
