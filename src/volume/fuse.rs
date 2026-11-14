@@ -23,8 +23,9 @@ use tracing::warn;
 
 /// Where file data comes from.
 pub trait Source: Send + Sync {
-    /// `size` bytes of `file` from `off`, fewer at its end; Err is an errno.
-    fn read(&self, file: &Entry, off: u64, size: u32) -> Result<Vec<u8>, i32>;
+    /// `size` bytes of `file` from `off`, fewer at its end, into `out` (cleared first; the
+    /// same buffer for every read of a thread); Err is an errno.
+    fn read(&self, file: &Entry, off: u64, size: u32, out: &mut Vec<u8>) -> Result<(), i32>;
 }
 
 /// The file tree of one version of a volume.
@@ -501,6 +502,8 @@ fn serve(fd: &OwnedFd, fs: &Fs) {
     let raw = fd.as_raw_fd();
     // At least what the kernel asks for (max_write plus headers).
     let mut buf = vec![0u8; 256 * 1024];
+    // What reads return, used again (a new buffer for each would cost more than the copy).
+    let mut data = Vec::new();
     loop {
         // SAFETY: the buffer is valid for its length.
         let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
@@ -521,10 +524,22 @@ fn serve(fd: &OwnedFd, fs: &Fs) {
         let ino = u64_at(req, 16);
         let body = &req[IN_HEADER..];
         // A bug must not leave the program that reads waiting for good (nor end this thread).
+        if opcode == FUSE_READ {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(fs, body, &mut data)));
+            match r {
+                Ok(Ok(())) => send(raw, unique, Ok(&data)),
+                Ok(Err(e)) => send(raw, unique, Err(e)),
+                Err(_) => {
+                    data = Vec::new();
+                    send(raw, unique, Err(libc::EIO));
+                }
+            }
+            continue;
+        }
         let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(fs, opcode, ino, body)))
             .unwrap_or(Some(Err(libc::EIO)));
         if let Some(r) = reply {
-            send(raw, unique, r);
+            send(raw, unique, r.as_deref().map_err(|e| *e));
         }
     }
 }
@@ -568,13 +583,6 @@ fn handle(fs: &Fs, opcode: u32, ino: u64, body: &[u8]) -> Option<Result<Vec<u8>,
             Some(Kind::Dir(_)) => Err(libc::EISDIR),
             None => Err(libc::ENOENT),
         },
-        FUSE_READ => {
-            let e = fs.handles.lock().unwrap().get(&u64_at(body, 0)).cloned();
-            match e {
-                Some(e) => fs.src.read(&e, u64_at(body, 8), u32_at(body, 16)),
-                None => Err(libc::EBADF),
-            }
-        }
         FUSE_RELEASE => {
             fs.handles.lock().unwrap().remove(&u64_at(body, 0));
             Ok(vec![])
@@ -602,10 +610,18 @@ fn handle(fs: &Fs, opcode: u32, ino: u64, body: &[u8]) -> Option<Result<Vec<u8>,
     })
 }
 
-fn send(fd: i32, unique: u64, r: Result<Vec<u8>, i32>) {
-    let (error, data) = match r {
-        Ok(d) => (0i32, d),
-        Err(e) => (-e, vec![]),
+fn read(fs: &Fs, body: &[u8], out: &mut Vec<u8>) -> Result<(), i32> {
+    let e = fs.handles.lock().unwrap().get(&u64_at(body, 0)).cloned();
+    match e {
+        Some(e) => fs.src.read(&e, u64_at(body, 8), u32_at(body, 16), out),
+        None => Err(libc::EBADF),
+    }
+}
+
+fn send(fd: i32, unique: u64, r: Result<&[u8], i32>) {
+    let (error, data): (i32, &[u8]) = match r {
+        Ok(d) => (0, d),
+        Err(e) => (-e, &[]),
     };
     let header = Out::new().u32((16 + data.len()) as u32).u32(error as u32).u64(unique).0;
     let iov = [

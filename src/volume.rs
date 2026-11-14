@@ -2,14 +2,17 @@
 //!
 //! An admin makes a volume for a group of nodes (`meshvpn volume create NAME --nodes a,b,c`),
 //! optionally filled from network storage that every node of the group has mounted at the same
-//! path (`--from /mnt/lustre/imagenet`). The definition is an admin-signed document; the
-//! volume's file list (the manifest) is kept by its first node, which numbers its versions, and
-//! the others follow it.
+//! path (`--from /mnt/lustre/imagenet`). The definition is an admin-signed document. The
+//! volume's file list (the manifest) is kept by one node of the group, the lead, which numbers
+//! its versions; the others follow it. The lead is the first node of the group (in its order)
+//! that answers, if most of the group's nodes take it as theirs: when it is gone, the next one
+//! takes over (with three nodes or more), after bringing its list up to the newest any of them
+//! has. A change counts once most of the nodes have it, so the next lead has it too.
 //!
 //! Files are cut into chunks of 4 MB. Which nodes keep a chunk follows from the node ids and
 //! the file's id alone (rendezvous hashing). Files copied in (`meshvpn volume cp`, from any
 //! member - a laptop too) go straight to those nodes, in `copies` copies (2 by default: there is
-//! nothing behind them); then the first node takes them into the file list. Files from the
+//! nothing behind them); then the lead takes them into the file list. Files from the
 //! network storage are copied by each node itself, its share of them, all nodes at once; until
 //! then, and when that node is offline, they are read from the storage.
 //!
@@ -68,8 +71,14 @@ impl Def {
         format!("{}-{}", self.name, self.created)
     }
 
+    /// The node that reads the storage's file list when the volume is made.
     pub fn keeper(&self) -> NodeId {
         self.nodes[0]
+    }
+
+    /// Nodes that make a majority of the group.
+    fn majority(&self) -> usize {
+        self.nodes.len() / 2 + 1
     }
 
     pub fn mount(&self) -> PathBuf {
@@ -234,7 +243,7 @@ fn check_entry(f: &Entry, chunk: u64) -> Result<()> {
 }
 
 /// Files copied in (`add`) and paths removed (files, or directories with everything in them).
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Commit {
     pub add: Vec<Entry>,
     pub remove: Vec<String>,
@@ -565,17 +574,24 @@ impl Store {
         Ok(())
     }
 
-    /// `len` bytes from `within` of a chunk this node has.
-    fn read(&self, id: u128, chunk: u32, within: u64, len: u32) -> Option<std::io::Result<Vec<u8>>> {
-        if !self.has(id, chunk) {
-            return None;
+    /// `len` bytes from `within` of a chunk this node has, after `out` (left as it was if the
+    /// read fails).
+    fn read_into(&self, id: u128, chunk: u32, within: u64, len: u32, out: &mut Vec<u8>) -> Option<std::io::Result<()>> {
+        let f = match self.open_chunk(id, chunk)? {
+            Ok(f) => f,
+            Err(e) => return Some(Err(e)),
+        };
+        let start = out.len();
+        out.resize(start + len as usize, 0);
+        let r = f.read_exact_at(&mut out[start..], within);
+        if r.is_err() {
+            out.truncate(start);
         }
-        let mut buf = vec![0u8; len as usize];
-        Some(
-            std::fs::File::open(self.path(id, chunk))
-                .and_then(|f| f.read_exact_at(&mut buf, within))
-                .map(|_| buf),
-        )
+        Some(r)
+    }
+
+    fn open_chunk(&self, id: u128, chunk: u32) -> Option<std::io::Result<std::fs::File>> {
+        self.has(id, chunk).then(|| std::fs::File::open(self.path(id, chunk)))
     }
 
     /// Deletes the chunks of files the volume no longer has (left alone for `GC_AFTER`: an
@@ -635,6 +651,65 @@ impl Store {
 
 // ------------------------------------------------------------------------------- one volume
 
+/// How a node of a volume stands (`VolState`): its version of the file list and the list's
+/// hash, which node it takes the list from, and whether it keeps it now.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct State {
+    pub version: u64,
+    pub hash: String,
+    #[serde(default)]
+    pub lead: Option<NodeId>,
+    #[serde(default)]
+    pub leading: bool,
+}
+
+/// Which node keeps the file list, as this node sees it.
+#[derive(Default)]
+struct Lead {
+    /// The first node of the group that answers (this one, if those before it don't).
+    node: Option<NodeId>,
+    /// This node keeps the list: it is the first that answers, and most nodes take it as theirs.
+    leading: bool,
+    /// When each other node of the group last answered.
+    seen: HashMap<NodeId, Instant>,
+}
+
+/// A node not taking commits just now (asked again in a moment).
+#[derive(Debug)]
+pub struct NotLead(String);
+
+impl std::fmt::Display for NotLead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotLead {}
+
+/// A node counts as there while it answered in the last few seconds.
+const ANSWERED: Duration = Duration::from_secs(5);
+/// How long a commit waits for most of the nodes to have it.
+const SPREAD: Duration = Duration::from_secs(10);
+
+/// The file list as it is sent, with its version and hash.
+struct Wire {
+    version: u64,
+    bytes: Vec<u8>,
+    hash: String,
+}
+
+impl Wire {
+    fn of(m: &Manifest) -> Result<Wire> {
+        let bytes = serde_json::to_vec(m)?;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        Ok(Wire {
+            version: m.version,
+            bytes,
+            hash,
+        })
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     /// Chunks from the storage this node keeps, and how many of them it has.
@@ -688,11 +763,56 @@ struct Vol {
     store: Option<Arc<Store>>,
     stats: Stats,
     man: RwLock<Arc<Manifest>>,
+    wire: RwLock<Arc<Wire>>,
     /// Source files opened (and checked) for reads: a few (each is a descriptor).
     open_src: Mutex<HashMap<String, Arc<std::fs::File>>>,
+    lead: Mutex<Lead>,
+    /// The newest version each other node of the group fetched (a commit waits for most).
+    fetched: Mutex<HashMap<NodeId, u64>>,
+    /// Fetching a new version the lead told of (one at a time).
+    nudged: AtomicBool,
 }
 
 impl Vol {
+    fn new(
+        def: Def,
+        node: &Arc<Node>,
+        pool: Arc<crate::share::Pool>,
+        store: Option<Arc<Store>>,
+        m: Manifest,
+    ) -> Result<Vol> {
+        Ok(Vol {
+            def,
+            me: node.id(),
+            node: node.clone(),
+            rt: tokio::runtime::Handle::current(),
+            pool,
+            store,
+            stats: Stats::default(),
+            wire: RwLock::new(Arc::new(Wire::of(&m)?)),
+            man: RwLock::new(Arc::new(m)),
+            open_src: Mutex::new(HashMap::new()),
+            lead: Mutex::new(Lead::default()),
+            fetched: Mutex::new(HashMap::new()),
+            nudged: AtomicBool::new(false),
+        })
+    }
+
+    fn state(&self) -> State {
+        let w = self.wire.read().unwrap().clone();
+        let l = self.lead.lock().unwrap();
+        State {
+            version: w.version,
+            hash: w.hash.clone(),
+            lead: l.node,
+            leading: l.leading,
+        }
+    }
+
+    fn leading(&self) -> bool {
+        self.lead.lock().unwrap().leading
+    }
+
     fn manifest(&self) -> Arc<Manifest> {
         self.man.read().unwrap().clone()
     }
@@ -735,9 +855,12 @@ impl Vol {
     ) -> Result<(), i32> {
         let id = e.id128();
         let within = pos - c * chunk;
-        if let Some(Ok(b)) = self.store.as_ref().and_then(|s| s.read(id, c as u32, within, len)) {
+        if let Some(Ok(())) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_into(id, c as u32, within, len, out))
+        {
             self.stats.local_bytes.fetch_add(len as u64, Relaxed);
-            out.extend_from_slice(&b);
             return Ok(());
         }
         for keeper in keepers(&self.def.nodes, id, c, self.copies(e)) {
@@ -745,19 +868,21 @@ impl Vol {
                 continue;
             }
             let key = self.def.key();
+            let start = out.len();
             let fetch = self
                 .pool
-                .volume_read(&self.node, keeper, &key, user, &e.id, c as u32, within, len);
+                .volume_read_into(&self.node, keeper, &key, user, &e.id, c as u32, within, len, out);
             // The timer must be made inside the runtime: this is one of the FUSE threads.
-            if let Ok(Ok(Some(b))) = self
+            let got = self
                 .rt
-                .block_on(async { tokio::time::timeout(Duration::from_secs(10), fetch).await })
-                && b.len() == len as usize
+                .block_on(async { tokio::time::timeout(Duration::from_secs(10), fetch).await });
+            if let Ok(Ok(true)) = got
+                && out.len() == start + len as usize
             {
                 self.stats.remote_bytes.fetch_add(len as u64, Relaxed);
-                out.extend_from_slice(&b);
                 return Ok(());
             }
+            out.truncate(start);
         }
         if !e.src {
             self.stats.errors.fetch_add(1, Relaxed);
@@ -772,31 +897,35 @@ impl Vol {
         Ok(())
     }
 
-    fn read_entry(&self, e: &Entry, off: u64, size: u32, user: Option<&str>) -> Result<Vec<u8>, i32> {
+    /// `size` bytes of `e` from `off` (fewer at its end) into `out`, which is cleared first (a
+    /// buffer used again and again: no new memory for every read).
+    fn read_entry(&self, e: &Entry, off: u64, size: u32, user: Option<&str>, out: &mut Vec<u8>) -> Result<(), i32> {
+        out.clear();
         if off >= e.size {
-            return Ok(vec![]);
+            return Ok(());
         }
         let chunk = self.manifest().chunk;
         let end = off.saturating_add(size as u64).min(e.size);
-        let mut out = Vec::with_capacity((end - off) as usize);
         let mut pos = off;
         while pos < end {
             let c = pos / chunk;
             let stop = ((c + 1) * chunk).min(end);
-            self.piece(e, chunk, c, pos, (stop - pos) as u32, user, &mut out)?;
+            self.piece(e, chunk, c, pos, (stop - pos) as u32, user, out)?;
             pos = stop;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// A new version of the file list: the mount shows it, and chunks no file needs any more
     /// go (after a while).
     fn set_manifest(&self, m: Manifest, mount: Option<&fuse::Mount>) -> Result<()> {
         let tree = fuse::Tree::build(&m.files)?;
+        let wire = Wire::of(&m)?;
         if let Some(mount) = mount {
             mount.update(tree);
         }
         *self.man.write().unwrap() = Arc::new(m);
+        *self.wire.write().unwrap() = Arc::new(wire);
         Ok(())
     }
 
@@ -817,8 +946,8 @@ impl Vol {
 struct Reader(Arc<Vol>);
 
 impl fuse::Source for Reader {
-    fn read(&self, e: &Entry, off: u64, size: u32) -> Result<Vec<u8>, i32> {
-        self.0.read_entry(e, off, size, None)
+    fn read(&self, e: &Entry, off: u64, size: u32, out: &mut Vec<u8>) -> Result<(), i32> {
+        self.0.read_entry(e, off, size, None, out)
     }
 }
 
@@ -1027,10 +1156,19 @@ impl Volumes {
         (who.user.is_none() && v.def.nodes.contains(&who.node)) || account(&v.node, who).is_ok()
     }
 
-    /// The version of the file list (on the node that keeps it).
+    /// The version of the file list (on the node that keeps it; nodes of 0.34.0 ask this).
     pub fn head(&self, key: &str, who: &Who) -> Option<Vec<u8>> {
         let v = self.vol(key)?;
-        (v.def.keeper() == v.me && self.sees(&v, who)).then(|| v.manifest().version.to_be_bytes().to_vec())
+        (v.leading() && self.sees(&v, who)).then(|| v.manifest().version.to_be_bytes().to_vec())
+    }
+
+    /// How this node stands in the volume (every node of it answers).
+    pub fn state(&self, key: &str, who: &Who) -> Option<Vec<u8>> {
+        let v = self.vol(key)?;
+        if !self.sees(&v, who) {
+            return None;
+        }
+        serde_json::to_vec(&v.state()).ok()
     }
 
     pub fn manifest_bytes(&self, key: &str, who: &Who) -> Option<Vec<u8>> {
@@ -1038,27 +1176,56 @@ impl Volumes {
         if !self.sees(&v, who) {
             return None;
         }
-        serde_json::to_vec(&*v.manifest()).ok()
+        let w = v.wire.read().unwrap().clone();
+        if who.user.is_none() && who.node != v.me && v.def.nodes.contains(&who.node) {
+            let mut f = v.fetched.lock().unwrap();
+            let n = f.entry(who.node).or_default();
+            *n = (*n).max(w.version);
+        }
+        Some(w.bytes.clone())
     }
 
-    /// Bytes of a chunk this node keeps (None: not here, or not for `who`: a user reads only
-    /// what its account here may read; the volume's nodes read for their mounts, where the
-    /// kernel checks).
-    pub fn read_local(&self, key: &str, who: &Who, id: &str, chunk: u32, within: u64, len: u32) -> Option<Vec<u8>> {
-        let v = self.vol(key)?;
+    /// Sends bytes of a chunk this node keeps on `sock` (the chunk server's connection: the
+    /// length, then the bytes, straight from the file - no copy here), if it is here and for
+    /// `who`: a user reads only what its account here may read; the volume's nodes read for
+    /// their mounts, where the kernel checks. Ok(false): not sent (nothing was written).
+    /// Blocking: called on a thread of its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_local(
+        &self,
+        sock: i32,
+        key: &str,
+        who: &Who,
+        id: &str,
+        chunk: u32,
+        within: u64,
+        len: u32,
+    ) -> std::io::Result<bool> {
+        let Some(v) = self.vol(key) else { return Ok(false) };
         if len as u64 > v.manifest().chunk {
-            return None;
+            return Ok(false);
         }
         if !(who.user.is_none() && v.def.nodes.contains(&who.node)) {
-            let (_, creds) = account(&v.node, who).ok()?;
+            let Ok((_, creds)) = account(&v.node, who) else {
+                return Ok(false);
+            };
             let m = v.manifest();
-            let e = m.files.iter().find(|f| f.id == id)?;
-            if !may_read(e, &creds) {
-                return None;
+            if !m.files.iter().find(|f| f.id == id).is_some_and(|e| may_read(e, &creds)) {
+                return Ok(false);
             }
         }
-        let id = u128::from_str_radix(id, 16).ok()?;
-        v.store.as_ref()?.read(id, chunk, within, len)?.ok()
+        let Ok(id) = u128::from_str_radix(id, 16) else {
+            return Ok(false);
+        };
+        let Some(Ok(f)) = v.store.as_ref().and_then(|s| s.open_chunk(id, chunk)) else {
+            return Ok(false);
+        };
+        if f.metadata()?.len() < within + len as u64 {
+            return Ok(false);
+        }
+        send_all(sock, &(len as u64).to_be_bytes())?;
+        sendfile_all(sock, &f, within, len as u64)?;
+        Ok(true)
     }
 
     /// A chunk copied in: kept if this node is one of the volume's, `who` has SSH access here,
@@ -1086,8 +1253,20 @@ impl Volumes {
     pub async fn commit(&self, key: &str, who: &Who, mut c: Commit) -> Result<u64> {
         let _one = self.commit_lock.lock().await;
         let v = self.vol(key).ok_or_else(|| anyhow!("no volume {key} here"))?;
-        if v.def.keeper() != v.me {
-            bail!("this node doesn't keep the file list of {}", v.def.name);
+        let lead = v.lead.lock().unwrap().node;
+        if !v.leading() {
+            let why = match lead {
+                Some(l) if l != v.me => format!(
+                    "{} keeps the file list of {}",
+                    v.node.node_names(&[l]).join(""),
+                    v.def.name
+                ),
+                _ => format!(
+                    "not enough nodes of {} answer: changes wait until most of them are back (reading works)",
+                    v.def.name
+                ),
+            };
+            return Err(NotLead(why).into());
         }
         let (name, creds) = account(&v.node, who)?;
         let mut m = (*v.manifest()).clone();
@@ -1130,7 +1309,46 @@ impl Volumes {
         if let Some(a) = a {
             a.vol.set_manifest(m, a.mount.lock().unwrap().as_ref())?;
         }
+        // The others fetch it now (not at their next round).
+        for &n in v.def.nodes.iter().filter(|n| **n != v.me) {
+            let (node, pool, key) = (v.node.clone(), v.pool.clone(), v.def.key());
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(3), pool.volume_nudge(&node, n, &key)).await;
+            });
+        }
+        // Done once most of the nodes have it: then the next lead has it too.
+        let need = v.def.majority() - 1;
+        let have = || v.fetched.lock().unwrap().values().filter(|&&n| n >= version).count();
+        let until = Instant::now() + SPREAD;
+        while have() < need && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if have() < need {
+            bail!(
+                "{}: version {version} is on {} of {} nodes only so far - it may be lost if this node goes away",
+                v.def.name,
+                have() + 1,
+                v.def.nodes.len()
+            );
+        }
         Ok(version)
+    }
+
+    /// `from` says there is a new version of the file list: fetched now if `from` keeps it.
+    pub fn nudged(&self, node: &Arc<Node>, key: &str, from: NodeId) {
+        let a = self.active.lock().unwrap().get(key).cloned();
+        let Some(a) = a else { return };
+        let v = &a.vol;
+        if from == v.me || v.lead.lock().unwrap().node != Some(from) || v.nudged.swap(true, Relaxed) {
+            return;
+        }
+        let node = node.clone();
+        tokio::spawn(async move {
+            if let Err(e) = node.volumes.adopt(&node, &a, from).await {
+                warn!("volume {}: the file list: {e:#}", a.vol.def.name);
+            }
+            a.vol.nudged.store(false, Relaxed);
+        });
     }
 
     pub fn shutdown(&self) {
@@ -1148,9 +1366,11 @@ impl Volumes {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let mut round = 0u64;
         loop {
-            node.volumes.reconcile(&node).await;
+            if round.is_multiple_of(3) {
+                node.volumes.reconcile(&node).await;
+            }
             node.volumes.follow(&node).await;
-            if round.is_multiple_of(100) {
+            if round.is_multiple_of(300) {
                 let all: Vec<Arc<Vol>> = node
                     .volumes
                     .active
@@ -1162,7 +1382,7 @@ impl Volumes {
                 let _ = tokio::task::spawn_blocking(move || all.iter().for_each(|v| v.collect())).await;
             }
             round += 1;
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -1204,7 +1424,7 @@ impl Volumes {
                 .lock()
                 .unwrap()
                 .get(&def.name)
-                .is_some_and(|(k, at, _)| *k == key && at.elapsed() < Duration::from_secs(10))
+                .is_some_and(|(k, at, _)| *k == key && at.elapsed() < Duration::from_secs(3))
             {
                 continue;
             }
@@ -1214,84 +1434,158 @@ impl Volumes {
                     self.active.lock().unwrap().insert(key, a);
                 }
                 Err(e) => {
-                    warn!("volume {}: {e:#}", def.name);
-                    self.failed
-                        .lock()
-                        .unwrap()
-                        .insert(def.name.clone(), (key, Instant::now(), format!("{e:#}")));
+                    let why = format!("{e:#}");
+                    let mut failed = self.failed.lock().unwrap();
+                    if failed.get(&def.name).is_none_or(|(k, _, w)| *k != key || *w != why) {
+                        warn!("volume {}: {why} (tried again every few seconds)", def.name);
+                    }
+                    failed.insert(def.name.clone(), (key, Instant::now(), why));
                 }
             }
         }
     }
 
-    /// The nodes that don't keep the file list fetch its new versions.
+    /// Every volume of this node, at once: who keeps the file list, and its newest version.
     async fn follow(&self, node: &Arc<Node>) {
-        let following: Vec<Arc<Active>> = self
-            .active
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|a| a.vol.def.keeper() != a.vol.me)
-            .cloned()
-            .collect();
-        for a in following {
-            let v = &a.vol;
-            let Ok(m) = self.fetch_manifest(node, &v.def, v.manifest().version, None).await else {
-                continue;
-            };
-            let Some(m) = m else { continue };
-            if let Err(e) = self.save_manifest(&m) {
-                warn!("volume {}: saving the file list: {e:#}", v.def.name);
-            }
-            if let Err(e) = v.set_manifest(m, a.mount.lock().unwrap().as_ref()) {
-                warn!("volume {}: {e:#}", v.def.name);
-            }
+        let all: Vec<Arc<Active>> = self.active.lock().unwrap().values().cloned().collect();
+        let mut set = tokio::task::JoinSet::new();
+        for a in all {
+            let node = node.clone();
+            set.spawn(async move { node.volumes.round(&node, &a).await });
         }
+        set.join_all().await;
     }
 
-    /// The file list from the node that keeps it, if it is newer than `have`.
-    async fn fetch_manifest(&self, node: &Node, def: &Def, have: u64, user: Option<&str>) -> Result<Option<Manifest>> {
-        let keeper = def.keeper();
-        let head = tokio::time::timeout(
-            Duration::from_secs(5),
-            self.pool.volume_head(node, keeper, &def.key(), user),
-        )
-        .await??
-        .ok_or_else(|| match user {
-            // The keeper answers a user only if it could log in there.
-            Some(u) => anyhow!(
-                "{u} may not use volume {}: that needs SSH access to {} (meshvpn ssh allow there)",
-                def.name,
-                node.node_names(&[keeper]).join("")
-            ),
-            None => anyhow!("{} has no file list for it", def.name),
-        })?;
-        let version = u64::from_be_bytes(head.get(..8).and_then(|b| b.try_into().ok()).unwrap_or_default());
-        if version <= have {
-            return Ok(None);
+    /// What the other nodes of the volume say (for `user`: only those where it has access
+    /// answer; `Ok(None)`: the node is there but doesn't answer this).
+    async fn states(&self, node: &Arc<Node>, def: &Def, user: Option<&str>) -> Vec<(NodeId, Result<Option<State>>)> {
+        let mut set = tokio::task::JoinSet::new();
+        for &n in def.nodes.iter().filter(|n| **n != node.id()) {
+            let (node, pool, key, user) = (node.clone(), self.pool.clone(), def.key(), user.map(String::from));
+            set.spawn(async move {
+                let ask = pool.volume_state(&node, n, &key, user.as_deref());
+                let r = match tokio::time::timeout(Duration::from_secs(3), ask).await {
+                    Ok(Ok(Some(b))) => serde_json::from_slice::<State>(&b).map(Some).map_err(Into::into),
+                    Ok(Ok(None)) => Ok(None),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(anyhow!("no answer")),
+                };
+                (n, r)
+            });
         }
+        set.join_all().await
+    }
+
+    /// One round for one volume: which node keeps the file list (the first that answers; it
+    /// keeps it if most take it as theirs, and once it has the newest version any of them
+    /// has), and the list from it when it changed.
+    async fn round(&self, node: &Arc<Node>, a: &Active) {
+        let v = &a.vol;
+        let answers: Vec<(NodeId, State)> = self
+            .states(node, &v.def, None)
+            .await
+            .into_iter()
+            .filter_map(|(n, r)| Some((n, r.ok()??)))
+            .collect();
+        let now = Instant::now();
+        let mine = v.state();
+        let (lead, from, votes) = {
+            let mut l = v.lead.lock().unwrap();
+            for (n, _) in &answers {
+                l.seen.insert(*n, now);
+            }
+            let there = |n: &NodeId| l.seen.get(n).is_some_and(|t| t.elapsed() < ANSWERED);
+            decide(&v.def.nodes, v.me, there, &answers, &mine)
+        };
+        if let Some(n) = from
+            && let Err(e) = self.adopt(node, a, n).await
+        {
+            warn!(
+                "volume {}: the file list from {}: {e:#}",
+                v.def.name,
+                node.node_names(&[n]).join("")
+            );
+        }
+        // Leading once it has the newest list of those that answered.
+        let newest = answers.iter().map(|(_, st)| st.version).max().unwrap_or(0);
+        let leading = lead == v.me && votes && v.state().version >= newest;
+        let version = v.state().version;
+        let mut l = v.lead.lock().unwrap();
+        if (l.node, l.leading) != (Some(lead), leading) {
+            let name = node.node_names(&[lead]).join("");
+            match (leading, lead == v.me) {
+                (true, _) => info!(
+                    "volume {}: this node keeps the file list (version {version})",
+                    v.def.name
+                ),
+                (false, true) => info!(
+                    "volume {}: waiting for most of its nodes to answer before taking changes",
+                    v.def.name
+                ),
+                (false, false) => info!("volume {}: {name} keeps the file list", v.def.name),
+            }
+        }
+        l.node = Some(lead);
+        l.leading = leading;
+    }
+
+    /// `from`'s file list, if it is newer than ours or the same version told otherwise.
+    async fn adopt(&self, node: &Arc<Node>, a: &Active, from: NodeId) -> Result<()> {
+        let v = &a.vol;
+        let m = self.fetch_from(node, &v.def, from, None).await?;
+        let mine = v.state();
+        if m.version < mine.version || (m.version == mine.version && Wire::of(&m)?.hash == mine.hash) {
+            return Ok(());
+        }
+        self.save_manifest(&m)?;
+        v.set_manifest(m, a.mount.lock().unwrap().as_ref())
+    }
+
+    async fn fetch_from(&self, node: &Node, def: &Def, from: NodeId, user: Option<&str>) -> Result<Manifest> {
         let bytes = tokio::time::timeout(
             Duration::from_secs(120),
-            self.pool.volume_manifest(node, keeper, &def.key(), user),
+            self.pool.volume_manifest(node, from, &def.key(), user),
         )
         .await??
-        .ok_or_else(|| anyhow!("no file list"))?;
+        .ok_or_else(|| anyhow!("no file list from {}", node.node_names(&[from]).join("")))?;
         let m: Manifest = serde_json::from_slice(&bytes)?;
         m.validate()?;
         if m.volume != def.key() {
             bail!("the file list of another volume");
         }
-        Ok(Some(m))
+        Ok(m)
     }
 
-    /// The file list to start with: our saved copy, a new one (the node that keeps it: an
-    /// empty volume, or the files of the source), or the keeper's.
+    /// The node to take the file list from: the lead, else the one with the newest version.
+    /// For `user`, the error says why there is none.
+    async fn best(&self, node: &Arc<Node>, def: &Def, user: Option<&str>) -> Result<(NodeId, State)> {
+        let answers = self.states(node, def, user).await;
+        let refused = answers.iter().any(|(_, r)| matches!(r, Ok(None)));
+        let mut ok: Vec<(NodeId, State)> = answers.into_iter().filter_map(|(n, r)| Some((n, r.ok()??))).collect();
+        ok.sort_by_key(|(_, st)| (st.leading, st.version));
+        if let Some(best) = ok.pop() {
+            return Ok(best);
+        }
+        Err(match user {
+            // The nodes answer a user only if it could log in there.
+            Some(u) if refused => anyhow!(
+                "{u} may not use volume {}: that needs SSH access to its nodes (meshvpn ssh allow there)",
+                def.name
+            ),
+            _ if refused => anyhow!("the nodes of {} don't have it running yet", def.name),
+            _ => anyhow!("none of the nodes of {} answers", def.name),
+        })
+    }
+
+    /// The file list to start with: our saved copy, the newest another node of the group has,
+    /// or a new one (on the first node: an empty volume, or the files of the source).
     async fn first_manifest(&self, node: &Arc<Node>, def: &Def) -> Result<Manifest> {
         if let Some(m) = self.load_manifest(&def.key()) {
             return Ok(m);
         }
-        let m = if def.keeper() == node.id() {
-            match &def.source {
+        let m = match self.best(node, def, None).await {
+            Ok((n, _)) => self.fetch_from(node, def, n, None).await?,
+            Err(_) if def.keeper() == node.id() => match &def.source {
                 Some(src) => {
                     let (src, key) = (PathBuf::from(src), def.key());
                     let (m, skipped) = tokio::task::spawn_blocking(move || scan(&src, &key)).await??;
@@ -1313,12 +1607,8 @@ impl Volumes {
                     chunk: CHUNK,
                     files: vec![],
                 },
-            }
-        } else {
-            self.fetch_manifest(node, def, 0, None)
-                .await
-                .with_context(|| format!("the file list (from {})", node.node_names(&[def.keeper()]).join("")))?
-                .ok_or_else(|| anyhow!("no file list yet"))?
+            },
+            Err(e) => return Err(e.context(format!("the file list of {}", def.name))),
         };
         self.save_manifest(&m)?;
         Ok(m)
@@ -1335,17 +1625,7 @@ impl Volumes {
         let tree = fuse::Tree::build(&m.files)?;
         let dir = def.store_dir();
         let store = Arc::new(tokio::task::spawn_blocking(move || Store::open(&dir)).await??);
-        let vol = Arc::new(Vol {
-            def: def.clone(),
-            me: node.id(),
-            node: node.clone(),
-            rt: tokio::runtime::Handle::current(),
-            pool: self.pool.clone(),
-            store: Some(store),
-            stats: Stats::default(),
-            man: RwLock::new(Arc::new(m)),
-            open_src: Mutex::new(HashMap::new()),
-        });
+        let vol = Arc::new(Vol::new(def.clone(), node, self.pool.clone(), Some(store), m)?);
         let path = def.mount();
         let reader = Arc::new(Reader(vol.clone()));
         let user = crate::config::rootless();
@@ -1384,44 +1664,77 @@ impl Volumes {
         if let Some(v) = self.vol(&def.key()) {
             return Ok(v);
         }
+        let (from, _) = self.best(node, &def, user).await?;
         let m = self
-            .fetch_manifest(node, &def, 0, user)
+            .fetch_from(node, &def, from, user)
             .await
-            .with_context(|| format!("the file list of {name}"))?
-            .ok_or_else(|| anyhow!("no file list"))?;
-        Ok(Arc::new(Vol {
-            def,
-            me: node.id(),
-            node: node.clone(),
-            rt: tokio::runtime::Handle::current(),
-            pool: self.pool.clone(),
-            store: None,
-            stats: Stats::default(),
-            man: RwLock::new(Arc::new(m)),
-            open_src: Mutex::new(HashMap::new()),
-        }))
+            .with_context(|| format!("the file list of {name}"))?;
+        Ok(Arc::new(Vol::new(def, node, self.pool.clone(), None, m)?))
     }
 
+    /// A commit to the node that keeps the file list (asked again for a while when there is
+    /// none just now, or it changes).
     async fn send_commit(&self, node: &Arc<Node>, v: &Vol, user: Option<&str>, c: Commit) -> Result<u64> {
-        if v.def.keeper() == v.me {
+        let body = serde_json::to_vec(&c)?;
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let err = match self.try_commit(node, v, user, &c, &body).await {
+                Ok(n) => return Ok(n),
+                Err((e, false)) => return Err(e),
+                Err((e, true)) => e,
+            };
+            if Instant::now() > until {
+                return Err(err);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// The error, and whether to ask again.
+    async fn try_commit(
+        &self,
+        node: &Arc<Node>,
+        v: &Vol,
+        user: Option<&str>,
+        c: &Commit,
+        body: &[u8],
+    ) -> Result<u64, (anyhow::Error, bool)> {
+        // A node of the volume knows the lead; the others ask.
+        let lead = match v.store {
+            Some(_) => v.lead.lock().unwrap().node,
+            None => match self.best(node, &v.def, user).await {
+                Ok((n, st)) if st.leading => Some(n),
+                Ok(_) => None,
+                Err(e) => return Err((e, false)),
+            },
+        };
+        let Some(lead) = lead else {
+            return Err((anyhow!("no node of {} keeps its file list just now", v.def.name), true));
+        };
+        if lead == v.me {
             let who = Who {
                 node: v.me,
                 user: user.map(String::from),
             };
-            return self.commit(&v.def.key(), &who, c).await;
+            return self.commit(&v.def.key(), &who, c.clone()).await.map_err(|e| {
+                let again = e.downcast_ref::<NotLead>().is_some();
+                (e, again)
+            });
         }
-        let body = serde_json::to_vec(&c)?;
+        let name = node.node_names(&[lead]).join("");
         let answer = tokio::time::timeout(
             Duration::from_secs(120),
-            self.pool.volume_commit(node, v.def.keeper(), &v.def.key(), user, &body),
+            self.pool.volume_commit(node, lead, &v.def.key(), user, body),
         )
-        .await??
-        .ok_or_else(|| anyhow!("{} refused the files", node.node_names(&[v.def.keeper()]).join("")))?;
-        let r: serde_json::Value = serde_json::from_slice(&answer)?;
+        .await
+        .map_err(|_| (anyhow!("{name} doesn't answer"), true))?
+        .map_err(|e| (e, true))?
+        .ok_or_else(|| (anyhow!("{name} refused the files"), false))?;
+        let r: serde_json::Value = serde_json::from_slice(&answer).map_err(|e| (e.into(), false))?;
         match (r["version"].as_u64(), r["error"].as_str()) {
             (Some(n), _) => Ok(n),
-            (_, Some(e)) => bail!("{e}"),
-            _ => bail!("no answer"),
+            (_, Some(e)) => Err((anyhow!("{e}"), r["retry"] == true)),
+            _ => Err((anyhow!("no answer from {name}"), false)),
         }
     }
 
@@ -1593,6 +1906,7 @@ impl Volumes {
                 let dest = dest.canonicalize()?;
                 let mut created = vec![];
                 let mut bytes = 0;
+                let mut data = Vec::new();
                 for (e, rel) in &picked {
                     let target = crate::share::inside(&dest, rel, &mut created)?;
                     let mut o = std::fs::OpenOptions::new();
@@ -1605,9 +1919,10 @@ impl Volumes {
                     let mut off = 0;
                     while off < e.size {
                         let want = (e.size - off).min(4 << 20) as u32;
-                        let data = v2.read_entry(e, off, want, user.as_deref()).map_err(|errno| {
-                            anyhow!("{vname}:{}: {}", e.path, std::io::Error::from_raw_os_error(errno))
-                        })?;
+                        v2.read_entry(e, off, want, user.as_deref(), &mut data)
+                            .map_err(|errno| {
+                                anyhow!("{vname}:{}: {}", e.path, std::io::Error::from_raw_os_error(errno))
+                            })?;
                         if data.is_empty() {
                             break;
                         }
@@ -1655,6 +1970,8 @@ impl Volumes {
                         "read_source_bytes": s.source_bytes.load(Relaxed),
                         "errors": s.errors.load(Relaxed),
                         "note": s.note.lock().unwrap().clone(),
+                        "lead": v.lead.lock().unwrap().node.map(|n| node.node_names(&[n]).join("")),
+                        "leading": v.leading(),
                     })
                 });
                 serde_json::json!({
@@ -1776,6 +2093,93 @@ async fn upload_file(
     })
 }
 
+/// One round's decision on a node of a volume, from what the others answered: the lead (the
+/// first node of the group that answered, `there`; this one if none before it did), the node
+/// to take a newer file list from (on the lead: the one with the newest; elsewhere: the lead,
+/// when its list is newer or the same version with other content), and whether most of the
+/// group takes this node as its lead.
+fn decide(
+    nodes: &[NodeId],
+    me: NodeId,
+    there: impl Fn(&NodeId) -> bool,
+    answers: &[(NodeId, State)],
+    mine: &State,
+) -> (NodeId, Option<NodeId>, bool) {
+    let lead = nodes.iter().copied().find(|n| *n == me || there(n)).unwrap_or(me);
+    if lead != me {
+        let from = answers
+            .iter()
+            .find(|(n, st)| {
+                *n == lead && (st.version > mine.version || (st.version == mine.version && st.hash != mine.hash))
+            })
+            .map(|(n, _)| *n);
+        return (lead, from, false);
+    }
+    let from = answers
+        .iter()
+        .filter(|(_, st)| st.version > mine.version)
+        .max_by_key(|(_, st)| st.version)
+        .map(|(n, _)| *n);
+    let votes = 1 + answers.iter().filter(|(_, st)| st.lead == Some(me)).count();
+    (lead, from, votes > nodes.len() / 2)
+}
+
+/// Waits (blocking) until the non-blocking socket `fd` takes more.
+fn writable(fd: i32) -> std::io::Result<()> {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    match unsafe { libc::poll(&mut p, 1, 30_000) } {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        n if n < 0 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// Whether to try again (after waiting for `fd` to take more).
+fn again(fd: i32) -> std::io::Result<()> {
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EAGAIN) => writable(fd),
+        Some(libc::EINTR) => Ok(()),
+        _ => Err(e),
+    }
+}
+
+/// All of `buf` onto the non-blocking socket `fd`, waiting when it is full.
+fn send_all(fd: i32, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
+        if n < 0 {
+            again(fd)?;
+        } else {
+            buf = &buf[n as usize..];
+        }
+    }
+    Ok(())
+}
+
+/// `len` bytes of `f` from `off` onto the non-blocking socket `fd`, by the kernel (sendfile).
+fn sendfile_all(fd: i32, f: &std::fs::File, off: u64, len: u64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut off = off as libc::off_t;
+    let end = off + len as libc::off_t;
+    while off < end {
+        // SAFETY: valid descriptors; sendfile advances `off`.
+        let n = unsafe { libc::sendfile(fd, f.as_raw_fd(), &mut off, (end - off) as usize) };
+        match n {
+            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n if n < 0 => again(fd)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A node serving many files (and FUSE) needs more descriptors than the usual 1024.
 fn raise_open_files() {
     // SAFETY: zeroed is a valid rlimit; the results are checked.
@@ -1794,6 +2198,43 @@ mod tests {
 
     fn id(b: u8) -> NodeId {
         crate::keys::Key32([b; 32])
+    }
+
+    #[test]
+    fn the_first_that_answers_leads_with_most_votes() {
+        let nodes = [id(1), id(2), id(3)];
+        let st = |version, hash: &str, lead: Option<NodeId>| State {
+            version,
+            hash: hash.into(),
+            lead,
+            leading: false,
+        };
+        let mine = st(5, "x", None);
+        // All there: 1 leads; 2 follows it.
+        let all = |_: &NodeId| true;
+        let answers = [(id(2), st(5, "x", Some(id(1)))), (id(3), st(5, "x", Some(id(1))))];
+        assert_eq!(decide(&nodes, id(1), all, &answers, &mine), (id(1), None, true));
+        let answers2 = [(id(1), st(6, "y", Some(id(1)))), (id(3), st(5, "x", Some(id(1))))];
+        assert_eq!(
+            decide(&nodes, id(2), all, &answers2, &mine),
+            (id(1), Some(id(1)), false)
+        );
+        // Same version, other list: the lead's wins.
+        let answers3 = [(id(1), st(5, "z", Some(id(1))))];
+        assert_eq!(decide(&nodes, id(2), all, &answers3, &mine).1, Some(id(1)));
+        // 1 gone: 2 leads once 3 takes it as its lead, after taking 3's newer list.
+        let not1 = |n: &NodeId| *n != id(1);
+        let answers4 = [(id(3), st(7, "w", Some(id(2))))];
+        assert_eq!(
+            decide(&nodes, id(2), not1, &answers4, &mine),
+            (id(2), Some(id(3)), true)
+        );
+        let answers5 = [(id(3), st(5, "x", None))];
+        assert_eq!(decide(&nodes, id(2), not1, &answers5, &mine), (id(2), None, false));
+        // Alone of three, or one of two: no lead.
+        assert_eq!(decide(&nodes, id(2), |_| false, &[], &mine), (id(2), None, false));
+        assert_eq!(decide(&nodes[..2], id(2), |_| false, &[], &mine), (id(2), None, false));
+        assert_eq!(decide(&nodes[..1], id(1), |_| false, &[], &mine), (id(1), None, true));
     }
 
     #[test]
@@ -1829,13 +2270,18 @@ mod tests {
             let s = Store::open(&dir).unwrap();
             s.put(3, 0, b"hello").unwrap();
             s.put(3, 1, b"world!").unwrap();
-            assert_eq!(s.read(3, 1, 1, 4).unwrap().unwrap(), b"orld");
-            assert!(s.read(3, 1, 4, 4).unwrap().is_err());
+            let mut out = b"x".to_vec();
+            s.read_into(3, 1, 1, 4, &mut out).unwrap().unwrap();
+            assert_eq!(out, b"xorld");
+            assert!(s.read_into(3, 1, 4, 4, &mut out).unwrap().is_err());
+            assert_eq!(out, b"xorld");
         }
         // A temporary file of a crash is cleaned away.
         std::fs::write(dir.join(format!("{:032x}", 3u128)).join(".2.123"), b"half").unwrap();
         let s = Store::open(&dir).unwrap();
-        assert_eq!(s.read(3, 0, 0, 5).unwrap().unwrap(), b"hello");
+        let mut out = vec![];
+        s.read_into(3, 0, 0, 5, &mut out).unwrap().unwrap();
+        assert_eq!(out, b"hello");
         assert!(s.has(3, 1) && !s.has(3, 2) && !s.has(4, 0));
         // Fresh chunks of files the list doesn't have stay (an upload may commit them yet).
         assert_eq!(s.collect(&HashSet::new()), 0);

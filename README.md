@@ -595,8 +595,13 @@ sudo meshvpn volume delete imagenet                   # every node unmounts it a
 * Files are cut into 4 MB chunks; which nodes keep a chunk follows from the node ids (rendezvous hashing). With
   `--from`, each node copies its own share from the storage; until it has, and while a node is offline, those chunks
   are read from the storage. Files copied in have `--copies` copies (2 by default): there is nothing behind them.
-* The volume can be read right away, also while the nodes copy. The first node of `--nodes` keeps the list of files;
-  the others follow it within seconds. While it is offline the volume is read-only.
+* The volume can be read right away, also while the nodes copy. One node keeps the list of files (the first of
+  `--nodes` that answers, if most of the nodes agree); the others follow it within a second or two. When it goes
+  away, the next one takes over within seconds, after bringing its list up to the newest any node has; a change
+  counts once most of the nodes have it, so none is lost when that node goes. Back again, the first node takes the
+  list back. A volume of three nodes or more takes changes with one of them gone; with two, it is read-only while
+  one is gone (one node alone can't tell whether the other is gone or only cut off). `volume list` shows which node
+  keeps the list.
 * The files change only through `volume cp` and `volume rm`, never by writing into the mount, so every node sees the
   same files. A file copied in again replaces the old one everywhere; programs that have it open keep reading the
   old version.

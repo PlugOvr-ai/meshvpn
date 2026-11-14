@@ -243,8 +243,9 @@ def test_basics(lab):
     """Join, ping by IP and name, status/nodes JSON, stable exit codes, rename."""
     _, (hub, a, b) = mesh(lab, ["hub", "a", "b"])
     wait(lambda: a.online("b"), "a sees b")
-    check(ping(a, b.ip()), "a can't ping b")
-    check(ping(a, "b.mesh"), "names don't resolve (b.mesh)")
+    # online means a heard of b; the first packets may still wait for the tunnel
+    wait(lambda: ping(a, b.ip()), "a pings b", timeout=30)
+    wait(lambda: ping(a, "b.mesh"), "names resolve (b.mesh)", timeout=30)
     check(len(a.mvj("nodes")) == 3, "nodes --json should list 3 nodes")
     st = a.status()
     check(st.get("rendezvous") is None, "the DHT rendezvous is off by default")
@@ -678,6 +679,19 @@ def test_volume(lab):
     wait(lambda: (here(b) or {}).get("staged"), "b back", 60)
     check(here(b)["staged_bytes"] == here(b)["owned_bytes"], f"b: {here(b)}")
     check(sums(b) == sums(c), "b reads other bytes after a restart")
+    # a gone, which keeps the file list: b takes over (c takes it as its lead); back, a takes it
+    # back with what changed meanwhile.
+    check(here(c)["lead"] == "a" and here(a)["leading"], f"a keeps the list: {here(a)}")
+    a.stop()
+    pc.sh("echo while-away > up/away.txt", user="agent")
+    wait(lambda: pc.sh("meshvpn volume cp up/away.txt ds:results", user="agent", ok=False).returncode == 0,
+         "copied in with a gone", 60)
+    check(here(c)["lead"] == "b" and here(b)["leading"], f"b keeps the list: {here(b)}")
+    wait(lambda: c.sh("cat /volumes/ds/results/away.txt", ok=False).stdout.strip() == "while-away", "c sees it", 30)
+    a.up()
+    wait(lambda: (here(a) or {}).get("leading"), "a keeps the list again", 60)
+    check(a.sh("cat /volumes/ds/results/away.txt").strip() == "while-away", "a lost what changed while it was away")
+    wait(lambda: here(b)["lead"] == "a" and not here(b)["leading"], "b follows a again", 20)
     pc.sh("meshvpn volume rm ds:results", user="agent")
     wait(lambda: a.sh("test -e /volumes/ds/results && echo y || echo n").strip() == "n", "results removed", 30)
     a.mv("volume delete ds")
@@ -710,6 +724,8 @@ def test_volume_rootless(lab):
     # pc follows the list hub keeps (within seconds).
     wait(lambda: pc.sh("cd volumes/scratch/data 2>/dev/null && sha256sum p*.bin", user="agent", ok=False).stdout == want,
          "pc reads what it copied in", 30)
+    wait(lambda: a.sh("cd /volumes/scratch/data 2>/dev/null && sha256sum p*.bin", ok=False).stdout == want,
+         "a reads it", 30)
     # pc gone: every chunk has a second copy on hub or a.
     pc.sh("pkill -u agent -x meshvpn; true")
     check(a.sh("cd /volumes/scratch/data && sha256sum p*.bin", timeout=120) == want, "a: other bytes with pc gone")

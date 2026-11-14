@@ -10,6 +10,27 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-11-14
+
+### Added
+- **Volumes go on taking changes when the node that keeps the file list is gone** (with three nodes or more): the
+  next node of the group takes over within seconds, once most of the nodes take it as theirs and it has the newest
+  list any of them has; back again, the first node takes the list back with what changed meanwhile. A change is
+  confirmed once most of the nodes have it. `volume list` shows which node keeps the list. Update all nodes of a
+  volume together (0.34.0 nodes don't know the new state request).
+
+### Changed
+- **Reading a volume's chunks from another node costs about half the CPU:** the chunk server sends them straight from
+  the file (sendfile), and readers reuse their buffers instead of taking fresh memory for every read. Two containers,
+  no network limit (`tests/volume/bench.py`): one reader 0.9 -> 1.4 GB/s, eight 3.4 -> 7.8 GB/s; CPU per GB with
+  eight readers 1.64 -> 0.75 s on the reading node, 1.1 -> 0.28 s on the serving one.
+- A commit is confirmed as soon as most of the volume's nodes have the new list: the lead tells them at once.
+- The nodes of a volume follow changes within a second or two (were 3 s); a volume that could not start is tried
+  again after 3 s (was 10 s), warning only when the reason changes.
+
+### Fixed
+- The e2e test `basics` waits for the first ping through a new tunnel instead of trying once.
+
 ## [0.34.0] - 2026-11-14
 
 Volumes (experimental): the disks of a group of nodes as one file system, filled from network storage or by copying
