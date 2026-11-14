@@ -615,8 +615,11 @@ sudo meshvpn volume delete imagenet                   # every node unmounts it a
   rights. Only admins make and delete volumes, and only from network storage (NFS, Lustre, GPFS, BeeGFS, CephFS, SMB,
   FUSE file systems such as sshfs), never from a node's local disk.
 * **Data path:** between nodes that share a LAN, chunks go straight over it (port 7871, the native interface, like
-  NCCL), not encrypted: every answer carries a tag of the network key, so nobody on the LAN can change or forge
-  what the nodes read, but someone tapping the LAN can see the data. Otherwise through the encrypted mesh.
+  NCCL), encrypted by the kernel (TLS records with AES-GCM, the `tls` module; NICs that can, such as Mellanox
+  ConnectX-6 Dx and 7, do it themselves). The key comes from both nodes' own keys, so not even another node of the
+  network can read or change what goes between two. Without the kernel's TLS on either node, the answers carry tags
+  instead: nobody can change or forge them, but someone tapping the LAN can see the data. Otherwise through the
+  encrypted mesh. Files read in order are fetched ahead, a few 1 MB pieces at once.
 * Without root (rootless install) the volume is mounted with `fusermount3` at `~/volumes/NAME` (the package fuse3),
   readable by the user only unless `user_allow_other` is set in `/etc/fuse.conf`; the chunks are in `~/.cache`. As
   root, the chunks are in `/var/lib/meshvpn/volumes`; a tenth of the disk (at least 1 GB) stays free.

@@ -10,6 +10,20 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.3] - 2026-11-14
+
+### Changed
+- **Volumes:** files read in order through the mount are fetched ahead, a few 1 MB pieces at once, and sent to the
+  kernel straight from where they arrived. One reader gets 2.1 GB/s instead of 1.1 GB/s (two nodes on one machine,
+  no network limit); eight readers stay at 4.5 GB/s.
+
+### Security
+- **Volumes and shares over a LAN path:** the chunk server's connections are now encrypted and authenticated in both
+  directions by the kernel (TLS records with AES-GCM; NICs that can, such as ConnectX-6 Dx and 7, do it themselves).
+  Before, someone tapping the LAN could see the data read, and a node that still had the network key (a banned one)
+  could forge answers and requests. The key comes from both nodes' own keys and both nonces of the connection. Without the
+  kernel's `tls` module on either node, and towards nodes older than 0.34.3, the answers carry tags as before.
+
 ## [0.34.2] - 2026-11-14
 
 ### Security

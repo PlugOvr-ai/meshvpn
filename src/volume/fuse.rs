@@ -25,7 +25,74 @@ use tracing::warn;
 pub trait Source: Send + Sync {
     /// `size` bytes of `file` from `off`, fewer at its end, into `out` (cleared first; the
     /// same buffer for every read of a thread); Err is an errno.
-    fn read(&self, file: &Entry, off: u64, size: u32, out: &mut Vec<u8>) -> Result<(), i32>;
+    fn read(&self, file: &Entry, off: u64, size: u32, out: &mut Data) -> Result<(), i32>;
+}
+
+/// The bytes of a read: in a buffer of its own (what derefs to), with parts of buffers held
+/// elsewhere in between (`hold`: sent from where they are, not copied).
+#[derive(Default)]
+pub struct Data {
+    buf: Vec<u8>,
+    /// (where in `buf` it goes, the buffer, from, to)
+    held: Vec<(usize, Arc<Vec<u8>>, usize, usize)>,
+}
+
+impl std::ops::Deref for Data {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for Data {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+}
+
+impl Data {
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.held.clear();
+    }
+
+    /// `b[from..to]` next.
+    pub fn hold(&mut self, b: Arc<Vec<u8>>, from: usize, to: usize) {
+        assert!(from <= to && to <= b.len());
+        self.held.push((self.buf.len(), b, from, to));
+    }
+
+    /// Where it is now, for `back_to`.
+    pub fn mark(&self) -> (usize, usize) {
+        (self.buf.len(), self.held.len())
+    }
+
+    pub fn back_to(&mut self, (buf, held): (usize, usize)) {
+        self.buf.truncate(buf);
+        self.held.truncate(held);
+    }
+
+    /// All its bytes.
+    pub fn total(&self) -> usize {
+        self.buf.len() + self.held.iter().map(|(_, _, f, t)| t - f).sum::<usize>()
+    }
+
+    /// Its bytes in order, part by part.
+    pub fn parts(&self) -> Vec<&[u8]> {
+        let mut out = vec![];
+        let mut at = 0;
+        for (pos, b, from, to) in &self.held {
+            if *pos > at {
+                out.push(&self.buf[at..*pos]);
+                at = *pos;
+            }
+            out.push(&b[*from..*to]);
+        }
+        if self.buf.len() > at {
+            out.push(&self.buf[at..]);
+        }
+        out
+    }
 }
 
 /// The file tree of one version of a volume.
@@ -503,7 +570,7 @@ fn serve(fd: &OwnedFd, fs: &Fs) {
     // At least what the kernel asks for (max_write plus headers).
     let mut buf = vec![0u8; 256 * 1024];
     // What reads return, used again (a new buffer for each would cost more than the copy).
-    let mut data = Vec::new();
+    let mut data = Data::default();
     loop {
         // SAFETY: the buffer is valid for its length.
         let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
@@ -527,10 +594,10 @@ fn serve(fd: &OwnedFd, fs: &Fs) {
         if opcode == FUSE_READ {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(fs, body, &mut data)));
             match r {
-                Ok(Ok(())) => send(raw, unique, Ok(&data)),
+                Ok(Ok(())) => send_parts(raw, unique, &data.parts()),
                 Ok(Err(e)) => send(raw, unique, Err(e)),
                 Err(_) => {
-                    data = Vec::new();
+                    data = Data::default();
                     send(raw, unique, Err(libc::EIO));
                 }
             }
@@ -610,12 +677,28 @@ fn handle(fs: &Fs, opcode: u32, ino: u64, body: &[u8]) -> Option<Result<Vec<u8>,
     })
 }
 
-fn read(fs: &Fs, body: &[u8], out: &mut Vec<u8>) -> Result<(), i32> {
+fn read(fs: &Fs, body: &[u8], out: &mut Data) -> Result<(), i32> {
     let e = fs.handles.lock().unwrap().get(&u64_at(body, 0)).cloned();
     match e {
         Some(e) => fs.src.read(&e, u64_at(body, 8), u32_at(body, 16), out),
         None => Err(libc::EBADF),
     }
+}
+
+/// The answer to a read: its parts in one write.
+fn send_parts(fd: i32, unique: u64, parts: &[&[u8]]) {
+    let len: usize = parts.iter().map(|p| p.len()).sum();
+    let header = Out::new().u32((16 + len) as u32).u32(0).u64(unique).0;
+    let mut iov = vec![libc::iovec {
+        iov_base: header.as_ptr() as *mut _,
+        iov_len: header.len(),
+    }];
+    iov.extend(parts.iter().map(|p| libc::iovec {
+        iov_base: p.as_ptr() as *mut _,
+        iov_len: p.len(),
+    }));
+    // SAFETY: all buffers outlive the call. ENOENT (the request was interrupted) is fine.
+    unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as i32) };
 }
 
 fn send(fd: i32, unique: u64, r: Result<&[u8], i32>) {
@@ -698,4 +781,25 @@ fn readdir(tree: &Tree, ino: u64, offset: u64, size: u32) -> Result<Vec<u8>, i32
         out.resize(out.len() + padded - len, 0);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_keeps_its_parts_in_order() {
+        let mut d = Data::default();
+        d.extend_from_slice(b"ab");
+        d.hold(Arc::new(b"xyz".to_vec()), 1, 3);
+        let mark = d.mark();
+        d.extend_from_slice(b"cd");
+        d.hold(Arc::new(b"12".to_vec()), 0, 2);
+        assert_eq!(d.parts().concat(), b"abyzcd12");
+        assert_eq!(d.total(), 8);
+        d.back_to(mark);
+        assert_eq!(d.parts().concat(), b"abyz");
+        d.clear();
+        assert!(d.parts().is_empty());
+    }
 }

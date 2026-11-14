@@ -118,6 +118,11 @@ def main():
             print(f"{name}: {want / 1e9:.1f} GB in {secs:.1f} s = {r['mb_s']} MB/s "
                   f"({r['remote_share']:.0%} from b); CPU per GB: reader {r['cpu_a_s_per_gb']} s, "
                   f"server {r['cpu_b_s_per_gb']} s", flush=True)
+        # The kernel's TLS on the LAN path (its counters, per network namespace).
+        tls = {k: v for k, v in (l.split() for l in nb.sh("cat /proc/net/tls_stat 2>/dev/null || true").splitlines())
+               if k in ("TlsTxSw", "TlsRxSw", "TlsTxDevice", "TlsRxDevice", "TlsDecryptError")}
+        print(f"kernel TLS on b: {tls or 'none'}", flush=True)
+        results["tls"] = tls
         if a.out:
             with open(a.out, "a") as f:
                 f.write(json.dumps(results) + "\n")

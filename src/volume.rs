@@ -875,6 +875,66 @@ struct Vol {
     nudged: AtomicBool,
     /// Commits taken (`COMMIT_*`): tokens left, when.
     commits: Mutex<Option<(f32, Instant)>>,
+    ahead: Ahead,
+}
+
+/// What this node's mount reads in order from other nodes: fetched ahead, a few pieces at once
+/// (the kernel reads a FUSE file 128 kB at a time, a round trip each). Each piece goes once the
+/// kernel has read all of it (its page cache has it then).
+#[derive(Default)]
+struct Ahead {
+    /// By file and piece (`PIECE` bytes each).
+    slots: Mutex<HashMap<(u128, u64), Arc<Slot>>>,
+    /// Where the last read of each file ended: a read that goes on from about there is in order.
+    ends: Mutex<HashMap<u128, u64>>,
+    /// Buffers of pieces read, for the next ones (no new memory for every piece); some may
+    /// still be on their way to the kernel.
+    free: Mutex<Vec<Arc<Vec<u8>>>>,
+}
+
+struct Slot {
+    /// None: being fetched; Some(None): it failed.
+    data: Mutex<Option<Option<Arc<Vec<u8>>>>>,
+    ready: std::sync::Condvar,
+    /// Bytes the kernel has read of it.
+    used: AtomicU64,
+    at: Instant,
+}
+
+/// Pieces fetched ahead: their size (each its own request, several at once), how many ahead of
+/// a reader, how many at most (per volume).
+const PIECE: u64 = 1 << 20;
+const AHEAD_PIECES: u64 = 8;
+const AHEAD_SLOTS: usize = 64;
+/// A piece fetched ahead that nobody read this long goes.
+const AHEAD_KEEP: Duration = Duration::from_secs(20);
+
+impl Ahead {
+    /// Is a read of file `id` from `pos` in order? And notes where it ends.
+    fn in_order(&self, id: u128, pos: u64, end: u64) -> bool {
+        let mut ends = self.ends.lock().unwrap();
+        if ends.len() >= 4096 {
+            ends.clear();
+        }
+        // (the kernel's reads come on several threads: not quite one after the other)
+        let ok = pos == 0 || ends.get(&id).is_some_and(|&e| pos.abs_diff(e) <= 2 * CHUNK);
+        ends.insert(id, end);
+        ok
+    }
+
+    fn drop_slot(&self, key: (u128, u64), slot: &Arc<Slot>) {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.get(&key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
+            slots.remove(&key);
+        }
+        drop(slots);
+        if let Some(buf) = slot.data.lock().unwrap().take().flatten() {
+            let mut free = self.free.lock().unwrap();
+            if free.len() < AHEAD_SLOTS / 2 {
+                free.push(buf);
+            }
+        }
+    }
 }
 
 /// Commits a volume takes at once, and per second after that.
@@ -906,6 +966,7 @@ impl Vol {
             fetched: Mutex::new(HashMap::new()),
             nudged: AtomicBool::new(false),
             commits: Mutex::new(None),
+            ahead: Ahead::default(),
         })
     }
 
@@ -962,7 +1023,8 @@ impl Vol {
         pos: u64,
         len: u32,
         user: Option<&str>,
-        out: &mut Vec<u8>,
+        in_order: bool,
+        out: &mut fuse::Data,
     ) -> Result<(), i32> {
         let id = e.id128();
         let within = pos - c * chunk;
@@ -972,6 +1034,10 @@ impl Vol {
             .and_then(|s| s.read_into(id, c as u32, within, len, out))
         {
             self.stats.local_bytes.fetch_add(len as u64, Relaxed);
+            return Ok(());
+        }
+        if user.is_none() && self.ahead_read(e, chunk, c, within, len, in_order, out) {
+            self.stats.remote_bytes.fetch_add(len as u64, Relaxed);
             return Ok(());
         }
         for keeper in keepers(&self.def.nodes, id, c, self.copies(e)) {
@@ -1008,20 +1074,140 @@ impl Vol {
         Ok(())
     }
 
+    /// `len` bytes at `within` of chunk `c` of `e` from pieces fetched ahead (`Ahead`): ones
+    /// fetched already or being fetched, or (`in_order`) ones fetched now, with the next few.
+    /// False: none (then as before, just the bytes asked for).
+    #[allow(clippy::too_many_arguments)]
+    fn ahead_read(
+        &self,
+        e: &Entry,
+        chunk: u64,
+        c: u64,
+        within: u64,
+        len: u32,
+        in_order: bool,
+        out: &mut fuse::Data,
+    ) -> bool {
+        if !chunk.is_multiple_of(PIECE) || len == 0 {
+            return false;
+        }
+        let id = e.id128();
+        let (pos, end) = (c * chunk + within, c * chunk + within + len as u64);
+        let (first, last) = (pos / PIECE, (end - 1) / PIECE);
+        if in_order {
+            let pieces = e.size.div_ceil(PIECE);
+            // (the piece read now only from its start: of one read in part, the rest as before)
+            let from = if pos % PIECE == 0 { first } else { first + 1 };
+            for p in from..(first + AHEAD_PIECES).min(pieces) {
+                let pc = p * PIECE / chunk;
+                if !self.store.as_ref().is_some_and(|s| s.has(id, pc as u32)) {
+                    self.fetch_ahead(e, chunk, p);
+                }
+            }
+        }
+        let start = out.mark();
+        for p in first..=last {
+            let key = (id, p);
+            let Some(slot) = self.ahead.slots.lock().unwrap().get(&key).cloned() else {
+                out.back_to(start);
+                return false;
+            };
+            let data = {
+                let d = slot.data.lock().unwrap();
+                let (d, _) = slot
+                    .ready
+                    .wait_timeout_while(d, Duration::from_secs(15), |d| d.is_none())
+                    .unwrap();
+                d.clone().flatten()
+            };
+            let (from, to) = (pos.max(p * PIECE) - p * PIECE, end.min((p + 1) * PIECE) - p * PIECE);
+            let Some(data) = data.filter(|d| to as usize <= d.len()) else {
+                self.ahead.drop_slot(key, &slot);
+                out.back_to(start);
+                return false;
+            };
+            let all = data.len() as u64;
+            // (sent from the piece itself: no copy)
+            out.hold(data, from as usize, to as usize);
+            if slot.used.fetch_add(to - from, Relaxed) + (to - from) >= all {
+                self.ahead.drop_slot(key, &slot);
+            }
+        }
+        true
+    }
+
+    /// Piece `p` of `e` (`PIECE` bytes from `p * PIECE`) fetched in the background.
+    fn fetch_ahead(&self, e: &Entry, chunk: u64, p: u64) {
+        let id = e.id128();
+        let key = (id, p);
+        let slot = {
+            let mut slots = self.ahead.slots.lock().unwrap();
+            if slots.contains_key(&key) {
+                return;
+            }
+            // Full: what nobody read for a while goes (a reader that stopped, bytes the page
+            // cache had); still full: none fetched ahead (the readers read as before).
+            if slots.len() >= AHEAD_SLOTS {
+                slots.retain(|_, s| s.at.elapsed() < AHEAD_KEEP);
+                if slots.len() >= AHEAD_SLOTS {
+                    return;
+                }
+            }
+            let s = Arc::new(Slot {
+                data: Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+                used: AtomicU64::new(0),
+                at: Instant::now(),
+            });
+            slots.insert(key, s.clone());
+            s
+        };
+        let off = p * PIECE;
+        let (c, within) = (off / chunk, off % chunk);
+        let len = e.size.saturating_sub(off).min(PIECE) as usize;
+        let mut buf = {
+            let mut free = self.ahead.free.lock().unwrap();
+            let done = free.iter().position(|b| Arc::strong_count(b) == 1);
+            done.and_then(|i| Arc::try_unwrap(free.swap_remove(i)).ok())
+                .unwrap_or_default()
+        };
+        buf.clear();
+        let keepers: Vec<NodeId> = keepers(&self.def.nodes, id, c, self.copies(e))
+            .into_iter()
+            .filter(|k| *k != self.me)
+            .collect();
+        let (pool, node, vol, file) = (self.pool.clone(), self.node.clone(), self.def.key(), e.id.clone());
+        self.rt.spawn(async move {
+            let mut got = None;
+            for k in keepers {
+                let fetch = pool.volume_read_into(&node, k, &vol, None, &file, c as u32, within, len as u32, &mut buf);
+                if let Ok(Ok(true)) = tokio::time::timeout(Duration::from_secs(10), fetch).await
+                    && buf.len() == len
+                {
+                    got = Some(Arc::new(buf));
+                    break;
+                }
+                buf.clear();
+            }
+            *slot.data.lock().unwrap() = Some(got);
+            slot.ready.notify_all();
+        });
+    }
     /// `size` bytes of `e` from `off` (fewer at its end) into `out`, which is cleared first (a
     /// buffer used again and again: no new memory for every read).
-    fn read_entry(&self, e: &Entry, off: u64, size: u32, user: Option<&str>, out: &mut Vec<u8>) -> Result<(), i32> {
+    fn read_entry(&self, e: &Entry, off: u64, size: u32, user: Option<&str>, out: &mut fuse::Data) -> Result<(), i32> {
         out.clear();
         if off >= e.size {
             return Ok(());
         }
         let chunk = self.manifest().chunk;
         let end = off.saturating_add(size as u64).min(e.size);
+        let in_order = user.is_none() && self.ahead.in_order(e.id128(), off, end);
         let mut pos = off;
         while pos < end {
             let c = pos / chunk;
             let stop = ((c + 1) * chunk).min(end);
-            self.piece(e, chunk, c, pos, (stop - pos) as u32, user, out)?;
+            self.piece(e, chunk, c, pos, (stop - pos) as u32, user, in_order, out)?;
             pos = stop;
         }
         Ok(())
@@ -1057,7 +1243,7 @@ impl Vol {
 struct Reader(Arc<Vol>);
 
 impl fuse::Source for Reader {
-    fn read(&self, e: &Entry, off: u64, size: u32, out: &mut Vec<u8>) -> Result<(), i32> {
+    fn read(&self, e: &Entry, off: u64, size: u32, out: &mut fuse::Data) -> Result<(), i32> {
         self.0.read_entry(e, off, size, None, out)
     }
 }
@@ -1407,7 +1593,8 @@ impl Volumes {
         let deadline = Instant::now() + SEND_WITHIN;
         match mac {
             None => {
-                send_all(fd, &(len as u64).to_be_bytes(), deadline)?;
+                // (MSG_MORE: with the kernel's TLS, in one record with the first bytes)
+                send_more(fd, &(len as u64).to_be_bytes(), libc::MSG_MORE, deadline)?;
                 sendfile_all(fd, &f, within, len as u64, deadline)?;
             }
             Some(mac) => {
@@ -2107,7 +2294,7 @@ impl Volumes {
                 let dest = dest.canonicalize()?;
                 let mut created = vec![];
                 let mut bytes = 0;
-                let mut data = Vec::new();
+                let mut data = fuse::Data::default();
                 for (e, rel) in &picked {
                     let target = crate::share::inside(&dest, rel, &mut created)?;
                     let mut o = std::fs::OpenOptions::new();
@@ -2125,11 +2312,13 @@ impl Volumes {
                             .map_err(|errno| {
                                 anyhow!("{vname}:{}: {}", e.path, std::io::Error::from_raw_os_error(errno))
                             })?;
-                        if data.is_empty() {
+                        if data.total() == 0 {
                             break;
                         }
-                        file.write_all_at(&data, off)?;
-                        off += data.len() as u64;
+                        for part in data.parts() {
+                            file.write_all_at(part, off)?;
+                            off += part.len() as u64;
+                        }
                     }
                     bytes += e.size;
                 }
@@ -2356,10 +2545,15 @@ fn again(fd: i32, deadline: Instant) -> std::io::Result<()> {
 }
 
 /// All of `buf` onto the non-blocking socket `fd`, waiting when it is full.
-fn send_all(fd: i32, mut buf: &[u8], deadline: Instant) -> std::io::Result<()> {
+fn send_all(fd: i32, buf: &[u8], deadline: Instant) -> std::io::Result<()> {
+    send_more(fd, buf, 0, deadline)
+}
+
+/// `send_all` with `flags`.
+fn send_more(fd: i32, mut buf: &[u8], flags: i32, deadline: Instant) -> std::io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: the buffer is valid for its length.
-        let n = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
+        let n = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL | flags) };
         if n < 0 {
             again(fd, deadline)?;
         } else {
@@ -2445,6 +2639,21 @@ mod tests {
         assert_eq!(decide(&nodes, id(2), |_| false, &[], &mine), (id(2), None, false));
         assert_eq!(decide(&nodes[..2], id(2), |_| false, &[], &mine), (id(2), None, false));
         assert_eq!(decide(&nodes[..1], id(1), |_| false, &[], &mine), (id(1), None, true));
+    }
+
+    #[test]
+    fn reads_in_order_are_told_from_jumps() {
+        let a = Ahead::default();
+        assert!(a.in_order(1, 0, 128 << 10));
+        assert!(a.in_order(1, 128 << 10, 256 << 10));
+        // (a little out of order: the kernel's threads)
+        assert!(a.in_order(1, 512 << 10, 640 << 10));
+        assert!(a.in_order(1, 384 << 10, 512 << 10));
+        // A jump far away, then on from there.
+        assert!(!a.in_order(1, 100 * CHUNK, 100 * CHUNK + 4096));
+        assert!(a.in_order(1, 100 * CHUNK + 4096, 100 * CHUNK + 8192));
+        // Another file, not from its start.
+        assert!(!a.in_order(2, 5 * CHUNK, 5 * CHUNK + 4096));
     }
 
     #[test]

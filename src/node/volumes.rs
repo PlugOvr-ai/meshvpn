@@ -44,6 +44,7 @@ impl Node {
             .and_then(|p| p.lan_ip.as_ref())
             .and_then(|ip| ip.parse().ok());
         Some(crate::share::Holder {
+            id: *id,
             name: r.info.name.clone(),
             mesh_ip: r.info.ip(),
             lan_ip,

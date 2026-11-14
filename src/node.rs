@@ -5284,6 +5284,13 @@ impl Node {
         )
     }
 
+    /// The key of a share connection with `peer`: of both nodes' own keys (X25519), so only
+    /// the two know it, and bound to `context`. None: no record of `peer`.
+    pub fn share_link_key(&self, peer: &NodeId, context: &[u8]) -> Option<[u8; 32]> {
+        let noise = self.state.lock().unwrap().records.get(peer)?.info.noise_pub;
+        Some(self.ident.share_key(&noise, context))
+    }
+
     /// May the share client that proved a network key of `version` and signed our `nonce` as
     /// node `id` fetch here? What a link asks of a node too: not banned, admitted, and with
     /// an old key only if the new one was sealed for it.
@@ -5328,6 +5335,7 @@ impl Node {
                 let lan_ip = perf.and_then(|p| p.lan_ip.as_ref()).and_then(|ip| ip.parse().ok());
                 let rtt = perf.and_then(|p| p.rtt_us).unwrap_or(u32::MAX);
                 let h = crate::share::Holder {
+                    id: r.info.id,
                     name: r.info.name.clone(),
                     mesh_ip: r.info.ip(),
                     lan_ip,

@@ -339,6 +339,109 @@ impl Mac {
     }
 }
 
+/// The kernel's TLS on a share connection over a LAN: records of AES-GCM (TLS 1.3), keys of
+/// both nodes' own keys and both nonces, no handshake of TLS's own. The kernel encrypts what
+/// `sendfile` sends too (and a NIC that can, does it).
+#[cfg(target_os = "linux")]
+mod ktls {
+    use std::os::fd::AsRawFd;
+
+    /// struct tls12_crypto_info_aes_gcm_128 (linux/tls.h)
+    #[repr(C)]
+    struct Info {
+        version: u16,
+        cipher: u16,
+        iv: [u8; 8],
+        key: [u8; 16],
+        salt: [u8; 4],
+        rec_seq: [u8; 8],
+    }
+
+    /// The keys of both directions (server to client, client to server); None: no record of
+    /// `peer` (whose own key goes into them).
+    pub(super) fn keys(
+        node: &super::Node,
+        peer: &crate::keys::NodeId,
+        net_key: &[u8; 32],
+        server: &[u8; 32],
+        client: &[u8; 32],
+    ) -> Option<([u8; 32], [u8; 32])> {
+        let mut context = net_key.to_vec();
+        context.extend_from_slice(server);
+        context.extend_from_slice(client);
+        let k = node.share_link_key(peer, &context)?;
+        Some((
+            *blake3::keyed_hash(&k, b"server to client").as_bytes(),
+            *blake3::keyed_hash(&k, b"client to server").as_bytes(),
+        ))
+    }
+
+    /// The kernel's TLS on the socket, keys not set yet (bytes pass as they are until then).
+    /// False: none here (no `tls` module).
+    pub(super) fn attach(s: &tokio::net::TcpStream) -> bool {
+        // SAFETY: a valid descriptor and a buffer of the length given.
+        unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_ULP,
+                b"tls".as_ptr().cast(),
+                3,
+            ) == 0
+        }
+    }
+
+    /// Attached, and the receiving side keyed.
+    pub(super) fn start(s: &tokio::net::TcpStream, rx: &[u8; 32]) -> std::io::Result<()> {
+        if !attach(s) {
+            return Err(std::io::Error::last_os_error());
+        }
+        set(s, false, rx)
+    }
+
+    /// One direction's key (`tx`: what we send): records from the next byte on.
+    pub(super) fn set(s: &tokio::net::TcpStream, tx: bool, k: &[u8; 32]) -> std::io::Result<()> {
+        let info = Info {
+            version: 0x0304, // TLS 1.3
+            cipher: 51,      // AES-GCM-128
+            key: k[..16].try_into().unwrap(),
+            salt: k[16..20].try_into().unwrap(),
+            iv: k[20..28].try_into().unwrap(),
+            rec_seq: [0; 8],
+        };
+        let dir = if tx { 1 } else { 2 }; // TLS_TX, TLS_RX
+        // SAFETY: a valid descriptor and the struct the kernel expects, of its size.
+        let r = unsafe {
+            libc::setsockopt(
+                s.as_raw_fd(),
+                libc::SOL_TLS,
+                dir,
+                (&info as *const Info).cast(),
+                std::mem::size_of::<Info>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if !tx {
+            // Our records have no padding: decrypted straight into the reader's buffer (no
+            // copy of its own; kernel 6.0 and later, else as before).
+            let yes: libc::c_int = 1;
+            // SAFETY: as above, an int.
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_TLS,
+                    4, // TLS_RX_EXPECT_NO_PAD
+                    (&yes as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
+        Ok(())
+    }
+}
+
 /// Every answer goes out within this long (a client that doesn't read holds nothing longer).
 const WRITE_WITHIN: Duration = Duration::from_secs(60);
 
@@ -378,6 +481,11 @@ enum Req {
         nonce: Option<String>,
         #[serde(default)]
         mac: bool,
+        /// The client can encrypt in the kernel (TLS records, `ktls`): the server answers the
+        /// hello with "tls" when it can too, and from then on both directions are encrypted
+        /// and authenticated, with a key of both nodes' own keys - no tags then.
+        #[serde(default)]
+        tls: bool,
     },
     Manifest {
         id: String,
@@ -517,27 +625,48 @@ async fn serve_conn(node: &Arc<Node>, mut s: TcpStream) -> Result<()> {
         .await??
         .ok_or_else(|| anyhow!("closed before the hello"))?;
     let mut mac = None;
+    #[allow(unused_mut)]
+    let mut tls = false;
     let peer = match serde_json::from_slice::<Req>(&hello)? {
         Req::Hello {
             id,
             sig,
             nonce: theirs,
             mac: tags,
+            tls: want_tls,
         } if node.share_admits(&id, version, &nonce, &sig) => {
+            let theirs = theirs.as_deref().and_then(|n| crate::keys::Key32::from_hex(n).ok());
             if tags {
-                let theirs = theirs
-                    .as_deref()
-                    .and_then(|n| crate::keys::Key32::from_hex(n).ok())
-                    .ok_or_else(|| anyhow!("tags asked for without a nonce"))?;
+                let theirs = theirs.ok_or_else(|| anyhow!("tags asked for without a nonce"))?;
                 mac = Some(Mac::new(&key, &nonce, &theirs.0, &id));
             }
+            // The kernel's TLS (its receiving side before the answer: the client's next bytes
+            // are records), else the tags.
+            #[cfg(target_os = "linux")]
+            let keys = match theirs {
+                Some(theirs) if want_tls && !tunnel => ktls::keys(node, &id, &key, &nonce, &theirs.0)
+                    .filter(|(_, from_client)| ktls::start(w.as_ref(), from_client).is_ok()),
+                _ => None,
+            };
+            #[cfg(not(target_os = "linux"))]
+            let _ = (want_tls, theirs);
+            #[cfg(target_os = "linux")]
+            if let Some((to_client, _)) = keys {
+                answer(&mut w, &mut mac, Some(b"tls")).await?;
+                ktls::set(w.as_ref(), true, &to_client)?;
+                mac = None;
+                tls = true;
+            } else {
+                answer(&mut w, &mut mac, Some(&[])).await?;
+            }
+            #[cfg(not(target_os = "linux"))]
             answer(&mut w, &mut mac, Some(&[])).await?;
             id
         }
         Req::Hello { id, .. } => bail!("{id} is not admitted to this network"),
         _ => bail!("no hello (a node older than 0.33.1?)"),
     };
-    let vouched = tunnel || mac.is_some();
+    let vouched = tunnel || mac.is_some() || tls;
     #[cfg(target_os = "linux")]
     let who = |user: Option<String>| crate::volume::Who { node: peer, user };
     #[cfg(not(target_os = "linux"))]
@@ -753,6 +882,7 @@ fn peer_reads(peer: crate::keys::NodeId) -> Arc<tokio::sync::Semaphore> {
 /// A node that has the object, and how to reach its chunk server.
 #[derive(Clone, Debug)]
 pub struct Holder {
+    pub id: crate::keys::NodeId,
     pub name: String,
     pub mesh_ip: Ipv4Addr,
     /// Verified LAN address (faster, used when known).
@@ -775,9 +905,16 @@ async fn dial(node: &Node, h: &Holder) -> Result<TcpStream> {
 }
 
 /// The client's side of the greeting: a tag of the network key over the server's nonce, then
-/// (`hello`) which node this is, signed over the same nonce; with `tags` (a LAN path) the
-/// answers carry tags from then on.
-async fn greet(node: &Node, stream: TcpStream, hello: bool, tags: bool) -> Result<Conn> {
+/// (`hello`) which node this is, signed over the same nonce. With `tags` (a LAN path to node
+/// `server`) the connection is encrypted in the kernel from then on, or (where either has no
+/// kernel TLS) the answers carry tags.
+async fn greet(
+    node: &Node,
+    stream: TcpStream,
+    hello: bool,
+    tags: bool,
+    server: Option<&crate::keys::NodeId>,
+) -> Result<Conn> {
     stream.set_nodelay(true).ok();
     let (r, mut w) = stream.into_split();
     let mut r = BufReader::new(r);
@@ -797,26 +934,53 @@ async fn greet(node: &Node, stream: TcpStream, hello: bool, tags: bool) -> Resul
         if tags {
             c.mac = Some(Mac::new(&key, &nonce, &mine, &id));
         }
+        #[cfg(target_os = "linux")]
+        let keys = match server {
+            Some(server) if tags => {
+                ktls::keys(node, server, &key, &nonce, &mine).filter(|_| ktls::attach(c.w.as_ref()))
+            }
+            _ => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = server;
         let hello = Req::Hello {
             id,
             sig,
             nonce: Some(crate::keys::Key32(mine).hex()),
             mac: tags,
+            #[cfg(target_os = "linux")]
+            tls: keys.is_some(),
+            #[cfg(not(target_os = "linux"))]
+            tls: false,
         };
-        match tokio::time::timeout(GREETING, request(&mut c, &hello)).await {
-            Ok(Ok(Some(_))) => {}
+        let answer = match tokio::time::timeout(GREETING, request(&mut c, &hello)).await {
+            Ok(Ok(Some(a))) => a,
             _ => bail!("the hello was not accepted"),
+        };
+        #[cfg(target_os = "linux")]
+        if let Some((from_server, to_server)) = keys
+            && answer == b"tls"
+        {
+            // (the server sends nothing more before our next request)
+            if !c.lines.buffer().is_empty() {
+                bail!("bytes after the hello's answer");
+            }
+            ktls::set(c.w.as_ref(), false, &from_server)?;
+            ktls::set(c.w.as_ref(), true, &to_server)?;
+            c.mac = None;
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = answer;
     }
     Ok(c)
 }
 
 async fn connect(node: &Node, h: &Holder) -> Result<Conn> {
     // Tags on a LAN path; through the mesh the tunnel vouches for the answers.
-    match greet(node, dial(node, h).await?, true, h.lan_ip.is_some()).await {
+    match greet(node, dial(node, h).await?, true, h.lan_ip.is_some(), Some(&h.id)).await {
         Ok(c) => Ok(c),
         // A node older than 0.33.1 doesn't know the hello and closes at it: as before, then.
-        Err(_) => greet(node, dial(node, h).await?, false, false).await,
+        Err(_) => greet(node, dial(node, h).await?, false, false, None).await,
     }
 }
 
@@ -1099,10 +1263,10 @@ async fn sink_stream(node: Arc<Node>, ip: Ipv4Addr, secs: f64) -> Option<(u64, f
             .ok()
     };
     // (the count at the end is not tagged: a measurement, it ends the connection)
-    let mut c = match greet(&node, dial().await?, true, false).await {
+    let mut c = match greet(&node, dial().await?, true, false, None).await {
         Ok(c) => c,
         // A node older than 0.33.1 (see `connect`).
-        Err(_) => greet(&node, dial().await?, false, false).await.ok()?,
+        Err(_) => greet(&node, dial().await?, false, false, None).await.ok()?,
     };
     c.w.write_all(b"\"sink\"\n").await.ok()?;
     let buf = vec![0u8; 1 << 20];
@@ -1431,6 +1595,45 @@ pub(crate) fn gid_of(uid: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records both ways with the keys as set; a wrong key is refused (where the kernel has TLS).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kernel_tls_carries_both_ways_and_refuses_a_wrong_key() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (b, _) = l.accept().await.unwrap();
+        if !ktls::attach(&a) {
+            eprintln!("no kernel TLS here: skipped");
+            return;
+        }
+        let (k1, k2) = ([1u8; 32], [2u8; 32]);
+        ktls::set(&a, true, &k1).unwrap();
+        ktls::set(&a, false, &k2).unwrap();
+        ktls::start(&b, &k1).unwrap();
+        ktls::set(&b, true, &k2).unwrap();
+        let (mut a, mut b) = (a, b);
+        let big: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        a.write_all(&big).await.unwrap();
+        let mut got = vec![0u8; big.len()];
+        b.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, big);
+        b.write_all(b"back").await.unwrap();
+        let mut back = [0u8; 4];
+        a.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"back");
+
+        // The receiver with another key: an error, not the bytes.
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (d, _) = l.accept().await.unwrap();
+        assert!(ktls::attach(&c));
+        ktls::set(&c, true, &k1).unwrap();
+        ktls::start(&d, &k2).unwrap();
+        let (mut c, mut d) = (c, d);
+        c.write_all(b"secret").await.unwrap();
+        let mut buf = [0u8; 6];
+        assert!(d.read_exact(&mut buf).await.is_err());
+    }
 
     #[test]
     fn fetched_files_stay_inside_and_tame() {
