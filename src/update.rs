@@ -34,8 +34,21 @@ pub const SIGNED_FROM: &str = "0.27.0";
 
 /// What a release signature covers: the tag (so an older release's list can't pass for a
 /// newer one) and the checksum list.
-pub fn release_message(tag: &str, sums: &[u8]) -> Vec<u8> {
-    let mut m = format!("meshvpn release v1\n{}\n", tag.trim_start_matches('v')).into_bytes();
+#[cfg(test)]
+fn release_message(tag: &str, sums: &[u8]) -> Vec<u8> {
+    release_message_of(REPO, tag, sums)
+}
+
+/// What a release of `repo` signs: an extension's names its repository, so that a signed
+/// release of one can't be passed off as one of another (the same tag, the same file names).
+pub fn release_message_of(repo: &str, tag: &str, sums: &[u8]) -> Vec<u8> {
+    let version = tag.trim_start_matches('v');
+    let mut m = if repo == REPO {
+        format!("meshvpn release v1\n{version}\n")
+    } else {
+        format!("meshvpn release v1\n{repo}\n{version}\n")
+    }
+    .into_bytes();
     m.extend_from_slice(sums);
     m
 }
@@ -69,8 +82,10 @@ struct Trust<'a> {
     revoked: &'a [&'a str],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_with(
     trust: &Trust,
+    repo: &str,
     tag: &str,
     sums: &[u8],
     sig: &[u8],
@@ -79,7 +94,7 @@ fn verify_with(
     now_ms: u64,
 ) -> Result<()> {
     let sig = crate::keys::unb64(&String::from_utf8_lossy(sig)).context("reading SHA256SUMS.sig")?;
-    let msg = release_message(tag, sums);
+    let msg = release_message_of(repo, tag, sums);
     let (roots, revoked) = (trust.roots, trust.revoked);
     if roots.iter().any(|k| verifies(k, &msg, &sig)) {
         return Ok(());
@@ -112,12 +127,13 @@ fn verify_with(
 
 /// Checks release `tag`'s `SHA256SUMS` against its `SHA256SUMS.sig` and `release-key.cert`
 /// (the keys built in).
-pub fn verify_release_sums(tag: &str, sums: &[u8], sig: &[u8], cert: Option<&[u8]>) -> Result<()> {
+/// `repo`: whose release it is (meshvpn's or an extension's).
+pub fn verify_release_sums(repo: &str, tag: &str, sums: &[u8], sig: &[u8], cert: Option<&[u8]>) -> Result<()> {
     let trust = Trust {
         roots: ROOT_KEYS,
         revoked: REVOKED_KEYS,
     };
-    verify_with(&trust, tag, sums, sig, cert, &current(), crate::node::now_ms())
+    verify_with(&trust, repo, tag, sums, sig, cert, &current(), crate::node::now_ms())
 }
 
 /// The checksum of `name` in the release's signed list.
@@ -128,8 +144,8 @@ pub fn signed_sum(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-/// The SHA-256 `name` of release `tag` must have: from the signed `SHA256SUMS` (releases from
-/// `SIGNED_FROM` on), else from the release's `<name>.sha256`.
+/// The SHA-256 `name` of release `tag` must have: from the signed `SHA256SUMS`. meshvpn's
+/// releases are signed from `SIGNED_FROM` on, an extension's all (their own numbers).
 async fn expected_sum(client: &reqwest::Client, repo: &str, tag: &str, name: &str) -> Result<String> {
     let base = format!("https://github.com/{repo}/releases/download/{tag}");
     let get = |url: String| async move {
@@ -143,28 +159,19 @@ async fn expected_sum(client: &reqwest::Client, repo: &str, tag: &str, name: &st
         }
         Ok::<_, anyhow::Error>(r.bytes().await?)
     };
-    if at_least(tag, SIGNED_FROM) {
+    if repo != REPO || at_least(tag, SIGNED_FROM) {
         let sums = get(format!("{base}/SHA256SUMS")).await?;
         let sig = get(format!("{base}/SHA256SUMS.sig"))
             .await
             .context("release not signed (yet) - not installing; try again later")?;
         let cert = get(format!("{base}/release-key.cert")).await.ok();
-        verify_release_sums(tag, &sums, &sig, cert.as_deref())?;
+        verify_release_sums(repo, tag, &sums, &sig, cert.as_deref())?;
         return signed_sum(&String::from_utf8_lossy(&sums), name)
             .ok_or_else(|| anyhow!("{name} is not in the release's signed checksums"));
     }
     // meshvpn's own releases from before the signatures are never installed: such a release's
-    // checksum file proves nothing (who can change the release can change the file too). An
-    // extension's releases have their own version numbers.
-    if repo == REPO {
-        bail!("release {tag} is older than the first signed one ({SIGNED_FROM}) - not installing");
-    }
-    let sums = get(format!("{base}/{name}.sha256")).await?;
-    Ok(String::from_utf8_lossy(&sums)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase())
+    // checksum file proves nothing (who can change the release can change the file too).
+    bail!("release {tag} is older than the first signed one ({SIGNED_FROM}) - not installing")
 }
 
 /// Where releases of this build come from: an extension's own (enterprise builds update to
@@ -344,11 +351,30 @@ mod tests {
 
     /// The old check (root keys only, no certificate).
     fn v(roots: &[&str], tag: &str, sums: &[u8], sig: &[u8]) -> Result<()> {
-        verify_with(&Trust { roots, revoked: &[] }, tag, sums, sig, None, "0.27.0", 0)
+        verify_with(&Trust { roots, revoked: &[] }, REPO, tag, sums, sig, None, "0.27.0", 0)
     }
 
     fn b64sig(k: &SigningKey, msg: &[u8]) -> String {
         crate::keys::b64(&k.sign(msg).to_bytes())
+    }
+
+    #[test]
+    fn an_extensions_release_is_signed_for_its_repository() {
+        let root = SigningKey::from_bytes(&[7; 32]);
+        let roots = [crate::keys::b64(root.verifying_key().as_bytes())];
+        let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+        let trust = Trust {
+            roots: &roots,
+            revoked: &[],
+        };
+        let sums = b"abc  meshvpn-x86_64-unknown-linux-musl\n";
+        let ext = "Example/meshvpn-ext";
+        let theirs = b64sig(&root, &release_message_of(ext, "v0.23.0", sums));
+        assert!(verify_with(&trust, ext, "v0.23.0", sums, theirs.as_bytes(), None, "0.1.0", 0).is_ok());
+        // meshvpn's own signed release under the same tag isn't one of the extension's.
+        let ours = b64sig(&root, &release_message("v0.23.0", sums));
+        assert!(verify_with(&trust, ext, "v0.23.0", sums, ours.as_bytes(), None, "0.1.0", 0).is_err());
+        assert!(verify_with(&trust, REPO, "v0.23.0", sums, theirs.as_bytes(), None, "0.1.0", 0).is_err());
     }
 
     #[test]
@@ -386,7 +412,7 @@ mod tests {
         let sig = b64sig(&rel, &release_message("v0.28.0", sums));
         let check = |cert: Option<&[u8]>, revoked: &[&str], running: &str, now: u64| {
             let trust = Trust { roots: &roots, revoked };
-            verify_with(&trust, "v0.28.0", sums, sig.as_bytes(), cert, running, now)
+            verify_with(&trust, REPO, "v0.28.0", sums, sig.as_bytes(), cert, running, now)
         };
         let good = cert(&root, 400 * day);
         assert!(
@@ -426,6 +452,7 @@ mod tests {
                     roots: &roots,
                     revoked: &[]
                 },
+                REPO,
                 "v0.28.0",
                 sums,
                 root_sig.as_bytes(),
@@ -442,6 +469,7 @@ mod tests {
                     roots: &roots,
                     revoked: &[]
                 },
+                REPO,
                 "v0.28.1",
                 sums,
                 sig.as_bytes(),

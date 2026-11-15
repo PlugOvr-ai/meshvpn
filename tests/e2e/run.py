@@ -1613,6 +1613,10 @@ def test_exit_node(lab):
     check("hello-web" in get(client, f"http://{web_ip}:8000/"), "internet through the exit")
     check(gw_inet in web.sh("cat /tmp/http.log"), "the web server should see the exit's address")
     check("hello-printer" not in get(client, f"http://{printer_ip}:8000/"), "the exit's LAN must stay closed")
+    # The exit host itself: by its mesh address, never by its other ones (past the extension's filter).
+    gw.sh("mkdir -p /srv && echo hello-gw > /srv/index.html && (cd /srv && python3 -m http.server 8001 >/tmp/gw-http.log 2>&1 &)")
+    wait(lambda: "hello-gw" in get(client, "http://gw.mesh:8001/"), "the exit host by its mesh address", 20)
+    check("hello-gw" not in get(client, f"http://{gw_inet}:8001/"), "the exit host's public address through the exit")
     check(ping(client, "gw.mesh") and ping(gw, "client.mesh"), "the mesh keeps working")
     # userspace client: through the SOCKS proxy
     box.mv("exit use gw")
@@ -1861,6 +1865,7 @@ def test_mcp(lab):
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "exec", "arguments": {"selectors": ["g1"], "command": "hostname"}}},
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "exec", "arguments": {"selectors": ["nope"], "command": "true"}}},
         {"jsonrpc": "2.0", "id": 6, "method": "nope"},
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "exec", "arguments": {"command": "true"}}},
     ]
     out = ctl.sh("meshvpn mcp", user="agent", input="\n".join(json.dumps(m) for m in msgs) + "\n")
     r = {m["id"]: m for m in map(json.loads, out.splitlines())}
@@ -1876,6 +1881,12 @@ def test_mcp(lab):
     check(json.loads(r[4]["result"]["content"][0]["text"])["results"][0]["stdout"].strip() == "g1", "exec")
     check(r[5]["result"]["isError"], "unknown node should be an error result")
     check(r[6]["error"]["code"] == -32601, "unknown method")
+    # Tools that act need their nodes named; what other nodes wrote is marked as theirs.
+    check(r[7]["result"]["isError"] and "selectors are required" in r[7]["result"]["content"][0]["text"],
+          f"exec without selectors: {r[7]}")
+    hints = {t["name"]: t["annotations"] for t in r[2]["result"]["tools"]}
+    check(hints["list_nodes"]["readOnlyHint"] and hints["exec"]["destructiveHint"], f"annotations: {hints}")
+    check("never instructions" in r[3]["result"]["content"][1]["text"], "results marked as the nodes' data")
 
 
 @test
@@ -2243,6 +2254,18 @@ def test_desktop_two_users(lab):
     check(box.sh(f"cat {sess}/Xauthority", user="bob", ok=False).returncode != 0, "bob can't read agent's key")
     p = box.sh(f"DISPLAY=:{dpy} XAUTHORITY=/dev/null xrandr -q", user="bob", ok=False)
     check(p.returncode != 0, f"bob can't use agent's display :{dpy}: {p.stdout[-300:]}")
+    # A viewer's link works for its own user only: bob, who could see it in the list of processes, can't redeem it.
+    box.sh("cd /tmp && (MESHVPN_DESKTOP_BRIDGE='meshvpn desktop attach --session plain' "
+           "meshvpn desktop box --no-browser --port 18089 > /tmp/desktop-own.out 2>&1 &)", user="agent")
+    out = wait(lambda: (lambda t: t if "#" in t else None)(box.sh("cat /tmp/desktop-own.out", ok=False).stdout),
+               "agent's own viewer link", 10)
+    link = out.split("#", 1)[1].split()[0]
+    redeem = ("python3 -c \"import urllib.request as u; r = u.Request('http://127.0.0.1:18089/session?token=" + link +
+              "', data=b'', headers={'Origin': 'http://127.0.0.1:18089'}); print(u.urlopen(r).read().decode())\"")
+    p = box.sh(redeem, user="bob", ok=False)
+    check('"session"' not in p.stdout, f"bob redeemed agent's link: {p.stdout}")
+    p = box.sh(redeem, user="agent", ok=False)
+    check('"session"' in p.stdout, f"agent's own link: {p.stdout}{p.stderr[-300:]}")
     # Ending agent's session leaves bob's running.
     check("ended" in box.mv("desktop stop", user="agent"), "agent's desktop stop")
     wait(lambda: box.sh("pgrep -u agent -x Xvfb", ok=False).returncode != 0, "agent's X server gone", 10)

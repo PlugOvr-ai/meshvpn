@@ -126,6 +126,27 @@ fn serve_exit(iface: &str, on: bool) -> Result<()> {
         on,
         false,
     )?;
+    // Into this host only by its mesh address (where the extension's filter looks): a packet
+    // to one of its other addresses - its public one, say - would be delivered here past it.
+    iptables(
+        "filter",
+        "INPUT",
+        &[
+            "-i",
+            iface,
+            "!",
+            "-d",
+            mesh,
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "DROP",
+        ],
+        on,
+        true,
+    )?;
     // Hosts with Docker drop forwarded packets by default.
     iptables(
         "filter",

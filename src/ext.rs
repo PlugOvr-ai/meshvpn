@@ -295,12 +295,17 @@ pub fn interface_name(dir: &Path) -> Option<String> {
 /// `release-key.cert`), and the
 /// checksum of `name` in that list.
 pub mod release {
-    pub fn signed(tag: &str) -> bool {
-        crate::update::at_least(tag, crate::update::SIGNED_FROM)
+    /// Every release of an extension is signed (its repository named in what is signed).
+    pub fn signed(_tag: &str) -> bool {
+        true
     }
-    /// `cert`: the release's `release-key.cert`, if it has one.
+    /// `cert`: the release's `release-key.cert`, if it has one. Of the extension's repository.
     pub fn verify(tag: &str, sums: &[u8], sig: &[u8], cert: Option<&[u8]>) -> anyhow::Result<()> {
-        crate::update::verify_release_sums(tag, sums, sig, cert)
+        crate::update::verify_release_sums(&crate::update::repo(), tag, sums, sig, cert)
+    }
+    /// `verify` for the releases of `repo` (a program without the extension registered).
+    pub fn verify_of(repo: &str, tag: &str, sums: &[u8], sig: &[u8], cert: Option<&[u8]>) -> anyhow::Result<()> {
+        crate::update::verify_release_sums(repo, tag, sums, sig, cert)
     }
     pub fn sum(sums: &str, name: &str) -> Option<String> {
         crate::update::signed_sum(sums, name)

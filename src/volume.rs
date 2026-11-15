@@ -535,7 +535,34 @@ pub struct Who {
 /// its SSH access here gives it (`meshvpn ssh allow`) - the account of the same name if it may
 /// log in as that, else the first that isn't root, else root. Without SSH access, none: only
 /// who could log in to a node works with its volumes.
+///
+/// Asked for every chunk a user reads: the answer is kept for `ACCOUNT_FOR` (a rule taken
+/// back counts after that long).
 fn account(node: &Node, who: &Who) -> Result<(String, Creds)> {
+    type Known = HashMap<(NodeId, NodeId, String), (Instant, Result<(String, Creds), String>)>;
+    static KNOWN: std::sync::LazyLock<Mutex<Known>> = std::sync::LazyLock::new(Mutex::default);
+    let key = (node.id(), who.node, who.user.clone().unwrap_or_default());
+    if let Some((at, r)) = KNOWN.lock().unwrap().get(&key)
+        && at.elapsed() < ACCOUNT_FOR
+    {
+        return r.clone().map_err(|e| anyhow!(e));
+    }
+    let r = account_now(node, who).map_err(|e| format!("{e:#}"));
+    let mut known = KNOWN.lock().unwrap();
+    if known.len() >= 1024 {
+        known.retain(|_, (at, _)| at.elapsed() < ACCOUNT_FOR);
+        if known.len() >= 1024 {
+            known.clear();
+        }
+    }
+    known.insert(key, (Instant::now(), r.clone()));
+    r.map_err(|e| anyhow!(e))
+}
+
+/// How long `account` keeps an answer.
+const ACCOUNT_FOR: Duration = Duration::from_secs(10);
+
+fn account_now(node: &Node, who: &Who) -> Result<(String, Creds)> {
     let user = who.user.clone().ok_or_else(|| anyhow!("no user"))?;
     if crate::config::rootless() {
         // A rootless install has one account, its own.
@@ -577,6 +604,9 @@ fn account(node: &Node, who: &Who) -> Result<(String, Creds)> {
 struct Store {
     dir: PathBuf,
     have: RwLock<HashSet<(u128, u32)>>,
+    /// When a chunk last came in (or the store was opened): while they come, an upload may be
+    /// on its way.
+    last_put: Mutex<Instant>,
 }
 
 impl Store {
@@ -604,6 +634,7 @@ impl Store {
         Ok(Store {
             dir: dir.into(),
             have: RwLock::new(have),
+            last_put: Mutex::new(Instant::now()),
         })
     }
 
@@ -626,6 +657,7 @@ impl Store {
         let _ = std::fs::remove_file(&tmp);
         linked.with_context(|| format!("chunk {chunk} of {id:032x} is here already"))?;
         self.have.write().unwrap().insert((id, chunk));
+        *self.last_put.lock().unwrap() = Instant::now();
         Ok(())
     }
 
@@ -649,9 +681,13 @@ impl Store {
         self.has(id, chunk).then(|| std::fs::File::open(self.path(id, chunk)))
     }
 
-    /// Deletes the chunks of files the volume no longer has (left alone for `GC_AFTER`: an
-    /// upload may still commit them). Returns how many files' chunks went.
-    fn collect(&self, keep: &HashSet<u128>) -> usize {
+    /// Deletes the chunks of files the volume no longer has, left alone for `GC_AFTER` (a
+    /// reader may still have them open). Of files that were never in the list (`removed`
+    /// names those that were), only once no chunk came for that long: an upload sends chunks
+    /// to every node in turn, and its files go into the list only at its end, which may be
+    /// hours after their chunks came here. Returns how many files' chunks went.
+    fn collect(&self, keep: &HashSet<u128>, removed: &HashSet<u128>) -> usize {
+        let quiet = self.last_put.lock().unwrap().elapsed() >= GC_AFTER;
         let old: Vec<u128> = {
             let have = self.have.read().unwrap();
             let mut ids: Vec<u128> = have.iter().map(|(i, _)| *i).filter(|i| !keep.contains(i)).collect();
@@ -666,7 +702,10 @@ impl Store {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| SystemTime::now().duration_since(t).ok());
-            if age.is_some_and(|a| a >= GC_AFTER) && std::fs::remove_dir_all(&dir).is_ok() {
+            if age.is_some_and(|a| a >= GC_AFTER)
+                && (quiet || removed.contains(&id))
+                && std::fs::remove_dir_all(&dir).is_ok()
+            {
                 self.have.write().unwrap().retain(|(i, _)| *i != id);
                 gone += 1;
             }
@@ -876,6 +915,8 @@ struct Vol {
     /// Commits taken (`COMMIT_*`): tokens left, when.
     commits: Mutex<Option<(f32, Instant)>>,
     ahead: Ahead,
+    /// Files that left the list since the start (their chunks go after `GC_AFTER`).
+    removed: Mutex<HashSet<u128>>,
 }
 
 /// What this node's mount reads in order from other nodes: fetched ahead, a few pieces at once
@@ -967,6 +1008,7 @@ impl Vol {
             nudged: AtomicBool::new(false),
             commits: Mutex::new(None),
             ahead: Ahead::default(),
+            removed: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1221,6 +1263,14 @@ impl Vol {
         if let Some(mount) = mount {
             mount.update(tree);
         }
+        {
+            // Files that leave the list (removed, replaced): their chunks may go.
+            let old = self.manifest();
+            let now: HashSet<u128> = m.files.iter().map(Entry::id128).collect();
+            let mut removed = self.removed.lock().unwrap();
+            removed.extend(old.files.iter().map(Entry::id128).filter(|i| !now.contains(i)));
+            removed.retain(|i| !now.contains(i));
+        }
         *self.man.write().unwrap() = Arc::new(Current::of(m));
         *self.wire.write().unwrap() = Arc::new(wire);
         Ok(())
@@ -1229,7 +1279,11 @@ impl Vol {
     fn collect(&self) {
         if let Some(store) = &self.store {
             let keep: HashSet<u128> = self.manifest().files.iter().map(Entry::id128).collect();
-            let gone = store.collect(&keep);
+            let removed = self.removed.lock().unwrap().clone();
+            let gone = store.collect(&keep, &removed);
+            // (what is no longer here needs no note)
+            let have: HashSet<u128> = store.have.read().unwrap().iter().map(|(i, _)| *i).collect();
+            self.removed.lock().unwrap().retain(|i| have.contains(i));
             if gone > 0 {
                 info!(
                     "volume {}: deleted the chunks of {gone} file(s) it no longer has",
@@ -2703,7 +2757,23 @@ mod tests {
         assert_eq!(out, b"hello");
         assert!(s.has(3, 1) && !s.has(3, 2) && !s.has(4, 0));
         // Fresh chunks of files the list doesn't have stay (an upload may commit them yet).
-        assert_eq!(s.collect(&HashSet::new()), 0);
+        assert_eq!(s.collect(&HashSet::new(), &HashSet::new()), 0);
+        // Old ones too while chunks still come in (an upload going on) - unless they left the
+        // list; once none came for a while, all of them.
+        let old = SystemTime::now() - GC_AFTER - Duration::from_secs(60);
+        s.put(5, 0, b"other").unwrap();
+        for id in [3u128, 5] {
+            std::fs::File::open(dir.join(format!("{id:032x}")))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        assert_eq!(s.collect(&HashSet::new(), &HashSet::new()), 0);
+        assert_eq!(s.collect(&HashSet::new(), &HashSet::from([5])), 1);
+        assert!(s.has(3, 0) && !s.has(5, 0));
+        *s.last_put.lock().unwrap() = Instant::now() - GC_AFTER;
+        assert_eq!(s.collect(&HashSet::from([7]), &HashSet::new()), 1);
+        assert!(!s.has(3, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

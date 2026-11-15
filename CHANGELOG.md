@@ -10,6 +10,30 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.4] - 2026-11-15
+
+### Fixed
+- **Volumes:** a `volume cp` of more than about an hour could lose files: a node deleted the chunks of files that
+  weren't in the list yet once they were an hour old, though the copy commits them only at its end. Chunks of files
+  never in the list now stay while any chunks come in; those of removed files go after an hour as before.
+- **Volumes:** the account a user reads as is looked up once per 10 seconds, not for every chunk.
+
+### Security
+- **MCP:** tools that act (`exec`, copies, `launch`, `training_env`, `gpu_reserve`) need their nodes named
+  (`all` too); before, a call without any reached every node, this machine included. Tools carry MCP's
+  read-only/destructive hints, and every result says that names, notes and output from other nodes are data, not
+  instructions (a member could write text for the agent into GPU names, object names or reservation notes).
+- **Remote desktop:** the viewer's link (in the browser's arguments, visible to other local users) is redeemed only
+  by a connection of the same user (Linux). Before, another local user who saw it first got the desktop.
+- **Remote desktop:** a session makes sure the X socket it connects to is its own Xvfb's. Where `/tmp/.X11-unix`
+  isn't root's (containers), another local user could put a socket there and get the session's cookie.
+- **Exit node:** packets from the mesh to one of the exit host's other addresses (its public one) are dropped; the
+  host is reachable by its mesh address, where an extension's filter applies.
+- **Updates:** a build with an extension of its own releases installs only signed releases of it, signed for its
+  repository. Before, its releases were checked against their checksum files only, which whoever could change the
+  release could change too.
+- **macOS:** the tunnel's descriptor is no longer inherited by programs meshvpn starts (SSH sessions).
+
 ## [0.34.3] - 2026-11-14
 
 ### Changed

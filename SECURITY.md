@@ -44,7 +44,10 @@ where appropriate) and named in the release notes.
 - `SHA256SUMS.sig`: an Ed25519 signature of `SHA256SUMS` (and of the version, so an older
   release's list can't be passed off as a newer one's). `meshvpn update` and `meshvpn desktop
   setup` install a release only if it verifies, and the file's checksum is in the signed list.
-  Releases before 0.27.0 are checked against their checksums only.
+  meshvpn's releases before 0.27.0 are never installed. A build with an extension of its own
+  releases (the enterprise edition) installs only signed releases of the extension's repository
+  too; what is signed then names that repository as well (`meshvpn release v1`, the repository,
+  the version, `SHA256SUMS`), so a release of one can't be passed off as one of the other.
 
   The keys come in two levels (as with TUF or Tailscale's distsign):
   - **Root keys**, built into meshvpn and kept offline. They certify release keys, and in an

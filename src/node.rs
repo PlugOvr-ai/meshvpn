@@ -5482,6 +5482,14 @@ fn create_tun(cfg: &mut Config, my_ip: Ipv4Addr, extra: bool) -> std::result::Re
         p.enable_routing(false);
     });
     let dev = tun::create_as_async(&tcfg).map_err(|e| e.to_string())?;
+    // Not to programs started from here, such as SSH sessions (the macOS backend leaves it
+    // inheritable): raw access to the mesh's packets.
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a descriptor we own; flags only.
+        unsafe { libc::fcntl(dev.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     #[cfg(target_os = "macos")]
     {
         use tun::AbstractDevice;

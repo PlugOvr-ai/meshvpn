@@ -524,6 +524,13 @@ pub fn run(want: &str) -> Result<()> {
     std::fs::write(dir.join("display"), format!(":{dpy}"))?;
     let path = format!("/tmp/.X11-unix/X{dpy}");
     let unix = std::os::unix::net::UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
+    // The socket is ours only if Xvfb made it: /tmp/.X11-unix may belong to someone else (no
+    // root-owned directory in a container), who could have put theirs there to get the cookie.
+    #[cfg(target_os = "linux")]
+    if peer_pid(&unix) != Some(xvfb.id() as i32) {
+        let _ = xvfb.kill();
+        bail!("{path} is not our Xvfb's (someone else's socket in /tmp/.X11-unix?)");
+    }
     let (stream, _) = DefaultStream::from_unix_stream(unix)?;
     let conn =
         RustConnection::connect_to_stream_with_auth_info(stream, 0, b"MIT-MAGIC-COOKIE-1".to_vec(), cookie.to_vec())
@@ -1003,6 +1010,25 @@ fn prepare_xfce() {
              <property name=\"use_compositing\" type=\"bool\" value=\"false\"/>\n  </property>\n</channel>\n",
         );
     }
+}
+
+/// The process at the other end of a Unix socket.
+#[cfg(target_os = "linux")]
+fn peer_pid(s: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: zeroed is a valid ucred; a valid descriptor and the struct's size.
+    let mut c: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut c as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (r == 0).then_some(c.pid)
 }
 
 /// The bundled Xvfb, or `system`'s (the system's own, with OpenGL through Mesa).

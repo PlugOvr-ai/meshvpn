@@ -185,6 +185,33 @@ pub fn terminal_link(url: &str) -> String {
     }
 }
 
+fn own_port(s: &TcpStream) -> u16 {
+    s.local_addr().map(|a| a.port()).unwrap_or(0)
+}
+
+/// Is the connection from 127.0.0.1:`port` to our `ours` one of this user's (or root's)? The
+/// kernel lists each socket's owner in /proc/net/tcp. Where it can't tell (no /proc): yes.
+fn peer_is_us(port: u16, ours: u16) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+            return true;
+        };
+        let (local, remote) = (format!("0100007F:{port:04X}"), format!("0100007F:{ours:04X}"));
+        let me = unsafe { libc::geteuid() };
+        let owner = table.lines().skip(1).find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() > 7 && f[1] == local && f[2] == remote).then(|| f[7].parse::<u32>().ok())
+        });
+        matches!(owner, Some(Some(uid)) if uid == me || uid == 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (port, ours);
+        true
+    }
+}
+
 pub fn open_url(url: &str) -> bool {
     for cmd in ["xdg-open", "open", "wslview"] {
         let ok = std::process::Command::new(cmd)
@@ -246,7 +273,12 @@ async fn handle(mut stream: TcpStream, target: &Target, tokens: &std::sync::Mute
         header("Origin").is_none_or(|o| o == own) && header("Host").is_some_and(|h| own.ends_with(&format!("//{h}")));
     let method = head.split_whitespace().next().unwrap_or_default().to_string();
     if path.starts_with("/session") {
-        let session = (method == "POST" && same_origin)
+        // The link may show in the list of processes (the browser's argument): only this
+        // user's own programs redeem it, not another local user who saw it first.
+        let ours = stream
+            .peer_addr()
+            .is_ok_and(|a| peer_is_us(a.port(), own_port(&stream)));
+        let session = (method == "POST" && same_origin && ours)
             .then(|| {
                 let mut t = tokens.lock().unwrap();
                 match (&t.link, &given) {
@@ -462,6 +494,20 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connection_of_our_own_is_ours() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = l.local_addr().unwrap().port();
+        let c = std::net::TcpStream::connect(("127.0.0.1", ours)).unwrap();
+        let port = c.local_addr().unwrap().port();
+        assert!(peer_is_us(port, ours));
+        // No such connection: not ours.
+        assert!(!peer_is_us(port.wrapping_add(1), ours));
+    }
+
     #[test]
     fn titles_are_escaped() {
         assert_eq!(super::html_escape("a<script>&\"'"), "a&lt;script&gt;&amp;&quot;&#39;");
