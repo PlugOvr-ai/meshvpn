@@ -494,11 +494,10 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(target_os = "linux")]
     #[test]
     fn a_connection_of_our_own_is_ours() {
+        use super::peer_is_us;
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let ours = l.local_addr().unwrap().port();
         let c = std::net::TcpStream::connect(("127.0.0.1", ours)).unwrap();
