@@ -10,6 +10,13 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.6] - 2026-11-18
+
+### Changed
+- **`meshvpn ssh` explains missing people:** the grid lists only users that have an SSH key, so someone without one
+  was simply not there. A node without any key is now marked "no SSH key", and the line at the bottom says how to
+  get one into the list (`ssh-keygen -t ed25519` on that machine, then reopen the grid).
+
 ## [0.34.5] - 2026-11-18
 
 ### Fixed

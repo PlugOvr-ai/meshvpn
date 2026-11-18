@@ -24,6 +24,8 @@ struct Source {
     from_user: Option<String>,
     online: bool,
     known: bool,
+    /// The node publishes at least one SSH key (a user's ~/.ssh/id_*).
+    keys: bool,
     /// The "every node of the network" row.
     everyone: bool,
 }
@@ -34,6 +36,7 @@ impl Source {
             return "everyone (all nodes)".into();
         }
         match &self.from_user {
+            None if self.known && !self.keys => format!("{} (any user) - no SSH key", self.name),
             None => format!("{} (any user)", self.name),
             Some(u) => format!("  {u}@{}", self.name),
         }
@@ -126,6 +129,7 @@ impl App {
             from_user: None,
             online: true,
             known: true,
+            keys: true,
             everyone: true,
         }];
         for n in &ov.nodes {
@@ -135,6 +139,7 @@ impl App {
                 from_user: None,
                 online: n.online,
                 known: true,
+                keys: !n.users.is_empty(),
                 everyone: false,
             });
             for u in &n.users {
@@ -144,6 +149,7 @@ impl App {
                     from_user: Some(u.clone()),
                     online: n.online,
                     known: true,
+                    keys: true,
                     everyone: false,
                 });
             }
@@ -157,6 +163,7 @@ impl App {
                     from_user: r.from_user.clone(),
                     online: false,
                     known: false,
+                    keys: true,
                     everyone: false,
                 });
             }
@@ -206,6 +213,24 @@ impl App {
         let row = self.table.selected().unwrap_or(0);
         let col = self.table.selected_column().unwrap_or(1).saturating_sub(1);
         (row, col)
+    }
+
+    /// What to do when someone who should get access has no SSH key yet.
+    fn key_hint(&self) -> Option<String> {
+        let s = self.rows.get(self.cursor().0)?;
+        if s.everyone || !s.known {
+            return None;
+        }
+        let name = &s.name;
+        Some(match &s.from_user {
+            None if !s.keys => format!(
+                "no SSH key on {name} yet: whoever logs in from there runs `ssh-keygen -t ed25519`, then reopen this"
+            ),
+            None => format!(
+                "someone on {name} missing? Only users with an SSH key are listed: they run `ssh-keygen -t ed25519`"
+            ),
+            Some(_) => return None,
+        })
     }
 
     fn dirty(&self) -> bool {
@@ -259,7 +284,7 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let [title, body, help] =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(3), Constraint::Length(2)]).areas(f.area());
+            Layout::vertical([Constraint::Length(3), Constraint::Min(3), Constraint::Length(3)]).areas(f.area());
 
         f.render_widget(
             Paragraph::new(vec![
@@ -357,6 +382,7 @@ impl App {
                     " quit".into(),
                 ]),
                 Line::from(status),
+                Line::from(self.key_hint().unwrap_or_default().dark_gray()),
             ]),
             help,
         );
@@ -430,5 +456,53 @@ mod account_tests {
         assert_eq!(users[0], me);
         assert_eq!(users.iter().filter(|u| **u == me).count(), 1);
         assert_eq!(super::me_first(vec!["root".into()])[0], me);
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn screen(app: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 12)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        buf.content()
+            .chunks(140)
+            .map(|l| l.iter().map(|c| c.symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn a_node_without_a_key_says_how_to_make_one() {
+        let ov = SshOverview {
+            hostname: "here".into(),
+            nodes: vec![
+                crate::node::SshSource {
+                    id: crate::keys::Key32([1; 32]),
+                    name: "nokey".into(),
+                    online: true,
+                    users: vec![],
+                },
+                crate::node::SshSource {
+                    id: crate::keys::Key32([2; 32]),
+                    name: "withkey".into(),
+                    online: true,
+                    users: vec!["ann".into()],
+                },
+            ],
+            rules: vec![],
+            allow_all: vec![],
+        };
+        let mut app = App::new(ov);
+        assert!(!screen(&mut app).contains("ssh-keygen"), "not on the everyone row");
+        app.table.select(Some(1));
+        let s = screen(&mut app);
+        assert!(s.contains("nokey (any user) - no SSH key"), "{s}");
+        assert!(s.contains("no SSH key on nokey yet"), "{s}");
+        app.table.select(Some(2));
+        let s = screen(&mut app);
+        assert!(s.contains("someone on withkey missing?"), "{s}");
+        assert!(!s.contains("withkey (any user) - no SSH key"), "{s}");
     }
 }
