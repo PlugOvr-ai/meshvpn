@@ -243,12 +243,18 @@ impl App {
     fn save(&mut self, rt: &tokio::runtime::Runtime, dir: &Path) -> Result<()> {
         let rules = self.rules();
         let allow_all = self.allow_all();
-        if !rules.is_empty() || !allow_all.is_empty() {
-            crate::sshd::enable_if_installed()?;
-        }
+        // The rules count for the built-in server and once sshd is set up: saved either way.
+        let sshd = if !rules.is_empty() || !allow_all.is_empty() {
+            crate::sshd::enable_if_installed().err()
+        } else {
+            None
+        };
         rt.block_on(control::request(dir, &Request::SshSetRules { rules, allow_all }))?;
         self.saved = self.checked.clone();
-        Ok(())
+        match sshd {
+            Some(e) => Err(e.context("saved, but sshd doesn't use the rules yet")),
+            None => Ok(()),
+        }
     }
 
     fn draw(&mut self, f: &mut Frame) {

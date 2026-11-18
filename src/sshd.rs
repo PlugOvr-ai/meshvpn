@@ -125,7 +125,7 @@ pub fn enable() -> Result<bool> {
             String::from_utf8_lossy(&check.stderr).trim()
         );
     }
-    if effective_command(&sshd).as_deref() != Some(want.as_str()) {
+    if effective_command(&sshd).as_deref() != Some(want.as_str()) && !include_dropins(&sshd, &want) {
         let _ = std::fs::remove_file(DROPIN);
         bail!(
             "sshd does not read {} - add `Include /etc/ssh/sshd_config.d/*.conf` at the top of \
@@ -135,6 +135,39 @@ pub fn enable() -> Result<bool> {
     }
     reload();
     Ok(true)
+}
+
+const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
+const INCLUDE: &str = "Include /etc/ssh/sshd_config.d/*.conf";
+
+/// sshd's main config doesn't read the drop-in directory (RHEL 8 and its relatives ship it so):
+/// the `Include` that newer distributions have at its top, added there. Kept if sshd then takes
+/// meshvpn's drop-in; otherwise the file is put back as it was.
+fn include_dropins(sshd: &Path, want: &str) -> bool {
+    let Ok(before) = std::fs::read_to_string(SSHD_CONFIG) else {
+        return false;
+    };
+    if mentions_dropins(&before) {
+        return false; // read already, somewhere further down (e.g. after a `Match`): not ours to move
+    }
+    let after = format!("# Added by meshvpn: read the drop-ins (e.g. {DROPIN}).\n{INCLUDE}\n\n{before}");
+    if std::fs::write(SSHD_CONFIG, after).is_err() {
+        return false;
+    }
+    let ok = Command::new(sshd).arg("-t").output().is_ok_and(|o| o.status.success())
+        && effective_command(sshd).as_deref() == Some(want);
+    if !ok {
+        let _ = std::fs::write(SSHD_CONFIG, before);
+    }
+    ok
+}
+
+/// An `Include` (not commented out) of the drop-in directory.
+fn mentions_dropins(config: &str) -> bool {
+    config.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        w.next().is_some_and(|k| k.eq_ignore_ascii_case("include")) && w.any(|p| p.contains("sshd_config.d"))
+    })
 }
 
 /// An AuthorizedKeysCommand that runs some meshvpn binary's `ssh-authorized-keys`.
@@ -153,6 +186,14 @@ pub fn disable() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sees_an_include_of_the_dropins() {
+        assert!(mentions_dropins("Port 22\nInclude /etc/ssh/sshd_config.d/*.conf\n"));
+        assert!(mentions_dropins("  include  /etc/ssh/sshd_config.d/*.conf"));
+        assert!(!mentions_dropins("#Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n"));
+        assert!(!mentions_dropins("Include /etc/ssh/other/*.conf\n"));
+    }
 
     #[test]
     fn recognizes_its_own_command() {

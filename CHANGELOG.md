@@ -10,6 +10,23 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.5] - 2026-11-18
+
+### Fixed
+- **Joining with a new invite while meshvpn runs:** it said "admitted", but every new connection still showed the
+  old admission, so a node that members had turned away stayed out (`not admitted: ... the admission is too old and
+  nobody vouched for it`) until meshvpn was restarted. The new admission now counts at once.
+- **A node that reached no member in its first hour** was turned away for good (its admission was too old) and needed
+  a new invite. It now makes a new admission from its invite as long as that is valid.
+- **`meshvpn update` on a machine in several networks** updated the program but restarted only the first network's
+  meshvpn: the others kept running the old version (`meshvpn --net NAME status` still offered the update, while
+  `meshvpn update` said it was up to date). They are now restarted too.
+- **sshd that doesn't read `/etc/ssh/sshd_config.d`** (RHEL 8 and its relatives): password-less logins needed
+  `Include /etc/ssh/sshd_config.d/*.conf` added by hand. meshvpn now adds it at the top of `/etc/ssh/sshd_config`
+  itself, and puts the file back if sshd doesn't take it.
+- **The grid of `meshvpn ssh` didn't save the rules** when sshd couldn't be set up; now it saves them (they count for the
+  built-in server, and for sshd once it is set up) and says what is missing.
+
 ## [0.34.4] - 2026-11-15
 
 ### Fixed

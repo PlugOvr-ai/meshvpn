@@ -2115,7 +2115,12 @@ fn real_main(cli: Cli) -> Result<i32> {
                 say(json, &text);
             }
         }
-        Cmd::Update { check, force } => update_cmd(&dir, check, force, json)?,
+        Cmd::Update { check, force } => {
+            update_cmd(&dir, check, force, json)?;
+            if !check {
+                restart_outdated(&base, &dir, net_given);
+            }
+        }
         Cmd::External(args) => {
             return match crate::ext::get().and_then(|e| e.command(&dir, json, &args)) {
                 Some(r) => r,
@@ -3833,6 +3838,44 @@ fn update_cmd(dir: &Path, check: bool, force: bool, json: bool) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// After an update: the other networks of this machine still run the program from before it (one
+/// daemon each, and only the one asked updated and restarted itself) - restart those.
+fn restart_outdated(base: &Path, dir: &Path, net_given: bool) {
+    if net_given {
+        return;
+    }
+    // This program's file, which the update may just have replaced (then Linux names it "... (deleted)").
+    let Some(installed) = std::env::current_exe()
+        .ok()
+        .map(|exe| PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)")))
+        .and_then(|exe| std::process::Command::new(exe).arg("--version").output().ok())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|v| v.split_whitespace().nth(1).map(str::to_string))
+    else {
+        return;
+    };
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        return;
+    };
+    for d in chosen_networks(base, dir, false) {
+        if d == dir || !control::is_running(&d) {
+            continue;
+        }
+        let Ok(control::Response::Status(st)) = rt.block_on(control::request(&d, &control::Request::Status)) else {
+            continue;
+        };
+        if st.version != installed
+            && let Err(e) = restart(&d)
+        {
+            eprintln!(
+                "network {} still runs meshvpn {}: {e:#}",
+                networks::name(&d).unwrap_or_default(),
+                st.version
+            );
+        }
+    }
 }
 
 /// The systemd unit of a network: `meshvpn.service`, `meshvpn-<name>.service`.

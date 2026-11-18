@@ -3854,6 +3854,9 @@ impl Node {
                         .unwrap_or(peer.short());
                     warn!("{by} turned this node away: {why}");
                     st.rejected = Some((by, why.clone()));
+                    if why.contains("admission is too old") {
+                        self.renew_stale_claim(&mut st);
+                    }
                     // A member that doesn't count this node as one: its list of admins is another.
                     if Self::managed(&st)
                         && (why.starts_with("this network is managed") || why.contains("not issued by an admin"))

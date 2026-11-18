@@ -23,6 +23,8 @@ use super::*;
 
 /// A claim must reach its first member within this time of being made.
 const FRESH_MS: u64 = 3600 * 1000;
+/// An own admission older than this is made anew when a member finds it too old.
+const RENEW_AFTER_MS: u64 = 5 * 60 * 1000;
 /// Open network: unconfirmed rosters kept, one per signer.
 const MAX_PENDING_ROSTERS: usize = 16;
 
@@ -668,7 +670,12 @@ impl Node {
             return Some(c.clone());
         }
         let ticket = self.cfg.ticket.clone()?;
-        let claim = self.make_claim(ticket, self.cfg.ticket_key.as_deref());
+        let mut at = now_ms();
+        // Tests: an admission that no member saw in its first hour.
+        if std::env::var_os("MESHVPN_TEST_STALE_CLAIM").is_some() {
+            at = at.saturating_sub(2 * FRESH_MS);
+        }
+        let claim = self.make_claim_at(ticket, self.cfg.ticket_key.as_deref(), at);
         let msg = ClaimMsg {
             claim: SignedDoc::sign(&claim, &self.ident),
             witness: None,
@@ -684,9 +691,53 @@ impl Node {
         Some(msg)
     }
 
+    /// A member turned us away because our admission is too old and nobody vouched for it (no
+    /// member saw it within `FRESH_MS`, e.g. the node reached none in its first hour): a new one
+    /// from the same invite while that is valid - as joining with it again would make.
+    pub(super) fn renew_stale_claim(&self, st: &mut State) {
+        let now = now_ms();
+        let recent = st
+            .my_claim
+            .as_ref()
+            .and_then(|m| m.claim.open::<Claim>(|c| c.node).ok())
+            .is_some_and(|c| now.saturating_sub(c.at) < RENEW_AFTER_MS);
+        if recent {
+            return;
+        }
+        let res = (|| -> Result<Option<ClaimMsg>> {
+            let mut cfg = Config::load(&self.dir)?;
+            let Some(ticket) = cfg.ticket.clone() else {
+                return Ok(None);
+            };
+            let t = ticket.open::<Ticket>(|t| t.issuer)?;
+            if t.net != self.net || t.expires <= now {
+                return Ok(None);
+            }
+            let claim = self.make_claim(ticket, cfg.ticket_key.as_deref());
+            let msg = ClaimMsg {
+                claim: SignedDoc::sign(&claim, &self.ident),
+                witness: None,
+            };
+            cfg.claim = Some(msg.clone());
+            cfg.save(&self.dir)?;
+            Ok(Some(msg))
+        })();
+        match res {
+            Ok(Some(msg)) => {
+                info!("the admission was too old for the members: made a new one from the invite");
+                st.my_claim = Some(msg);
+            }
+            Ok(None) => warn!("the admission is too old and the invite has expired - ask an admin for a new invite"),
+            Err(e) => warn!("renewing the admission: {e:#}"),
+        }
+    }
+
     /// Our claim on `ticket`, with the proof from the invite's one-time key if it is bound.
     fn make_claim(&self, ticket: SignedDoc, ticket_key: Option<&str>) -> Claim {
-        let at = now_ms();
+        self.make_claim_at(ticket, ticket_key, now_ms())
+    }
+
+    fn make_claim_at(&self, ticket: SignedDoc, ticket_key: Option<&str>, at: u64) -> Claim {
         let proof = ticket
             .open::<Ticket>(|t| t.issuer)
             .ok()
@@ -934,6 +985,9 @@ impl Node {
         cfg.claim = Some(msg.clone());
         cfg.save(&self.dir)?;
         let mut st = self.state.lock().unwrap();
+        // Every connection from now on shows the new admission (not only the links up now: a
+        // node that was turned away has none).
+        st.my_claim = Some(msg.clone());
         if let Some(m) = self.accept_claim(&mut st, msg)? {
             self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None);
             // The others dropped our record while we weren't admitted, and a copy that came

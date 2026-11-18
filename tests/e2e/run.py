@@ -994,6 +994,31 @@ def test_names(lab):
 
 
 @test
+def test_stale_admission(lab):
+    """An admission no member saw in its first hour: made anew while the invite is valid; after that, joining with a new invite works while meshvpn runs."""
+    net = lab.network("net")
+    hub = lab.node("hub", [net])
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    # The invite is still valid: the node makes a new admission once a member finds its own too old.
+    a = lab.node("a", [net])
+    a.mv(f"join {invite(hub)} --name a")
+    a.up(env="MESHVPN_TEST_STALE_CLAIM=1")
+    wait(lambda: hub.online("a"), "a is admitted with a new admission", 90)
+    log = a.sh("cat /var/log/meshvpn.log")
+    check("too old" in log and "made a new one from the invite" in log, f"a should have renewed its admission:\n{log[-2000:]}")
+    # The invite has expired as well: turned away until joined again with a new one - while running.
+    b = lab.node("b", [net])
+    b.mv(f"join {invite(hub, '--expires 15s')} --name b")
+    time.sleep(16)
+    b.up(env="MESHVPN_TEST_STALE_CLAIM=1")
+    wait(lambda: "too old" in (b.status().get("turned_away") or ""), "b is turned away", 60)
+    check(not hub.online("b"), "b must not be in with a stale admission and an expired invite")
+    check("admitted" in b.mv(f"join {invite(hub)}"), "joining again while running")
+    wait(lambda: hub.online("b"), "b is admitted after joining again while meshvpn runs", 90)
+
+
+@test
 def test_clients(lab):
     """A user's computer joins as a client for a time: reaches the nodes, relays nothing, is dropped when its time is up, renews."""
     net, (hub, a) = mesh(lab, ["hub", "a"])
@@ -1231,7 +1256,11 @@ def test_ssh_logins(lab):
     laptop.sh("useradd -m -s /bin/bash alice; useradd -m -s /bin/bash eve; "
               "for u in alice eve; do su $u -c 'ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/id_ed25519'; done")
     server.sh("useradd -m -s /bin/bash bob")
+    # An sshd that doesn't read sshd_config.d (RHEL 8 and its relatives): meshvpn adds the Include.
+    server.sh("rm -f /etc/ssh/sshd_config.d/meshvpn.conf; sed -i '/^Include /d' /etc/ssh/sshd_config; pkill -HUP -o -x sshd; true")
     server.mv("ssh allow alice@laptop --as bob")
+    head = server.sh("head -2 /etc/ssh/sshd_config")
+    check("Include /etc/ssh/sshd_config.d/*.conf" in head, f"the Include should be at the top: {head}")
     wait(lambda: "alice@laptop" in server.mv("ssh-authorized-keys bob"), "server learns alice's key", 60)
     o = "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
     login = lambda user, target: laptop.sh(f"su {user} -c 'ssh {o} {target} whoami'", ok=False).stdout.strip()  # noqa: E731
