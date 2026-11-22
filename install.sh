@@ -39,6 +39,7 @@ VERSION="${MESHVPN_VERSION:-latest}"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+star() { echo; echo "Like meshvpn? A star on GitHub helps others find it: https://github.com/PlugOvr-ai/meshvpn"; }
 
 ROOTLESS="${MESHVPN_ROOTLESS:-}"
 [ "$ROOTLESS" = 0 ] && ROOTLESS=""
@@ -261,6 +262,7 @@ if [ -n "$ROOTLESS" ]; then
         case "$1" in
             init | join) "$BIN_DIR/meshvpn" $DIR_ARGS install ;;
         esac
+        star
     elif [ -f "$MESH_DIR/config.toml" ]; then
         # Already set up: restart on the new version.
         "$BIN_DIR/meshvpn" $DIR_ARGS install
@@ -271,6 +273,7 @@ if [ -n "$ROOTLESS" ]; then
         echo "Next: create a network with   $MV init"
         echo "      or join one with        $MV join <invite>"
         echo "      then start it with      $MV install"
+        star
     fi
     exit 0
 fi
@@ -287,6 +290,7 @@ if [ $# -gt 0 ]; then
             $SUDO "$BIN_DIR/meshvpn" install
             ;;
     esac
+    star
 elif { [ -f /etc/systemd/system/meshvpn.service ] || [ -f /Library/LaunchDaemons/ai.plugovr.meshvpn.plist ]; } \
     && $SUDO test -f /etc/meshvpn/config.toml; then
     # Already set up: restart the service on the new version (this also stops a meshvpn
@@ -296,4 +300,5 @@ else
     echo
     echo "Next: create a network with   sudo meshvpn init"
     echo "      or join one with        sudo meshvpn join <invite>"
+    star
 fi

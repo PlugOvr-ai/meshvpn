@@ -10,6 +10,12 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.7] - 2026-11-22
+
+### Changed
+- **The install scripts** end a fresh install with a pointer to the GitHub repository, for a star if you like meshvpn.
+  Updates of a machine that is already set up stay quiet.
+
 ## [0.34.6] - 2026-11-18
 
 ### Changed

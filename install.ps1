@@ -42,6 +42,7 @@ try {
     New-Item -ItemType Directory -Force $dest -ErrorAction Stop | Out-Null
     # A running meshvpn holds its files: stop the task while replacing them.
     $running = $null -ne (Get-ScheduledTask -TaskName meshvpn -ErrorAction SilentlyContinue)
+    $star = $false
     if ($running) { Stop-ScheduledTask -TaskName meshvpn -ErrorAction SilentlyContinue; Start-Sleep 2 }
     Copy-Item "$tmp\x\*" $dest -Recurse -Force -ErrorAction Stop
     $path = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -59,6 +60,7 @@ try {
         & $exe @args
         if ($LASTEXITCODE -ne 0) { throw "meshvpn $($args[0]) failed" }
         if ($args[0] -in "init", "join") { & $exe install }
+        $star = $true
     } elseif ($running -and (Test-Path "C:\ProgramData\meshvpn\config.toml")) {
         & $exe install   # restart on the new version
     } else {
@@ -66,6 +68,11 @@ try {
         Write-Host "Next: create a network with   meshvpn init"
         Write-Host "      or join one with        meshvpn join <invite>"
         Write-Host "      then start it with      meshvpn install"
+        $star = $true
+    }
+    if ($star) {
+        Write-Host ""
+        Write-Host "Like meshvpn? A star on GitHub helps others find it: https://github.com/PlugOvr-ai/meshvpn"
     }
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

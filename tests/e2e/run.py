@@ -1972,6 +1972,7 @@ def test_install_proxy(lab):
           "client must not reach the mirror directly")
     out = client.sh(f"env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin MESHVPN_DOWNLOAD_URL=http://{web.c}:8000 sh /tmp/install.sh")
     check("from /etc/environment" in out and "Installed meshvpn" in out, out)
+    check("A star on GitHub" in out, "no star reminder after a fresh install")
     check(client.sh("cat /etc/meshvpn/proxy.env").count(proxy.c) == 2, "proxy not saved for meshvpn")
 
 
@@ -2622,6 +2623,7 @@ def test_rootless(lab):
     out = box.sh(f"MESHVPN_DOWNLOAD_URL=file:///tmp/rel sh /tmp/install.sh --user join {invite(hub)} --name box",
                  user="agent")
     check("Rootless install" in out and "running in the background" in out, out)
+    check("A star on GitHub" in out, "no star reminder after a fresh install")
     check(box.sh("test -e /etc/meshvpn -o -e /usr/local/bin/meshvpn && echo root || echo clean").strip() == "clean",
           "a rootless install must not touch system paths")
     mv = "/home/agent/.local/bin/meshvpn"
