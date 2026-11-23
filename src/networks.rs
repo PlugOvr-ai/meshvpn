@@ -55,7 +55,9 @@ pub fn suffix(dir: &Path) -> String {
 /// Every network of this machine: (name, directory), the first one as "" and first.
 pub fn all(base: &Path) -> Vec<(String, PathBuf)> {
     let mut out = vec![];
-    if Config::path(base).exists() {
+    // Without root the system directory can't be read: the running networks still count.
+    let system = base == Path::new(crate::config::SYSTEM_DIR);
+    if Config::path(base).exists() || (system && crate::control::is_running(base)) {
         out.push((String::new(), base.to_path_buf()));
     }
     let mut extra: Vec<(String, PathBuf)> = std::fs::read_dir(base.join(SUBDIR))
@@ -65,6 +67,13 @@ pub fn all(base: &Path) -> Vec<(String, PathBuf)> {
         .filter(|e| Config::path(&e.path()).exists())
         .filter_map(|e| Some((e.file_name().to_str()?.to_string(), e.path())))
         .collect();
+    if system {
+        for n in crate::control::running_system_networks() {
+            if !extra.iter().any(|(e, _)| *e == n) {
+                extra.push((n.clone(), dir_of(base, &n)));
+            }
+        }
+    }
     extra.sort();
     out.extend(extra);
     out

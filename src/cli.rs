@@ -869,11 +869,16 @@ fn exit_code(msg: &str) -> i32 {
 fn network_dir(base: &Path, name: &str, creating: bool) -> Result<PathBuf> {
     let name = name.trim().to_lowercase();
     let extra = networks::dir_of(base, &name);
-    if Config::path(&extra).exists() {
+    // Running counts too: without root the system directory can't be read.
+    if Config::path(&extra).exists() || (!name.is_empty() && crate::control::is_running(&extra)) {
         return Ok(extra);
     }
     // The first network, by its own name.
-    if Config::load(base).is_ok_and(|c| c.network == name) || name.is_empty() {
+    let first = || match Config::load(base) {
+        Ok(c) => c.network == name,
+        Err(_) => agent::status(base).is_ok_and(|st| st.network == name),
+    };
+    if name.is_empty() || first() {
         return Ok(base.to_path_buf());
     }
     networks::check_name(&name)?;

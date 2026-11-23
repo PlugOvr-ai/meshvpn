@@ -10,6 +10,13 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.8] - 2026-11-23
+
+### Fixed
+- **Further networks without sudo:** `meshvpn --net <name> ...` as a normal user said "this machine isn't in any
+  network yet", because the further networks live in root's `/etc/meshvpn`. Their control sockets are now in `/run`
+  next to the first one's, so `--net`, `status` ("also in: ...") and the list of networks work without sudo.
+
 ## [0.34.7] - 2026-11-22
 
 ### Changed

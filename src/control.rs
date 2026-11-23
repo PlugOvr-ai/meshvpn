@@ -188,6 +188,45 @@ pub enum Response {
 /// socket in /run where everyone can ask for the status. Everything else needs root; that is
 /// checked per request with the caller's credentials.
 /// Windows: a named pipe instead, `\\.\pipe\meshvpn` for the system install.
+const RUN_DIR: &str = if cfg!(target_os = "linux") { "/run" } else { "/var/run" };
+
+/// The name of a further network of the system install (`/etc/meshvpn/networks/<name>`).
+fn system_network(dir: &Path) -> Option<String> {
+    (dir.parent()? == Path::new("/etc/meshvpn").join("networks"))
+        .then(|| crate::networks::name(dir))
+        .flatten()
+}
+
+/// Further networks of the system install that run, by their sockets: what a user without root
+/// can see of them.
+pub fn running_system_networks() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        let mut out: Vec<String> = std::fs::read_dir(RUN_DIR)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let f = e.file_name().into_string().ok()?;
+                let name = f.strip_prefix("meshvpn-")?.strip_suffix(".sock")?.to_string();
+                let dir = crate::networks::dir_of(Path::new("/etc/meshvpn"), &name);
+                (crate::networks::check_name(&name).is_ok() && is_running(&dir)).then_some(name)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+    #[cfg(windows)]
+    vec![]
+}
+
+/// Where a further network of the system install had its socket before 0.34.8 (its daemon
+/// may still be an older one).
+#[cfg(unix)]
+fn old_socket_path(dir: &Path) -> Option<PathBuf> {
+    system_network(dir).map(|_| dir.join("meshvpn.sock"))
+}
+
 pub fn socket_path(dir: &Path) -> PathBuf {
     if cfg!(windows) {
         if dir == Path::new(crate::config::SYSTEM_DIR) {
@@ -198,11 +237,10 @@ pub fn socket_path(dir: &Path) -> PathBuf {
         return PathBuf::from(format!(r"\\.\pipe\meshvpn-{}", &hash[..16]));
     }
     if dir == Path::new("/etc/meshvpn") {
-        PathBuf::from(if cfg!(target_os = "linux") {
-            "/run/meshvpn.sock"
-        } else {
-            "/var/run/meshvpn.sock"
-        })
+        PathBuf::from(RUN_DIR).join("meshvpn.sock")
+    } else if let Some(name) = system_network(dir) {
+        // Next to the first one's: the directory is root's only, and users run commands too.
+        PathBuf::from(RUN_DIR).join(format!("meshvpn-{name}.sock"))
     } else {
         let path = dir.join("meshvpn.sock");
         // Unix socket paths are limited to ~108 bytes; a deep directory gets one in /tmp.
@@ -692,6 +730,7 @@ pub fn is_running(dir: &Path) -> bool {
     #[cfg(unix)]
     {
         std::os::unix::net::UnixStream::connect(socket_path(dir)).is_ok()
+            || old_socket_path(dir).is_some_and(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
     }
     #[cfg(windows)]
     {
@@ -725,7 +764,15 @@ async fn connect(path: &Path) -> std::io::Result<tokio::net::windows::named_pipe
 
 pub async fn request(dir: &Path, req: &Request) -> Result<Response> {
     let path = socket_path(dir);
-    let stream = connect(&path).await.map_err(|e| match e.kind() {
+    let mut stream = connect(&path).await;
+    #[cfg(unix)]
+    if stream.is_err()
+        && let Some(old) = old_socket_path(dir)
+        && let Ok(s) = connect(&old).await
+    {
+        stream = Ok(s);
+    }
+    let stream = stream.map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
             anyhow::anyhow!(
                 "meshvpn is not running - start it with `{}` (or `{}`)",

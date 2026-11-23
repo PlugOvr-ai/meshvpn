@@ -351,6 +351,14 @@ def test_two_networks(lab):
     routes = laptop.sh("ip route show dev mesh1")
     check(ip_b in routes and "100.64.0.0/10" not in routes, f"the further network routes its nodes only: {routes}")
     check("also in: lab" in laptop.mv("status"), "status names the other network")
+    # Without root (/etc/meshvpn is root's only): the further network is found all the same.
+    p = laptop.sh("meshvpn --net lab status --json", user="agent", ok=False)
+    check(p.returncode == 0 and json.loads(p.stdout)["ip"] == lab_ip, f"--net lab without root: {p.stdout}{p.stderr}")
+    p = laptop.sh("meshvpn --net mesh status --json", user="agent", ok=False)
+    check(p.returncode == 0 and json.loads(p.stdout)["ip"] == laptop.ip(), f"--net mesh without root: {p.stdout}{p.stderr}")
+    p = laptop.sh("meshvpn --net nope status", user="agent", ok=False)
+    check("mesh, lab" in p.stderr, f"the networks without root: {p.stderr}")
+    check("also in: lab" in laptop.sh("meshvpn status", user="agent"), "status names the other network without root")
     # IPv6: each network its own prefix, so nothing to clash.
     v6_a, v6_b = laptop.status()["mesh_ip6"], laptop.mvj("--net lab status")["mesh_ip6"]
     check(v6_a and v6_b and v6_a.split(":")[:3] != v6_b.split(":")[:3], f"IPv6 prefixes of the networks: {v6_a} {v6_b}")
