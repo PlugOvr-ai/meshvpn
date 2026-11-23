@@ -764,14 +764,12 @@ async fn connect(path: &Path) -> std::io::Result<tokio::net::windows::named_pipe
 
 pub async fn request(dir: &Path, req: &Request) -> Result<Response> {
     let path = socket_path(dir);
-    let mut stream = connect(&path).await;
+    let stream = connect(&path).await;
     #[cfg(unix)]
-    if stream.is_err()
-        && let Some(old) = old_socket_path(dir)
-        && let Ok(s) = connect(&old).await
-    {
-        stream = Ok(s);
-    }
+    let stream = match (stream, old_socket_path(dir)) {
+        (Err(e), Some(old)) => connect(&old).await.map_err(|_| e),
+        (s, _) => s,
+    };
     let stream = stream.map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
             anyhow::anyhow!(
