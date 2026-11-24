@@ -10,7 +10,7 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
-## [0.34.9] - 2026-11-24
+## [0.34.10] - 2026-11-24
 
 ### Added
 - **`meshvpn forget --offline-since 70m`** (s, m, h, d): forgets only the nodes offline for longer than that, so a
