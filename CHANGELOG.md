@@ -10,6 +10,15 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.11] - 2026-11-24
+
+### Fixed
+- **Userspace mode (containers, rootless): incoming connections could stop for good** until meshvpn was restarted,
+  while the node still showed online with a direct path (ssh: "Connection timed out"). Two causes: a panic in
+  the TCP/IP library on an unusual packet ended the stack, and now it starts again by itself (the open
+  connections end); and a client's source port, once seen, was ignored for good, so a later connection that
+  happened to use it again was never answered.
+
 ## [0.34.10] - 2026-11-24
 
 ### Added

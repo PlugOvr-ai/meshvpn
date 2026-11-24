@@ -307,7 +307,7 @@ struct Stack {
     conns: HashMap<SocketHandle, Conn>,
     /// One listening socket per new incoming connection (several may arrive at once).
     listeners: HashMap<u16, Vec<SocketHandle>>,
-    /// SYNs we opened a listener for, so retransmissions don't open more.
+    /// SYNs we opened a listener for, so retransmissions don't open more (for `LISTEN_FOR`).
     seen_syns: HashMap<(Ipv4Addr, u16, u16), Instant>,
     used_ports: HashSet<u16>,
     started: Instant,
@@ -318,6 +318,39 @@ struct Stack {
 }
 
 impl Stack {
+    fn new(node: Arc<Node>, node_ip: Ipv4Addr, prefix: u8, mtu: usize, tx: StackTx) -> Stack {
+        let mut device = VirtualDevice {
+            rx: VecDeque::new(),
+            tx: vec![],
+            mtu,
+        };
+        let mut config = IfaceConfig::new(HardwareAddress::Ip);
+        config.random_seed = rand::rngs::OsRng.next_u64();
+        let started = Instant::now();
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_micros(0));
+        iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(IpAddress::Ipv4(node_ip), prefix));
+        });
+        // Everything outside the mesh goes to the node too, which sends it to an exit node
+        // if one is set (and drops it otherwise). No link layer: the gateway is nominal.
+        let _ = iface.routes_mut().add_default_ipv4_route(node_ip);
+        Stack {
+            node,
+            my_ip: node_ip,
+            iface,
+            device,
+            sockets: SocketSet::new(vec![]),
+            conns: HashMap::new(),
+            listeners: HashMap::new(),
+            seen_syns: HashMap::new(),
+            used_ports: HashSet::new(),
+            started,
+            wake: Arc::new(Notify::new()),
+            tx,
+            listening: HashMap::new(),
+        }
+    }
+
     fn now(&self) -> SmolInstant {
         SmolInstant::from_micros(self.started.elapsed().as_micros() as i64)
     }
@@ -353,7 +386,9 @@ impl Stack {
             Cmd::Packet(p) => {
                 QUEUED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(key @ (src, _, port)) = syn(&p)
-                    && !self.seen_syns.contains_key(&key)
+                    // A retransmitted SYN, not a new connection: only while its listener waits. A
+                    // later SYN with the same ports is a new connection (clients reuse ports).
+                    && !self.seen_syns.get(&key).is_some_and(|t| t.elapsed() < LISTEN_FOR)
                     && self.room_for(src)
                     // SSH also when sshd only listens on loopback (it authenticates anyway).
                     && (self.listens(port, false)
@@ -367,7 +402,7 @@ impl Stack {
                         self.conns.insert(h, Conn::new(Kind::Inbound { port, dialing: false }));
                         self.seen_syns.insert(key, Instant::now());
                         if self.seen_syns.len() > 4096 {
-                            self.seen_syns.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+                            self.seen_syns.retain(|_, t| t.elapsed() < LISTEN_FOR);
                         }
                     }
                 }
@@ -605,42 +640,25 @@ pub fn start(node_ip: Ipv4Addr, prefix: u8, mtu: usize) -> (StackTx, impl FnOnce
     let tx2 = tx.clone();
     let run = move |node: Arc<Node>| {
         tokio::spawn(async move {
-            let mut device = VirtualDevice {
-                rx: VecDeque::new(),
-                tx: vec![],
-                mtu,
-            };
-            let mut config = IfaceConfig::new(HardwareAddress::Ip);
-            config.random_seed = rand::rngs::OsRng.next_u64();
-            let started = Instant::now();
-            let mut iface = Interface::new(config, &mut device, SmolInstant::from_micros(0));
-            iface.update_ip_addrs(|a| {
-                let _ = a.push(IpCidr::new(IpAddress::Ipv4(node_ip), prefix));
-            });
-            // Everything outside the mesh goes to the node too, which sends it to an exit node
-            // if one is set (and drops it otherwise). No link layer: the gateway is nominal.
-            let _ = iface.routes_mut().add_default_ipv4_route(node_ip);
-            let mut stack = Stack {
-                node,
-                my_ip: node_ip,
-                iface,
-                device,
-                sockets: SocketSet::new(vec![]),
-                conns: HashMap::new(),
-                listeners: HashMap::new(),
-                seen_syns: HashMap::new(),
-                used_ports: HashSet::new(),
-                started,
-                wake: Arc::new(Notify::new()),
-                tx: tx2,
-                listening: HashMap::new(),
-            };
+            let mut stack = Stack::new(node, node_ip, prefix, mtu, tx2.clone());
             loop {
-                let now = stack.now();
-                stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
-                stack.service();
-                stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
-                stack.flush();
+                // smoltcp can panic on an odd packet ("subtract sequence numbers with underflow"):
+                // that would end the stack for good, and with it every connection into this node.
+                // Start a fresh one instead (the open connections end).
+                let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let now = stack.now();
+                    stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                    stack.service();
+                    stack.iface.poll(now, &mut stack.device, &mut stack.sockets);
+                    stack.flush();
+                }));
+                if step.is_err() {
+                    warn!(
+                        "userspace mode: the TCP/IP stack failed (see the panic above) - starting it again; open connections into and out of this node end"
+                    );
+                    stack = Stack::new(stack.node.clone(), node_ip, prefix, mtu, tx2.clone());
+                    continue;
+                }
                 let delay = stack
                     .iface
                     .poll_delay(stack.now(), &stack.sockets)
@@ -651,9 +669,15 @@ pub fn start(node_ip: Ipv4Addr, prefix: u8, mtu: usize) -> (StackTx, impl FnOnce
                 tokio::select! {
                     cmd = rx.recv() => {
                         let Some(cmd) = cmd else { break };
-                        stack.handle(cmd);
-                        while let Ok(cmd) = rx.try_recv() {
+                        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             stack.handle(cmd);
+                            while let Ok(cmd) = rx.try_recv() {
+                                stack.handle(cmd);
+                            }
+                        }));
+                        if handled.is_err() {
+                            warn!("userspace mode: the TCP/IP stack failed (see the panic above) - starting it again; open connections into and out of this node end");
+                            stack = Stack::new(stack.node.clone(), node_ip, prefix, mtu, tx2.clone());
                         }
                     }
                     _ = wake.notified() => {}

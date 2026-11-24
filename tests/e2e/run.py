@@ -1261,6 +1261,19 @@ def test_userspace(lab):
     check(out.count("hello-box") == 10, f"parallel requests in: {out.count('hello-box')}/10")
     out = box.sh("curl -s -m5 -x socks5h://127.0.0.1:1055 http://hub.mesh:8000/")
     check("hello-hub" in out, "SOCKS out of the box")
+    # A client that uses the same source port again later (they cycle through their ports) is a
+    # new connection, not a retransmission to ignore.
+    again = ("import socket,struct,sys\n"
+             "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+             "s.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('ii',1,0))\n"
+             "s.settimeout(8); s.bind(('',40123)); s.connect(('box.mesh',8080))\n"
+             "s.sendall(b'GET / HTTP/1.0\\r\\n\\r\\n'); d=b''\n"
+             "while (c:=s.recv(4096)): d+=c\n"
+             "print('hello-box' in d.decode()); s.close()\n")
+    hub.sh(f"cat > /tmp/again.py <<'EOF'\n{again}EOF")
+    check("True" in hub.sh("python3 /tmp/again.py", ok=False).stdout, "first connection from port 40123")
+    time.sleep(32)
+    check("True" in hub.sh("python3 /tmp/again.py", ok=False).stdout, "a later connection from the same port")
     # integrity both ways
     hub.sh("head -c 20000000 /dev/urandom > /tmp/d")
     want = hub.sh("sha256sum /tmp/d | cut -c1-16").strip()
