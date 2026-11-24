@@ -2962,9 +2962,14 @@ impl Node {
         drop(st);
         self.update_hosts();
         Ok(match names.len() {
-            0 if tag.is_some() => format!("no offline node with tag {} to forget", tag.unwrap_or_default()),
-            0 if since.is_some_and(|d| !d.is_zero()) => "no node has been offline that long".into(),
-            0 => "no offline nodes to forget".into(),
+            0 => {
+                let with_tag = tag.map(|t| format!(" with tag {t}")).unwrap_or_default();
+                if since.is_some_and(|d| !d.is_zero()) {
+                    format!("no node{with_tag} has been offline that long")
+                } else {
+                    format!("no offline nodes{with_tag} to forget")
+                }
+            }
             _ if everywhere => format!("forgot {} (on every node of the network)", names.join(", ")),
             _ => format!(
                 "forgot {} here (in a managed network only an admin makes every node forget it)",

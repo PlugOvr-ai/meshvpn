@@ -937,7 +937,8 @@ def test_forget(lab):
     check(a.mv("forget --offline-since 7x", ok=False).returncode != 0, "a bad duration is refused")
     check(a.mv("forget --offline-since 1h gone", ok=False).returncode != 0, "a name with --offline-since is refused")
     out = a.mv("forget --offline-since 1s tag:nope")
-    check("no offline node with tag nope" in out, out)
+    check("no node with tag nope has been offline that long" in out, out)
+    time.sleep(3)  # offline for longer than 1 s
     # Only the tagged one: the laptop (a person's machine) stays.
     out = a.mv("forget --offline-since 1s tag:server")
     check("forgot gone here" in out and "lap" not in out and knows(a, "lap"), out)
