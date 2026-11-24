@@ -924,7 +924,8 @@ def test_forget(lab):
     net, (hub, a, b, gone, lap) = mesh(lab, ["hub", "a", "b", "gone", "lap"])
     gone.mv("tag add server")
     wait(lambda: all(n.online("gone") and n.online("lap") for n in (a, b)), "gone known everywhere", 40)
-    wait(lambda: "server" in a.mv("nodes tag:server"), "a sees the tag of gone", 40)
+    wait(lambda: any(p["name"] == "gone" and "server" in p.get("tags", []) for p in a.status()["peers"]),
+         "a sees the tag of gone", 40)
     knows = lambda n, name="gone": any(p["name"] == name for p in n.status()["peers"])
     gone.stop()
     lap.stop()
