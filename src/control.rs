@@ -172,6 +172,14 @@ pub enum Request {
     Forget {
         who: Option<String>,
     },
+    /// Forget the nodes offline for longer than this (a request of its own: an older daemon
+    /// refuses it instead of forgetting every offline node).
+    ForgetOfflineSince {
+        ms: u64,
+        /// Only nodes with this tag.
+        #[serde(default)]
+        tag: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -520,6 +528,14 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin + Send>(node: Arc<Node>, strea
                 message: format!("{e:#}"),
             },
         },
+        Ok(Request::ForgetOfflineSince { ms, tag }) => {
+            match node.forget_offline_since(std::time::Duration::from_millis(ms), tag.as_deref()) {
+                Ok(text) => Response::Message { text },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            }
+        }
         Ok(Request::Forget { who }) => match node.forget(who.as_deref()) {
             Ok(text) => Response::Message { text },
             Err(e) => Response::Error {

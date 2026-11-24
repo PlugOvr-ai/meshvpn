@@ -921,14 +921,25 @@ def test_ban(lab):
 @test
 def test_forget(lab):
     """Forgetting an offline node: signed, so in a managed network only an admin's reaches every node."""
-    net, (hub, a, b, gone) = mesh(lab, ["hub", "a", "b", "gone"])
-    wait(lambda: all(n.online("gone") for n in (a, b)), "gone known everywhere", 40)
-    knows = lambda n: any(p["name"] == "gone" for p in n.status()["peers"])
+    net, (hub, a, b, gone, lap) = mesh(lab, ["hub", "a", "b", "gone", "lap"])
+    gone.mv("tag add server")
+    wait(lambda: all(n.online("gone") and n.online("lap") for n in (a, b)), "gone known everywhere", 40)
+    wait(lambda: "server" in a.mv("nodes tag:server"), "a sees the tag of gone", 40)
+    knows = lambda n, name="gone": any(p["name"] == name for p in n.status()["peers"])
     gone.stop()
-    wait(lambda: not hub.online("gone") and not a.online("gone") and not b.online("gone"), "gone offline", 150)
-    # A member: only here.
-    out = a.mv("forget gone")
-    check("forgot gone here" in out, out)
+    lap.stop()
+    wait(lambda: not hub.online("gone") and not a.online("gone") and not b.online("gone") and not a.online("lap"),
+         "gone offline", 150)
+    # A member: only here. --offline-since leaves nodes that went away only recently.
+    out = a.mv("forget --offline-since 1h")
+    check("no node has been offline that long" in out and knows(a), out)
+    check(a.mv("forget --offline-since 7x", ok=False).returncode != 0, "a bad duration is refused")
+    check(a.mv("forget --offline-since 1h gone", ok=False).returncode != 0, "a name with --offline-since is refused")
+    out = a.mv("forget --offline-since 1s tag:nope")
+    check("no offline node with tag nope" in out, out)
+    # Only the tagged one: the laptop (a person's machine) stays.
+    out = a.mv("forget --offline-since 1s tag:server")
+    check("forgot gone here" in out and "lap" not in out and knows(a, "lap"), out)
     check(not knows(a), "a forgot it")
     time.sleep(5)
     check(knows(b) and knows(hub), "a member's forget reached the others")

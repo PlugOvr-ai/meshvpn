@@ -248,12 +248,17 @@ enum Cmd {
     },
     /// Remove offline nodes (e.g. old identities of re-installed machines) from the whole network.
     Forget {
-        /// Name or id (prefix) of the node.
-        #[arg(required_unless_present = "offline")]
+        /// Name or id (prefix) of the node; with --offline or --offline-since, tag:<tag> picks
+        /// only the nodes with that tag (e.g. the servers, not people's laptops).
+        #[arg(required_unless_present_any = ["offline", "offline_since"])]
         who: Option<String>,
         /// Forget all nodes that are currently offline.
-        #[arg(long, conflicts_with = "who")]
+        #[arg(long)]
         offline: bool,
+        /// Only the nodes offline for longer than this, e.g. 70m, 12h, 7d (s, m, h, d): a short
+        /// outage doesn't empty the list.
+        #[arg(long, value_name = "DURATION", conflicts_with = "offline")]
+        offline_since: Option<String>,
     },
     /// Ban a node from the network for good: every node drops it, and all other members get a
     /// new network key (so it cannot come back under a new identity). Old invites stop working.
@@ -2113,9 +2118,39 @@ fn real_main(cli: Cli) -> Result<i32> {
                 say(json, &text);
             }
         }
-        Cmd::Forget { who, offline: _ } => {
-            let resp =
-                tokio::runtime::Runtime::new()?.block_on(control::request(&dir, &control::Request::Forget { who }))?;
+        Cmd::Forget {
+            who,
+            offline,
+            offline_since,
+        } => {
+            let all_offline = offline || offline_since.is_some();
+            let tag = match who.as_deref().map(|w| w.strip_prefix("tag:")) {
+                Some(Some(t)) if all_offline && !t.is_empty() => Some(t.to_string()),
+                Some(_) if all_offline => {
+                    bail!("with --offline or --offline-since, pick nodes by tag:<tag> (or name one node without them)")
+                }
+                _ => None,
+            };
+            let req = match offline_since {
+                Some(d) => control::Request::ForgetOfflineSince {
+                    ms: parse_duration_ms(&d)?,
+                    tag,
+                },
+                // Plain --offline with a tag: the same request, with no minimum time.
+                None if tag.is_some() => control::Request::ForgetOfflineSince { ms: 0, tag },
+                None => control::Request::Forget { who },
+            };
+            let resp = tokio::runtime::Runtime::new()?
+                .block_on(control::request(&dir, &req))
+                .map_err(|e| {
+                    if e.to_string().contains("unknown variant") {
+                        anyhow::anyhow!(
+                            "the running meshvpn is too old for this (--offline-since, tag:): sudo meshvpn update"
+                        )
+                    } else {
+                        e
+                    }
+                })?;
             if let control::Response::Message { text } = resp {
                 say(json, &text);
             }

@@ -390,6 +390,8 @@ sudo meshvpn update          # on each node (without sudo for rootless installs)
 ```sh
 sudo meshvpn forget old-laptop      # an identity that is gone (e.g. a reinstalled machine)
 sudo meshvpn forget --offline       # all nodes that are currently offline
+sudo meshvpn forget --offline-since 7d  # only nodes offline for over 7 days (s, m, h, d)
+sudo meshvpn forget --offline-since 1h tag:server  # ... and only those with tag server
 sudo meshvpn ban stolen-laptop      # for good: every node drops it and the network gets a new key
 ```
 

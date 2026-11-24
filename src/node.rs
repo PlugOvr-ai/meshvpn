@@ -2901,13 +2901,40 @@ impl Node {
 
     /// `meshvpn forget NAME|ID` or `meshvpn forget --offline`.
     pub fn forget(&self, who: Option<&str>) -> Result<String> {
+        self.forget_where(who, None, None)
+    }
+
+    /// How long a node has surely been offline, also for one not heard of since this start: its
+    /// record was signed again at least every `HEARTBEAT` while it ran. None = online.
+    fn offline_at_least(&self, st: &State, id: &NodeId) -> Option<Duration> {
+        let d = self.offline_for(st, id)?;
+        let r = st.records.get(id)?;
+        if r.last_heard.is_some() {
+            return Some(d);
+        }
+        let since_record =
+            Duration::from_millis(now_ms().saturating_sub(r.info.seq)).saturating_sub(HEARTBEAT + ONLINE_WINDOW);
+        Some(d.max(since_record))
+    }
+
+    /// `meshvpn forget --offline-since 70m`: the nodes offline for longer than that.
+    /// Only nodes with tag `tag`, if given (e.g. the servers, not the people's laptops).
+    pub fn forget_offline_since(&self, since: Duration, tag: Option<&str>) -> Result<String> {
+        self.forget_where(None, Some(since), tag)
+    }
+
+    fn forget_where(&self, who: Option<&str>, since: Option<Duration>, tag: Option<&str>) -> Result<String> {
         let mut st = self.state.lock().unwrap();
         let ids: Vec<NodeId> = match who {
             None => st
                 .records
                 .keys()
                 .copied()
-                .filter(|id| !self.is_online(&st, id))
+                .filter(|id| match since {
+                    Some(since) if !since.is_zero() => self.offline_at_least(&st, id).is_some_and(|d| d > since),
+                    _ => !self.is_online(&st, id),
+                })
+                .filter(|id| tag.is_none_or(|t| st.records[id].info.tags.iter().any(|x| x == t)))
                 .collect(),
             Some(w) => {
                 let w = w.trim().to_lowercase();
@@ -2935,6 +2962,8 @@ impl Node {
         drop(st);
         self.update_hosts();
         Ok(match names.len() {
+            0 if tag.is_some() => format!("no offline node with tag {} to forget", tag.unwrap_or_default()),
+            0 if since.is_some_and(|d| !d.is_zero()) => "no node has been offline that long".into(),
             0 => "no offline nodes to forget".into(),
             _ if everywhere => format!("forgot {} (on every node of the network)", names.join(", ")),
             _ => format!(
