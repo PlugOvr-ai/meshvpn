@@ -58,6 +58,8 @@ const PROBE_REPLAY_MS: u64 = 120_000;
 /// Unfinished split datagrams, in all and per sending address.
 const MAX_FRAGS: usize = 256;
 const MAX_FRAGS_PER_SOURCE: usize = 32;
+/// A split datagram not complete after this long lost a part.
+const FRAG_TIMEOUT: Duration = Duration::from_secs(2);
 /// An answer to a probe counts only this soon.
 const PROBE_ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
@@ -493,7 +495,14 @@ impl Node {
         // node's current UDP path come first: others can't crowd them out.
         let on_path = st.udp_paths.values().any(|p| p.addr == from);
         if !st.udp_frags.contains_key(&(prefix, id)) {
-            let from_here = st.udp_frags.values().filter(|r| r.from == from).count();
+            let mut from_here = st.udp_frags.values().filter(|r| r.from == from).count();
+            // Datagrams whose other parts were lost (a lossy path) are given up after a while:
+            // otherwise they would fill this sender's share for good, and none of its split
+            // datagrams would get through any more.
+            if from_here >= MAX_FRAGS_PER_SOURCE || st.udp_frags.len() >= MAX_FRAGS {
+                st.udp_frags.retain(|_, r| r.started.elapsed() < FRAG_TIMEOUT);
+                from_here = st.udp_frags.values().filter(|r| r.from == from).count();
+            }
             let in_name = || {
                 st.udp_frags
                     .iter()
@@ -502,9 +511,6 @@ impl Node {
             };
             if from_here >= MAX_FRAGS_PER_SOURCE || (!on_path && in_name() >= MAX_FRAGS_PER_SOURCE) {
                 return None;
-            }
-            if st.udp_frags.len() >= MAX_FRAGS {
-                st.udp_frags.retain(|_, r| r.started.elapsed() < Duration::from_secs(2));
             }
             if st.udp_frags.len() >= MAX_FRAGS {
                 if !on_path {

@@ -10,6 +10,8 @@ pub mod proto;
 pub mod session;
 #[cfg(unix)]
 pub mod video;
+#[cfg(unix)]
+pub mod watchdog;
 
 /// The desktop server side (Xvfb sessions) needs Unix; Windows machines connect to others.
 #[cfg(windows)]

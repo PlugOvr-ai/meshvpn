@@ -25,6 +25,7 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use super::bundle::{self, Bundle};
 use super::proto::*;
+use super::watchdog;
 
 /// Largest screen: Xvfb allocates this once; RandR shrinks the visible part to the browser.
 const MAX_W: u16 = 3840;
@@ -503,10 +504,28 @@ pub fn run(want: &str) -> Result<()> {
     let font_cache = dir.join("fontcache");
     write_fonts_conf(&fonts_conf, &bundle, &font_cache)?;
 
+    // The last session hung and was stopped, or the GPU doesn't answer: this one goes without it
+    // (it could hang the same way).
+    let mut notice = None;
+    if let Some(why) = watchdog::last_stopped(&dir) {
+        watchdog::set_no_gpu();
+        notice = Some(format!(
+            "The last desktop session was stuck and was stopped: {why}. This session doesn't use the GPU \
+             (3D programs and the picture on the CPU). To try the GPU again: End session (⏻) and reconnect."
+        ));
+    } else if !watchdog::nvidia_answers() {
+        watchdog::set_no_gpu();
+        warn!("the GPU doesn't answer (nvidia-smi hangs) - this session runs without it");
+        notice = Some(
+            "The GPU of this node doesn't answer (nvidia-smi hangs), so this session doesn't use it: 3D \
+             programs and the picture on the CPU."
+                .to_string(),
+        );
+    }
     // VirtualGL needs an X server with GLX, as Cinnamon does: then the system's Xvfb. Not on
     // NVIDIA's EGL, which VirtualGL drives without it: there the bundled one will do (machines
     // where no one may install the system's Xvfb).
-    let mut gpu = gl_on_gpu();
+    let mut gpu = if watchdog::no_gpu() { vec![] } else { gl_on_gpu() };
     let glx = mode == Mode::Cinnamon || (!gpu.is_empty() && !nvidia_egl(&gpu));
     let system = glx.then(system_xvfb).flatten();
     if !gpu.is_empty() && system.is_none() && !nvidia_egl(&gpu) {
@@ -555,6 +574,7 @@ pub fn run(want: &str) -> Result<()> {
     }
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let mut desk = Desk::new(conn, env, mode)?;
+    desk.notice = notice;
     std::fs::write(dir.join("mode"), mode.name())?;
     if let Some(line) = mode.start_line() {
         if mode == Mode::Xfce {
@@ -568,6 +588,7 @@ pub fn run(want: &str) -> Result<()> {
         info!("{} started", mode.label());
     }
 
+    watchdog::start(dir.clone(), sock.clone());
     let result = serve(&mut desk, &sock, cmd_tx, cmd_rx);
     let _ = xvfb.kill();
     let _ = xvfb.wait();
@@ -1274,6 +1295,8 @@ struct Desk {
     /// Where the part shown starts on the X screen.
     ox: u16,
     oy: u16,
+    /// For the next browser that comes (why the GPU isn't used).
+    notice: Option<String>,
 }
 
 /// A monitor of the shared screen (RandR).
@@ -1424,6 +1447,7 @@ impl Desk {
             view: None,
             ox: 0,
             oy: 0,
+            notice: None,
         };
         if shared {
             d.load_monitors();
@@ -1438,6 +1462,7 @@ impl Desk {
         let mut last_reap = Instant::now();
         let mut last_touch = Instant::now();
         while !self.stop {
+            watchdog::beat();
             let mut busy = false;
             loop {
                 match rx.try_recv() {
@@ -1504,9 +1529,12 @@ impl Desk {
                         }
                         let msg = frame(
                             S_NOTICE,
-                            "Xfce stopped right after starting, so this is the built-in desktop. The reason is in \
-                             the session log on the node (meshvpn-desktop*/session.log in $XDG_RUNTIME_DIR or /tmp)."
-                                .as_bytes(),
+                            format!(
+                                "Xfce stopped right after starting, so this is the built-in desktop. The reason is \
+                                 in the session log on the node: {}",
+                                self.env.dir.join("session.log").display()
+                            )
+                            .as_bytes(),
                         );
                         self.broadcast(&msg);
                     } else {
@@ -1557,6 +1585,9 @@ impl Desk {
                 hello.extend(self.apps.clone());
                 if let Some(cur) = &self.cursor {
                     hello.extend(cur.clone());
+                }
+                if let Some(n) = self.notice.take() {
+                    hello.extend(frame(S_NOTICE, n.as_bytes()));
                 }
                 if c.tx.try_send(hello).is_ok() {
                     if self.screen && self.clients.is_empty() {

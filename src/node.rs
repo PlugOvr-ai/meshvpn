@@ -465,6 +465,8 @@ struct State {
     /// Refused logins to the built-in SSH server, for doctor/status.
     ssh_refused: VecDeque<(u64, String)>,
     leases: Vec<Lease>,
+    /// The other networks' reservations of this machine's GPUs (see `gpu`).
+    foreign_leases: Vec<Lease>,
     /// STUN requests in flight (transaction id, server, sent) and the answers: our public UDP
     /// address as each server saw it.
     stun_pending: Vec<([u8; 12], SocketAddr, Instant)>,
@@ -1222,7 +1224,7 @@ impl Node {
             objects: st.objects_ad.clone(),
             udp: st.my_udp.clone(),
             udp6: st.my_udp6.clone(),
-            leases: st.leases.clone(),
+            leases: Self::published_leases(st),
             ssh_host_key: st.my_ssh_host_key.clone(),
             login_user: st
                 .login_user
@@ -4262,6 +4264,7 @@ impl Node {
                 self.ssh_check();
             }
             self.update_hosts();
+            self.share_leases();
             // Another node has our address: start again with the next one (the TUN device, the
             // userspace stack and the SSH server all have it from the start).
             let moved = {
@@ -4753,7 +4756,7 @@ impl Node {
             perf: st.perf.values().cloned().collect(),
             measured: st.measured,
             objects: st.objects_ad.clone(),
-            leases: st.leases.clone(),
+            leases: Self::published_leases(&st),
             peers,
             client: Self::client_of(&st, &self.ident.id).cloned(),
         }

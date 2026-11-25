@@ -1617,6 +1617,49 @@ def test_gpu_reservations(lab):
 
 
 @test
+def test_gpu_two_networks(lab):
+    """A machine in two networks: a GPU reserved in one is taken in the other too (and shown there without its holder)."""
+    net_a, net_b = lab.network("a"), lab.network("b")
+    hub_a, hub_b = lab.node("huba", [net_a]), lab.node("hubb", [net_b])
+    box = lab.node("box", [net_a, net_b], caps=False)
+    box.fake_gpus([("NVIDIA A100", 40960, 300, 0)] * 2)
+    hub_a.mv(f"init --name huba --endpoint {hub_a.c}:7870")
+    hub_a.up()
+    hub_b.mv(f"init --name hubb --network lab --endpoint {hub_b.c}:7870")
+    hub_b.up()
+    box.mv(f"join {invite(hub_a)} --name box", user="agent")
+    box.mv(f"join {invite(hub_b)} --name box", user="agent")
+    box.mv("install", user="agent", timeout=60)
+    wait(lambda: hub_a.online("box") and hub_b.online("box"), "box online in both", 60)
+
+    def reserve(net, args):
+        return box.mv(f"{net} gpu reserve-local {args} --ttl-ms 600000 --holder test", user="agent", ok=False)
+
+    p = reserve("", "--gpus 0")
+    check(p.returncode == 0 and '"gpus":[0]' in p.stdout.replace(" ", ""), f"GPU 0 in the first network: {p.stdout}{p.stderr}")
+    lease = json.loads(p.stdout)
+    p = reserve("--net lab", "--gpus 0")
+    check(p.returncode != 0 and "another network" in p.stdout + p.stderr, f"GPU 0 is taken in the other network: {p.stdout}{p.stderr}")
+    p = reserve("--net lab", "--count 2")
+    check(p.returncode != 0, f"only one GPU is left: {p.stdout}{p.stderr}")
+    p = reserve("--net lab", "--count 1")
+    check(p.returncode == 0 and '"gpus":[1]' in p.stdout.replace(" ", ""), f"GPU 1 in the second: {p.stdout}{p.stderr}")
+    # The other network's nodes see GPU 0 as reserved, without who has it.
+    def leases(hub, name):
+        return (hub.peer(name) or {}).get("leases", [])
+    wait(lambda: any(l["gpus"] == [0] and "another network" in l["holder"] for l in leases(hub_b, "box")),
+         "hubb sees GPU 0 reserved in another network", 40)
+    check(not any("test" == l["holder"] and l["gpus"] == [0] for l in leases(hub_b, "box")), "no holder from the other network")
+    p = box.mv(f"--net lab gpu release-local {lease['id']}", user="agent", ok=False)
+    check(p.returncode != 0 and "another network" in p.stdout + p.stderr, f"released only where it was made: {p.stdout}{p.stderr}")
+    box.mv(f"gpu release-local {lease['id']}", user="agent")
+    p = reserve("--net lab", "--gpus 0")
+    check(p.returncode == 0, f"GPU 0 free again in the other network: {p.stdout}{p.stderr}")
+    wait(lambda: any(l["gpus"] == [1] and "another network" in l["holder"] for l in leases(hub_a, "box")),
+         "huba sees the second network's GPU 1", 40)
+
+
+@test
 def test_connect_outside(lab):
     """A node on the internet joins a firewalled network: the network connects to it (meshvpn connect)."""
     corp = lab.network("corp", internal=True)
@@ -2619,6 +2662,31 @@ def test_small_mtu(lab):
 
 
 @test
+def test_small_mtu_lost_parts(lab):
+    """Split datagrams that lost a part (lossy path) don't block that node's split datagrams for good."""
+    net = lab.network("net")
+    hub, b = (lab.node(n, [net]) for n in ("hub", "b"))
+    for chain, port in (("INPUT", "--dport"), ("OUTPUT", "--sport")):
+        b.sh(f"iptables -A {chain} -p udp {port} 7870 -m length --length 1300:65535 -j DROP")
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    b.mv(f"join {invite(hub)} --name b")
+    b.up()
+    wait(lambda: "splitting" in (hub.peer("b") or {}).get("path", ""), "hub splits towards b", 60)
+    big = "ping -4 -c 3 -W 2 -s 1300 b.mesh"
+    wait(lambda: hub.sh(big, ok=False).returncode == 0, "big pings over the split path", 30)
+    # A ping of 1300 bytes is split in two; the second part (235 bytes as an IP packet) of
+    # 60 of them gets lost.
+    b.sh("iptables -I INPUT -p udp --dport 7870 -m length --length 235 -j DROP")
+    hub.sh("ping -4 -c 60 -i 0.1 -W 1 -s 1300 b.mesh", ok=False)
+    b.sh("iptables -D INPUT -p udp --dport 7870 -m length --length 235 -j DROP")
+    time.sleep(3)
+    p = hub.sh(big, ok=False)
+    check(p.returncode == 0, f"big pings should get through again: {p.stdout[-300:]}")
+    check("splitting" in hub.peer("b")["path"], f"still split: {hub.peer('b')['path']}")
+
+
+@test
 def test_container_install(lab):
     """meshvpn install in a container whose systemctl only says "Running in chroot, ignoring command"."""
     net, (hub,) = mesh(lab, ["hub"])
@@ -2993,6 +3061,68 @@ def test_desktop_full_container(lab):
         run(["docker", "rmi", "-f", baked, base], ok=False)
 
 
+
+@test
+def test_desktop_stuck(lab):
+    """A desktop session with a program hung in the kernel is stopped; the next one says why (and skips the GPU)."""
+    check(DESKTOP_BUNDLE, "needs --desktop-bundle (build it with desktop/build-bundle.sh)")
+    net = lab.network("net")
+    box = lab.node("box", [net], caps=False, cmd=["sleep", "infinity"])
+    run(["docker", "cp", DESKTOP_BUNDLE, f"{box.c}:/tmp/desktop.tar.gz"])
+    box.sh("chmod 644 /tmp/desktop.tar.gz")
+    check("installed" in box.mv("desktop setup --from /tmp/desktop.tar.gz", user="agent"), "desktop setup")
+    # A program stuck in the kernel (state D), as one in a GPU driver that stopped answering:
+    # a vfork whose child doesn't go on.
+    box.sh("cat > /tmp/hang.py <<'EOF'\n"
+           "import ctypes\n"
+           "libc = ctypes.CDLL(None)\n"
+           "if libc.vfork() == 0:\n"
+           "    libc.sleep(3600)\n"
+           "    libc._exit(0)\n"
+           "EOF")
+    # Attaches like a browser's connection does; launches the hanging program, then reads what
+    # the session sends until it ends (or the time is up).
+    box.sh("cat > /tmp/attach.py <<'EOF'\n"
+           "import subprocess, struct, sys, time, select\n"
+           "p = subprocess.Popen(['meshvpn', 'desktop', 'attach', '--session', 'plain'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)\n"
+           "if sys.argv[1] == 'launch':\n"
+           "    cmd = b'python3 /tmp/hang.py'\n"
+           "    p.stdin.write(bytes([107]) + struct.pack('<I', len(cmd)) + cmd); p.stdin.flush()\n"
+           "buf, notices, end = b'', [], time.time() + float(sys.argv[2])\n"
+           "while time.time() < end:\n"
+           "    r, _, _ = select.select([p.stdout], [], [], 1)\n"
+           "    if not r: continue\n"
+           "    d = p.stdout.read1(65536)\n"
+           "    if not d: break\n"
+           "    buf += d\n"
+           "    while len(buf) >= 5 and len(buf) >= 5 + struct.unpack('<I', buf[1:5])[0]:\n"
+           "        n = struct.unpack('<I', buf[1:5])[0]\n"
+           "        if buf[0] == 8: notices.append(buf[5:5 + n].decode())\n"
+           "        buf = buf[5 + n:]\n"
+           "print('ENDED' if time.time() < end else 'RUNNING')\n"
+           "for n in notices: print('NOTICE', n)\n"
+           "EOF")
+    t0 = time.time()
+    out = box.sh("cd ~ && python3 /tmp/attach.py launch 150 2>&1", user="agent", timeout=200)
+    took = time.time() - t0
+    log = box.sh("cat /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
+    check("ENDED" in out, f"the stuck session should have been stopped: {out} {log[-1500:]}")
+    check(60 < took < 120, f"stopped after a minute or so, not {took:.0f} s: {out} {log[-1500:]}")
+    log = box.sh("cat /tmp/meshvpn-desktop-*/session.log", ok=False).stdout
+    check("the desktop session is stuck" in log and "python3" in log, f"the log says why: {log[-1500:]}")
+    # Gone, or dead and not yet collected (the container's first process collects nothing).
+    alive = "ps -eo stat=,args= | grep -v '^Z' | grep -v grep | grep -E "
+    wait(lambda: box.sh(alive + "'Xvfb'", ok=False).returncode != 0, "Xvfb gone with the session", 10)
+    wait(lambda: box.sh(alive + "'hang.py'", ok=False).returncode != 0, "the hung program gone too", 10)
+    # The next session starts, and its first browser hears why the last one was stopped.
+    out = box.sh("cd ~ && python3 /tmp/attach.py look 8", user="agent", timeout=60)
+    check("RUNNING" in out and "was stuck and was stopped" in out and "hung in the kernel" in out,
+          f"the next session should say why: {out}")
+    out = box.sh("cd ~ && python3 /tmp/attach.py look 3", user="agent", timeout=60)
+    check("was stuck" not in out, f"said once: {out}")
+    check("ended" in box.mv("desktop stop", user="agent"), "desktop stop")
+
+
 def main():
     global BINARY, DESKTOP_BUNDLE, FULL_RUN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3029,3 +3159,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

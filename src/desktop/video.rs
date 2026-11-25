@@ -135,11 +135,18 @@ pub fn pick() -> Option<Kind> {
             .min()
             .map(|p| Kind::Vaapi(p.display().to_string()))
     };
+    if want != "libx264" && super::watchdog::no_gpu() {
+        return None;
+    }
+    // Not on GPUs without a video encoder (A100, H100): nothing to find there, and on a GPU
+    // busy with other work (or a sick driver) the test itself could hang.
+    let models = super::watchdog::nvidia_models();
+    let nvenc = models.is_empty() || !models.iter().all(|m| super::watchdog::without_nvenc(m));
     let candidates: Vec<Kind> = match want.as_str() {
         "nvenc" => vec![Kind::Nvenc],
         "vaapi" => vaapi().into_iter().collect(),
         "libx264" => vec![Kind::X264],
-        _ => [Some(Kind::Nvenc), vaapi()].into_iter().flatten().collect(),
+        _ => [nvenc.then_some(Kind::Nvenc), vaapi()].into_iter().flatten().collect(),
     };
     candidates.into_iter().find(works)
 }
@@ -157,15 +164,32 @@ fn works(kind: &Kind) -> bool {
         return false;
     };
     let frame = vec![0x40u8; w as usize * h as usize * 4];
-    if let Some(mut i) = c.stdin.take() {
-        for _ in 0..3 {
-            let _ = i.write_all(&frame);
+    let pid = c.id() as i32;
+    let (tx, rx) = mpsc::channel();
+    // In a thread, with a time limit: an encoder stuck in its driver must not hold up the
+    // session (it is killed, and reaped once it gets out).
+    std::thread::spawn(move || {
+        if let Some(mut i) = c.stdin.take() {
+            for _ in 0..3 {
+                let _ = i.write_all(&frame);
+            }
+        }
+        let mut out = vec![];
+        let _ = c.stdout.take().map(|mut o| o.read_to_end(&mut out));
+        let ok = c.wait().map(|s| s.success()).unwrap_or(false);
+        let _ = tx.send(ok && out.starts_with(b"FLV"));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(ok) => ok,
+        Err(_) => {
+            warn!(
+                "video: testing {} took over 10 s (the GPU doesn't answer?) - not using it",
+                kind.name()
+            );
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            false
         }
     }
-    let mut out = vec![];
-    let _ = c.stdout.take().map(|mut o| o.read_to_end(&mut out));
-    let ok = c.wait().map(|s| s.success()).unwrap_or(false);
-    ok && out.starts_with(b"FLV")
 }
 
 /// One running encoder at one size.
@@ -231,7 +255,11 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         self.frames = None;
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Reaped in the background: an encoder stuck in its driver dies only once it gets out.
+        let pid = self.child.id();
+        std::thread::spawn(move || unsafe {
+            libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+        });
     }
 }
 

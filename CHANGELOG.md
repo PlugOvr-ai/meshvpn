@@ -10,6 +10,31 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.12] - 2026-11-25
+
+### Fixed
+- **Big packets could stop for good on paths with a small MTU** (VPNs, WSL2: "small MTU: splitting" in the
+  status) until meshvpn was restarted on one side: once 32 split packets from a node had lost a part on the
+  way, every further split packet from that node was refused. Small packets still passed, so typing and `ls`
+  over ssh worked while bigger output (`top`, `nvidia-smi`) and desktops froze. Incomplete packets are now given
+  up after 2 s. Both sides need this version.
+
+### Added
+- **GPU reservations count across networks**: on a machine in several networks, a GPU reserved in one is taken
+  in the others too (`gpu reserve`, `launch --gpus`, the agents' `gpu_reserve`). Their nodes see it as "reserved
+  in another network on this machine", without who holds it.
+- **Desktop: a stuck session is stopped.** When the session stops responding for 30 s, or one of its programs
+  hangs in the kernel for a minute (a GPU driver that no longer answers, a hung network drive), its programs are
+  ended. The next session says why (and which program), and runs without the GPU; End session (⏻) to use the
+  GPU again.
+- **Desktop: the GPU is asked first.** If `nvidia-smi` doesn't answer within 10 s, the session runs without the
+  GPU and says so. No video encoder test on GPUs that have none (A100, H100), and the test can no longer hold up
+  the desktop.
+
+### Changed
+- The TCP/IP stack of userspace mode (smoltcp) is updated to 0.14, with many TCP fixes. Building meshvpn needs
+  Rust 1.91.
+
 ## [0.34.11] - 2026-11-24
 
 ### Fixed
