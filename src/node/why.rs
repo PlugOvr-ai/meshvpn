@@ -98,6 +98,8 @@ pub(crate) fn diagnose(
     let tcp = path.starts_with("direct ");
     let over = if tcp {
         "Traffic uses a direct TCP connection, which works but is slower on lossy links.".to_string()
+    } else if path == NO_ROUTE {
+        "There is no way there at the moment: no direct path, and no node in between that has one.".to_string()
     } else {
         "Traffic is relayed by another node for now, which works but is slower.".to_string()
     };
@@ -302,9 +304,11 @@ impl Node {
             format!("direct UDP {}", p.addr)
         } else if let Some(l) = st.links.get(id) {
             format!("direct {}", l.addr)
-        } else if let Some(hop) = st.routes.get(id) {
-            let via = st.records.get(hop).map(|r| r.info.name.clone()).unwrap_or(hop.short());
+        } else if let Some(hop) = self.next_hop(st, id) {
+            let via = st.records.get(&hop).map(|r| r.info.name.clone()).unwrap_or(hop.short());
             format!("relay via {via}")
+        } else if self.is_online(st, id) {
+            NO_ROUTE.into()
         } else {
             "-".into()
         }

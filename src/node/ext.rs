@@ -216,12 +216,9 @@ impl Node {
         let hop = if st.links.contains_key(&env.to) {
             Some(env.to)
         } else {
-            st.routes.get(&env.to).copied()
+            self.next_hop(st, &env.to)
         };
-        match hop.and_then(|h| st.links.get(&h)) {
-            Some(l) => l.tx.try_send(frame(T_EXT, &serde_json::to_vec(env).unwrap())).is_ok(),
-            None => false,
-        }
+        hop.is_some_and(|h| self.to_hop(st, &h, frame(T_EXT, &serde_json::to_vec(env).unwrap())))
     }
 
     pub(super) fn handle_ext(self: &Arc<Self>, payload: &[u8]) {

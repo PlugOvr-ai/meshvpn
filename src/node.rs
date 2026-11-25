@@ -100,6 +100,12 @@ const DIGEST_GRACE_MS: u64 = 5_000;
 /// nobody can dial are always named: the others reach those only through us). Enough for relay
 /// routes; a record listing all links of a big mesh would grow with every node.
 const NEIGHBORS_MAX: usize = 32;
+/// The path of a node others hear from but this one can't reach: no direct path, and no
+/// node with a path to it that this node reaches.
+pub const NO_ROUTE: &str = "no route from here (others see it)";
+/// In a big network, a changed list of UDP neighbors is announced at most this often (paths
+/// open and close with traffic there).
+const UDP_NEIGHBORS_GAP: Duration = Duration::from_secs(60);
 /// A link coming up or going down re-announces the record at most this often (while a big
 /// mesh forms, every node gets hundreds of links within seconds).
 const LINK_ANNOUNCE_GAP: Duration = Duration::from_secs(2);
@@ -338,6 +344,8 @@ struct State {
     my_ssh_keys: Vec<SshKey>,
     /// The `neighbors` of `my_signed`.
     my_neighbors: Vec<NodeId>,
+    /// The `udp_neighbors` of `my_signed`.
+    my_udp_neighbors: Vec<NodeId>,
     last_announce: Option<Instant>,
     /// A link change is waiting for `LINK_ANNOUNCE_GAP` to pass.
     announce_pending: bool,
@@ -1153,6 +1161,27 @@ impl Node {
         n
     }
 
+    /// The nodes we relay for over UDP: a UDP path to them but no link (`NodeInfo::udp_neighbors`).
+    /// None from clients, which relay nothing.
+    fn udp_neighbor_list(&self, st: &State) -> Vec<NodeId> {
+        if Self::client_of(st, &self.ident.id).is_some() {
+            return vec![];
+        }
+        let me = self.ident.id;
+        let mut n: Vec<NodeId> = st
+            .udp_paths
+            .keys()
+            .filter(|id| !st.links.contains_key(*id) && st.records.get(*id).is_some_and(|r| r.info.udp_relay))
+            .copied()
+            .collect();
+        if n.len() > NEIGHBORS_MAX {
+            n.sort_by_cached_key(|p| pair_hash(&me, p));
+            n.truncate(NEIGHBORS_MAX);
+        }
+        n.sort();
+        n
+    }
+
     /// After a link came up or went down: re-announce at once, as a new link is often followed
     /// by something that needs the newest record (a login with keys added since). With more
     /// links than a record lists, only if the record changes, and not more often than
@@ -1163,7 +1192,11 @@ impl Node {
             self.announce(st);
             return;
         }
-        if st.announce_pending || (self.neighbor_list(st) == st.my_neighbors && self.endpoints(st) == st.my_endpoints) {
+        if st.announce_pending
+            || (self.neighbor_list(st) == st.my_neighbors
+                && self.udp_neighbor_list(st) == st.my_udp_neighbors
+                && self.endpoints(st) == st.my_endpoints)
+        {
             return;
         }
         let since = st.last_announce.map_or(LINK_ANNOUNCE_GAP, |t| t.elapsed());
@@ -1187,6 +1220,7 @@ impl Node {
     fn resign(&self, st: &mut State) -> bool {
         let neighbors = self.neighbor_list(st);
         st.my_neighbors = neighbors.clone();
+        st.my_udp_neighbors = self.udp_neighbor_list(st);
         st.my_endpoints = self.endpoints(st);
         st.my_udp = self.udp_candidates(st);
         st.my_udp6 = self.udp6_candidates();
@@ -1203,6 +1237,8 @@ impl Node {
             name: st.my_name.clone(),
             endpoints: st.my_endpoints.clone(),
             neighbors,
+            udp_neighbors: st.my_udp_neighbors.clone(),
+            udp_relay: true,
             seq: st.my_seq - 1,
             net: self.net.clone(),
             version: crate::update::current(),
@@ -3058,10 +3094,71 @@ impl Node {
         let hop = if st.links.contains_key(to) {
             Some(*to)
         } else {
-            st.routes.get(to).copied()
+            self.next_hop(st, to)
         };
-        hop.and_then(|h| st.links.get(&h))
-            .is_some_and(|l| l.tx.try_send(f.to_vec()).is_ok())
+        hop.is_some_and(|h| self.to_hop(st, &h, f.to_vec()))
+    }
+
+    /// The next hop towards `dst`: the first of its route, or else - no route from what we know
+    /// (records lag behind, or a part of the way is missing from them) - a node we have a direct
+    /// path to that names a path to `dst`, or that `dst` names (it decides on from there).
+    fn next_hop(&self, st: &State, dst: &NodeId) -> Option<NodeId> {
+        let usable = |h: &NodeId| {
+            st.links.contains_key(h)
+                || st.udp_paths.get(h).is_some_and(|p| p.usable())
+                    && st.records.get(h).is_some_and(|r| r.info.udp_relay)
+        };
+        // Routes are made every few seconds: the UDP path a route starts with may have gone quiet since.
+        if let Some(h) = st.routes.get(dst).filter(|h| usable(h)) {
+            return Some(*h);
+        }
+        let names = |a: &NodeId, b: &NodeId| {
+            st.records
+                .get(a)
+                .is_some_and(|r| r.info.neighbors.contains(b) || r.info.udp_neighbors.contains(b))
+        };
+        let mut hops: Vec<NodeId> = st
+            .links
+            .keys()
+            .chain(st.udp_paths.keys())
+            .filter(|h| *h != dst && (names(h, dst) || names(dst, h)) && usable(h) && Self::client_of(st, h).is_none())
+            .copied()
+            .collect();
+        hops.sort();
+        hops.first().copied()
+    }
+
+    /// What carries the routed frame `f` (data, ext, why) to the next hop: its link or its UDP
+    /// path (sealed for it, `udp_relay_datagrams`). Data prefers UDP, like direct data (a link
+    /// that just broke takes a while to time out); the rest the link, which loses nothing.
+    fn hop_carrier(&self, st: &State, hop: &NodeId, f: Vec<u8>) -> Option<Outgoing> {
+        let link = st.links.get(hop).map(|l| l.tx.clone());
+        if f.first() != Some(&T_DATA)
+            && let Some(tx) = link
+        {
+            return Some(Outgoing::Link(tx, f));
+        }
+        if let Some((addr, datagrams)) = self.udp_relay_datagrams(st, hop, &f) {
+            return Some(Outgoing::Udp(addr, datagrams));
+        }
+        link.map(|tx| Outgoing::Link(tx, f))
+    }
+
+    /// Hands the routed frame `f` to the next hop (dropped when congested, like a network).
+    fn to_hop(&self, st: &State, hop: &NodeId, f: Vec<u8>) -> bool {
+        match self.hop_carrier(st, hop, f) {
+            Some(Outgoing::Link(tx, f)) => tx.try_send(f).is_ok(),
+            Some(Outgoing::Udp(addr, datagrams)) => {
+                let Some(sock) = self.udp_socket(&addr) else {
+                    return false;
+                };
+                for d in datagrams {
+                    let _ = sock.try_send_to(&d, addr);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// A link or a working UDP path to `id`.
@@ -3251,13 +3348,24 @@ impl Node {
             .map(|id| (id.0[..8].try_into().unwrap(), *id))
             .collect();
 
-        // Breadth-first search over the neighbor lists of online nodes (links both ends name).
+        // Breadth-first search over the neighbor lists of online nodes (links and UDP paths
+        // both ends name), from our links and UDP paths.
         let mut routes: HashMap<NodeId, NodeId> = HashMap::new();
         let mut queue = VecDeque::new();
-        for n in st.links.keys() {
-            routes.insert(*n, *n);
-            queue.push_back(*n);
+        // (UDP paths only to nodes that take relay datagrams.)
+        let relays = |id: &NodeId| st.records.get(id).is_some_and(|r| r.info.udp_relay);
+        let udp: Vec<NodeId> = st
+            .udp_paths
+            .iter()
+            .filter(|(id, p)| p.usable() && relays(id))
+            .map(|(id, _)| *id)
+            .collect();
+        for n in st.links.keys().chain(udp.iter()) {
+            if routes.insert(*n, *n).is_none() {
+                queue.push_back(*n);
+            }
         }
+        let names = |r: &NodeInfo, id: &NodeId| r.neighbors.contains(id) || r.udp_neighbors.contains(id);
         while let Some(cur) = queue.pop_front() {
             let first = routes[&cur];
             let Some(rec) = st.records.get(&cur) else { continue };
@@ -3266,8 +3374,8 @@ impl Node {
                 continue;
             }
             // Only links both ends name: one node's word alone could pull traffic through it.
-            for nb in &rec.info.neighbors {
-                let mutual = st.records.get(nb).is_some_and(|r| r.info.neighbors.contains(&cur));
+            for nb in rec.info.neighbors.iter().chain(rec.info.udp_neighbors.iter()) {
+                let mutual = st.records.get(nb).is_some_and(|r| names(&r.info, &cur));
                 if mutual && *nb != self.ident.id && !routes.contains_key(nb) {
                     routes.insert(*nb, first);
                     queue.push_back(*nb);
@@ -3359,13 +3467,12 @@ impl Node {
         {
             return Some(Outgoing::Udp(addr, datagrams));
         }
-        let (dst, tx, cipher) = {
+        let (dst, hop, cipher) = {
             let mut st = self.state.lock().unwrap();
             let dst = self.node_for(&st, dst_ip)?;
-            let hop = st.routes.get(&dst).copied()?;
-            let tx = st.links.get(&hop).map(|l| l.tx.clone())?;
+            let hop = self.next_hop(&st, &dst)?;
             let cipher = self.cipher_for(&mut st, &dst)?;
-            (dst, tx, cipher)
+            (dst, hop, cipher)
         };
         let nonce = self.nonces.nonce();
         let ct = cipher.encrypt(&XNonce::from(nonce), pkt).ok()?;
@@ -3376,7 +3483,8 @@ impl Node {
         f.push(DEFAULT_TTL);
         f.extend_from_slice(&nonce);
         f.extend_from_slice(&ct);
-        Some(Outgoing::Link(tx, f))
+        let st = self.state.lock().unwrap();
+        self.hop_carrier(&st, &hop, f)
     }
 
     /// Handles a data frame: returns the IP packet if it is for us, otherwise relays it.
@@ -3398,8 +3506,8 @@ impl Node {
             if Self::client_of(&st, &self.ident.id).is_some() {
                 return None; // clients relay nothing
             }
-            let hop = st.routes.get(&dst)?;
-            let _ = st.links.get(hop)?.tx.try_send(f);
+            let hop = self.next_hop(&st, &dst)?;
+            self.to_hop(&st, &hop, f);
             return None;
         }
         let cipher = {
@@ -4206,6 +4314,8 @@ impl Node {
                     || self.endpoints(&st) != st.my_endpoints
                     || self.udp_candidates(&st) != st.my_udp
                     || self.udp6_candidates() != st.my_udp6
+                    || (self.udp_neighbor_list(&st) != st.my_udp_neighbors
+                        && (!self.on_demand(&st) || last_announce.elapsed() >= UDP_NEIGHBORS_GAP))
                 {
                     self.announce(&mut st);
                     last_announce = Instant::now();
@@ -4581,9 +4691,11 @@ impl Node {
                     )
                 } else if let Some(l) = st.links.get(&id) {
                     format!("direct {}", l.addr)
-                } else if let Some(hop) = st.routes.get(&id) {
-                    let via = st.records.get(hop).map(|r| r.info.name.clone()).unwrap_or(hop.short());
+                } else if let Some(hop) = self.next_hop(&st, &id) {
+                    let via = st.records.get(&hop).map(|r| r.info.name.clone()).unwrap_or(hop.short());
                     format!("relay via {via}")
+                } else if self.is_online(&st, &id) {
+                    NO_ROUTE.into()
                 } else {
                     "-".into()
                 };

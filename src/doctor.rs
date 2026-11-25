@@ -364,6 +364,19 @@ pub fn diagnose(dir: &Path) -> Vec<Check> {
             ),
             None,
         ));
+        let cut: Vec<&str> = online
+            .iter()
+            .filter(|p| p.path == crate::node::NO_ROUTE)
+            .map(|p| p.name.as_str())
+            .collect();
+        if !cut.is_empty() {
+            c.push(check(
+                "routes",
+                Level::Warn,
+                format!("other nodes see {} online, but this node has no way to reach them", cut.join(", ")),
+                Some("meshvpn net why <node> tells why there is no direct path; a node that reaches both relays once it has updated"),
+            ));
+        }
     }
     let udp = online.iter().filter(|p| p.path.contains("UDP")).count();
     let udp_off = cfg

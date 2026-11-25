@@ -18,7 +18,12 @@
 //! path over IPv6.
 //!   data   A3 | src id prefix 8 | nonce 24 | XChaCha20-Poly1305(packet)   (49 bytes overhead)
 //!          (the nonce counts packets: each is taken once, see `replay`)
-//!   frag   A4 | src id prefix 8 | message 4 | index 1 | count 1 | part of a data datagram
+//!   frag   A4 | src id prefix 8 | message 4 | index 1 | count 1 | part of a data or relay datagram
+//!   relay  A5 | src id prefix 8 | nonce 24 | XChaCha20-Poly1305(link frame)
+//!          a frame the receiver passes on towards another node, or takes as the last hop
+//!          (data, ext, why: what links carry for others). So a node that only UDP reaches
+//!          (TCP blocked or both sides behind NATs) still relays and is reached through relays.
+//!          Always split into parts that fit any path.
 //!
 //! Path MTU: a full-size packet makes a datagram of about 1450 bytes, more than some paths
 //! carry (VPNs, mobile networks, WSL2's NAT, which also drops IP fragments). Small probes get
@@ -33,6 +38,7 @@ const PROBE: u8 = 0xA1;
 const ACK: u8 = 0xA2;
 const DATA: u8 = 0xA3;
 const FRAG: u8 = 0xA4;
+const RELAY: u8 = 0xA5;
 /// Datagram size that fits every path that carries 1280-byte IP packets.
 const SAFE_DATAGRAM: usize = 1200;
 /// Nodes from this version on understand padded probes and fragments.
@@ -445,10 +451,31 @@ impl Node {
             (addr, split)
         };
         let (addr, split) = addr;
+        Some((addr, self.udp_seal(DATA, cipher, pkt, split)?))
+    }
+
+    /// The link frame `f` for `hop` to pass on, over its UDP path (`RELAY`). None without a
+    /// path, or if `hop` is of a version without relays (`NodeInfo::udp_relay`).
+    pub(super) fn udp_relay_datagrams(&self, st: &State, hop: &NodeId, f: &[u8]) -> Option<(SocketAddr, Vec<Vec<u8>>)> {
+        let p = st.udp_paths.get(hop).filter(|p| p.usable() && p.frags)?;
+        let rec = st.records.get(hop)?;
+        if !rec.info.udp_relay {
+            return None;
+        }
+        let cipher = match st.ciphers.get(hop) {
+            Some(c) => c.clone(),
+            None => XChaCha20Poly1305::new(&self.ident.e2e_key(&rec.info.noise_pub, &self.net).into()),
+        };
+        Some((p.addr, self.udp_seal(RELAY, &cipher, f, true)?))
+    }
+
+    /// A datagram of `kind` with `payload` sealed by `cipher`, in parts when `split` and too big
+    /// for any path. None if it needs more parts than a datagram can have.
+    fn udp_seal(&self, kind: u8, cipher: &XChaCha20Poly1305, payload: &[u8], split: bool) -> Option<Vec<Vec<u8>>> {
         let nonce = self.nonces.nonce();
-        let ct = cipher.encrypt(&XNonce::from(nonce), pkt).ok()?;
+        let ct = cipher.encrypt(&XNonce::from(nonce), payload).ok()?;
         let mut d = Vec::with_capacity(33 + ct.len());
-        d.push(DATA);
+        d.push(kind);
         d.extend_from_slice(&self.ident.id.0[..8]);
         d.extend_from_slice(&nonce);
         d.extend_from_slice(&ct);
@@ -456,6 +483,9 @@ impl Node {
             let id = rand::rngs::OsRng.next_u32();
             let chunk = SAFE_DATAGRAM - 15;
             let count = d.len().div_ceil(chunk);
+            if count > 255 {
+                return None;
+            }
             let parts = d
                 .chunks(chunk)
                 .enumerate()
@@ -470,9 +500,9 @@ impl Node {
                     f
                 })
                 .collect();
-            Some((addr, parts))
+            Some(parts)
         } else {
-            Some((addr, vec![d]))
+            Some(vec![d])
         }
     }
 
@@ -559,12 +589,25 @@ impl Node {
                         self.deliver(pkt).await;
                     }
                 }
+                Some(&RELAY) => {
+                    if let Some((hop, f)) = self.udp_relay(d, from) {
+                        self.routed(hop, f).await;
+                    }
+                }
                 Some(&FRAG) => {
-                    if let Some(whole) = self.udp_frag(d, from)
-                        && whole.first() == Some(&DATA)
-                        && let Some(pkt) = self.udp_data(&whole, from)
-                    {
-                        self.deliver(pkt).await;
+                    let Some(whole) = self.udp_frag(d, from) else { continue };
+                    match whole.first() {
+                        Some(&DATA) => {
+                            if let Some(pkt) = self.udp_data(&whole, from) {
+                                self.deliver(pkt).await;
+                            }
+                        }
+                        Some(&RELAY) => {
+                            if let Some((hop, f)) = self.udp_relay(&whole, from) {
+                                self.routed(hop, f).await;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Some(&0x01) => self.stun_answer(d, from),
@@ -728,6 +771,42 @@ impl Node {
         if d.len() < 1 + 8 + 24 + 16 + 20 {
             return None;
         }
+        // Anti-spoofing: the inner source address must belong to the sender (and only to it).
+        self.udp_open(d, from, |src, pkt| self.source_ok(src, pkt))
+            .map(|(_, pkt)| pkt)
+    }
+
+    /// A relay datagram: the sender (the previous hop) and the link frame it carries.
+    fn udp_relay(&self, d: &[u8], from: SocketAddr) -> Option<(NodeId, Vec<u8>)> {
+        if d.len() < 1 + 8 + 24 + 16 + 1 {
+            return None;
+        }
+        self.udp_open(d, from, |_, f| {
+            matches!(f.first(), Some(&(T_DATA | T_EXT | T_WHY | T_WHY_REPLY)))
+        })
+    }
+
+    /// A routed link frame that came over UDP, as if from the link to `hop`.
+    async fn routed(self: &Arc<Self>, hop: NodeId, f: Vec<u8>) {
+        let Some((&kind, payload)) = f.split_first() else {
+            return;
+        };
+        match kind {
+            T_DATA => {
+                if let Some(pkt) = self.handle_data(f) {
+                    self.deliver(pkt).await;
+                }
+            }
+            T_EXT => self.handle_ext(payload),
+            T_WHY => self.handle_why(hop, payload),
+            T_WHY_REPLY => self.handle_why_reply(hop, payload),
+            _ => {}
+        }
+    }
+
+    /// Opens a sealed datagram (`DATA`, `RELAY`) from a node we have a path to or not: its
+    /// sender and contents, if authentic, new and `ok`. Marks the path alive.
+    fn udp_open(&self, d: &[u8], from: SocketAddr, ok: impl Fn(&NodeId, &[u8]) -> bool) -> Option<(NodeId, Vec<u8>)> {
         let (src, cipher) = {
             let mut st = self.state.lock().unwrap();
             let src = *st.id_prefix.get(&<[u8; 8]>::try_from(&d[1..9]).ok()?)?;
@@ -735,8 +814,7 @@ impl Node {
         };
         let nonce: [u8; 24] = d[9..33].try_into().ok()?;
         let pkt = cipher.decrypt(&XNonce::from(nonce), &d[33..]).ok()?;
-        // Anti-spoofing: the inner source address must belong to the sender (and only to it).
-        if !self.source_ok(&src, &pkt) {
+        if !ok(&src, &pkt) {
             return None;
         }
         // Each packet once: a copy sent again from elsewhere must not move the path there.
@@ -754,7 +832,7 @@ impl Node {
                 p.addr = from;
             }
         }
-        Some(pkt)
+        Some((src, pkt))
     }
 }
 
@@ -1041,6 +1119,8 @@ mod tests {
             name: "a".into(),
             endpoints: vec!["203.0.113.9:7870".into()],
             neighbors: vec![],
+            udp_neighbors: vec![],
+            udp_relay: false,
             seq: 1,
             net: String::new(),
             version: String::new(),

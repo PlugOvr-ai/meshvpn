@@ -197,6 +197,13 @@ pub struct NodeInfo {
     pub endpoints: Vec<String>,
     /// Nodes this node currently has a direct link to (used for relay routing).
     pub neighbors: Vec<NodeId>,
+    /// Nodes this node has a direct UDP path to but no link (behind NATs, where only UDP gets
+    /// through): it relays for them over UDP. Routes use them like `neighbors`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_neighbors: Vec<NodeId>,
+    /// Takes relay datagrams over UDP (`node::udp`), so it can be a UDP hop of a route.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub udp_relay: bool,
     /// Monotonic version, newer wins.
     pub seq: u64,
     /// Network this record belongs to (see `keys::network_tag`).
@@ -605,7 +612,11 @@ impl SignedInfo {
                 info.name
             );
         }
-        if info.endpoints.len() > 32 || info.neighbors.len() > 4096 || info.ip_index >= crate::keys::IP_CANDIDATES {
+        if info.endpoints.len() > 32
+            || info.neighbors.len() > 4096
+            || info.udp_neighbors.len() > 4096
+            || info.ip_index >= crate::keys::IP_CANDIDATES
+        {
             bail!("oversized node info");
         }
         // Names end up in /etc/hosts and on terminals: only accept what we would generate.
@@ -806,6 +817,8 @@ mod tests {
             name: name.into(),
             endpoints: vec!["1.2.3.4:7870".into()],
             neighbors: vec![],
+            udp_neighbors: vec![],
+            udp_relay: false,
             seq: 1,
             net: "n1".into(),
             ssh_keys: vec![],

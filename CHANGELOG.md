@@ -10,6 +10,18 @@ attacker needed and what they could do.
 
 ## [Unreleased]
 
+## [0.34.13] - 2026-11-25
+
+### Added
+- **Relays over UDP**: a node that only UDP gets through to (TCP blocked by a firewall or VPN, both sides behind
+  NATs) now relays for others and is reached through relays, over its direct UDP paths. Before, relays went over
+  TCP links only, so such a node showed as "online" with path "-" and could not be reached from nodes without a
+  direct path to it. Relayed traffic prefers a UDP path over a TCP link, like direct traffic.
+- **Always a relay when there is no direct path**: when this node's picture of the network has no route to a node
+  (its records lag behind), traffic goes to a node with a direct path that has a path to it.
+- `meshvpn status` shows "no route from here (others see it)" instead of "-" for a node others report online
+  that this node can't reach in any way; `meshvpn doctor` warns about it.
+
 ## [0.34.12] - 2026-11-25
 
 ### Fixed

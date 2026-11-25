@@ -2687,6 +2687,33 @@ def test_small_mtu_lost_parts(lab):
 
 
 @test
+def test_relay_over_udp(lab):
+    """Nodes only UDP gets through to (TCP blocked) are relayed for over UDP: a reaches c through hub."""
+    net, (hub, a, c) = mesh(lab, ["hub", "a", "c"])
+    wait(lambda: "UDP" in (a.peer("c") or {}).get("path", ""), "a direct to c over UDP", 60)
+    wait(lambda: "UDP" in (a.peer("hub") or {}).get("path", "") and "UDP" in (c.peer("hub") or {}).get("path", ""),
+         "UDP paths to hub", 60)
+    cip = c.ip()
+    check(ping(a, cip), "a reaches c directly")
+    # No TCP for a and c at all (resets, so the links end at once), and nothing between them.
+    for n, other in ((a, c), (c, a)):
+        for chain in ("INPUT", "OUTPUT"):
+            for port in ("--dport", "--sport"):
+                n.sh(f"iptables -A {chain} -p tcp {port} 7870 -j REJECT --reject-with tcp-reset")
+        n.sh(f"iptables -A INPUT -s {other.net_ip(net)} -j DROP")
+        n.sh(f"iptables -A OUTPUT -d {other.net_ip(net)} -j DROP")
+    wait(lambda: (a.peer("c") or {}).get("path") == "relay via hub", "a reaches c through hub", 60)
+    wait(lambda: ping(a, cip, 3), "pings through hub over UDP", 30)
+    check("relay via hub" == (c.peer("a") or {}).get("path"), f"c's way back: {c.peer('a')}")
+    # Big packets too (relay datagrams go in parts).
+    p = a.sh(f"ping -4 -c 3 -W 2 -s 1400 {cip}", ok=False)
+    check(p.returncode == 0, f"big pings through hub: {p.stdout[-300:]}")
+    # A TCP connection over the mesh through the UDP relay.
+    out = a.sh(f"timeout 10 bash -c 'exec 3<>/dev/tcp/{cip}/22; head -c 7 <&3'", ok=False).stdout
+    check(out.startswith("SSH-2.0"), f"ssh banner through hub: {out!r}")
+
+
+@test
 def test_container_install(lab):
     """meshvpn install in a container whose systemctl only says "Running in chroot, ignoring command"."""
     net, (hub,) = mesh(lab, ["hub"])
