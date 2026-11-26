@@ -8,19 +8,31 @@ puts the section at the top of the release notes.
 Sections: **Added**, **Changed**, **Fixed**, **Security**, **Removed**. Security fixes say what an
 attacker needed and what they could do.
 
-## [Unreleased]
+## [0.34.14] - 2026-11-26
 
-## [0.34.13] - 2026-11-25
+0.34.13 was not published (a test failed in the release run: a routing loop, fixed here); its changes are in here.
 
 ### Added
+- **`meshvpn autoupdate on|off`**: new releases are installed by themselves (off by default), on every network of
+  the machine. Checked every ~6 hours and when another node runs a newer version, with the same signature checks as
+  `meshvpn update`. When GitHub can't be reached - a proxy that wants a login in the browser, say - it tries again
+  every 30 minutes, and `meshvpn status` says why. Switching it takes effect without a restart.
+- **Records over UDP**: a node with no TCP link at all (TCP blocked, both sides behind NATs) now gets the other
+  nodes' records, admissions, rosters, bans and key rotations over its UDP paths, and stays online for the others.
 - **Relays over UDP**: a node that only UDP gets through to (TCP blocked by a firewall or VPN, both sides behind
   NATs) now relays for others and is reached through relays, over its direct UDP paths. Before, relays went over
   TCP links only, so such a node showed as "online" with path "-" and could not be reached from nodes without a
-  direct path to it. Relayed traffic prefers a UDP path over a TCP link, like direct traffic.
+  direct path to it. Routes use TCP links as before; UDP paths fill in the nodes those don't reach.
 - **Always a relay when there is no direct path**: when this node's picture of the network has no route to a node
   (its records lag behind), traffic goes to a node with a direct path that has a path to it.
 - `meshvpn status` shows "no route from here (others see it)" instead of "-" for a node others report online
   that this node can't reach in any way; `meshvpn doctor` warns about it.
+
+### Fixed
+- **An invite two nodes used**: the node that came second is now told so by name - "this invite has already been
+  used by <node> - ask an admin for a new one" - also when a member had let it in before hearing of the other one
+  (it used to be dropped without a word), and `meshvpn status` shows it in red while links are still up. `meshvpn
+  join` and `install` say it right away.
 
 ## [0.34.12] - 2026-11-25
 

@@ -8,7 +8,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const REPO: &str = "PlugOvr-ai/meshvpn";
@@ -312,15 +312,25 @@ pub async fn download_binary(client: &reqwest::Client, tag: &str, target: &str) 
     binary.ok_or_else(|| anyhow!("{archive} does not contain meshvpn"))
 }
 
+/// The version of the program file `exe` (`meshvpn --version`): after an update by another
+/// network's daemon, newer than the one running.
+pub fn installed_version(exe: &Path) -> Option<String> {
+    let out = std::process::Command::new(exe).arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v = text.split_whitespace().find(|w| parse_version(w).is_some())?;
+    Some(v.to_string())
+}
+
 /// Downloads release `tag`, verifies it and that it runs, then atomically replaces the
 /// running binary. Returns the path of the new binary.
 pub async fn install(client: &reqwest::Client, tag: &str) -> Result<PathBuf> {
     let binary = download_binary(client, tag, TARGET).await?;
     let exe = current_exe()?;
+    // One file per process: the daemons of several networks may update at the same time.
     let tmp = exe.with_file_name(if cfg!(windows) {
-        ".meshvpn.update.exe"
+        format!(".meshvpn.update.{}.exe", std::process::id())
     } else {
-        ".meshvpn.update"
+        format!(".meshvpn.update.{}", std::process::id())
     });
     std::fs::write(&tmp, &binary).with_context(|| format!("writing {} (try again with sudo)", tmp.display()))?;
     crate::sys::set_mode(&tmp, 0o755)?;

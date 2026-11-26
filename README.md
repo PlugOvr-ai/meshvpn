@@ -633,7 +633,8 @@ sudo meshvpn volume delete imagenet                   # every node unmounts it a
 | `sudo meshvpn doctor` | Checks the setup (daemon, Tailscale conflicts, firewalls, peers, UDP paths, SSH logins, admins, updates) and says how to fix each problem |
 | `sudo meshvpn invite [--uses N] [--expires 24h]` | Print an invite code for a new machine (single-use and valid for 24 h by default) |
 | `meshvpn admin status` / `sudo meshvpn admin add\|rm <node>` | Who the admins are; change them |
-| `sudo meshvpn update` | Install the latest release. Nodes check for new releases every ~6 hours and show them in `meshvpn status` / `doctor`, but never install them by themselves |
+| `sudo meshvpn update` | Install the latest release. Nodes check for new releases every ~6 hours and show them in `meshvpn status` / `doctor`; they install them by themselves only with `meshvpn autoupdate on` |
+| `sudo meshvpn autoupdate on\|off` | Install new releases by themselves (off by default): checked every ~6 hours and when another node runs a newer version; when GitHub can't be reached (a proxy that wants a login in the browser), tried again every 30 minutes, and `meshvpn status` says why |
 | `sudo meshvpn forget <name>` | Remove an offline node (e.g. an old identity of a re-installed machine) from all nodes. `--offline` forgets all offline nodes. If an offline node's name is taken by a newer online node, it's forgotten automatically after 10 minutes |
 | `sudo meshvpn ban <name>` | Throw a node out for good (see below) |
 | `sudo meshvpn ssh` | Choose who may log in here over SSH without a password |
@@ -724,8 +725,8 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 * Updates are downloaded from this repository's GitHub releases. From 0.27.0 on, `meshvpn update` installs a release
   only if its checksums carry a valid signature of the release key, which the build machines don't hold (so a
   compromised GitHub account alone can't ship an update). Since 0.33.1 a release older than that is
-  never installed, not even by a build from source. Nodes never install updates by themselves: only `meshvpn update`
-  does.
+  never installed, not even by a build from source. Nodes install updates by themselves only after
+  `meshvpn autoupdate on` (the same checks); otherwise only `meshvpn update` does.
 * The end-to-end layer has replay protection (since 0.24.0) but no forward secrecy (the hop-by-hop Noise links have
   both).
 * Invites are bearer secrets: whoever has one can join (until it is used up or expires). Members see the tickets in

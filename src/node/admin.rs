@@ -53,6 +53,51 @@ fn witness_bytes(claim: &SignedDoc) -> Vec<u8> {
 }
 
 impl Node {
+    /// A node's name if we have its record, else its short id.
+    fn name_of(&self, st: &State, id: &NodeId) -> String {
+        if *id == self.ident.id {
+            return st.my_name.clone();
+        }
+        st.records
+            .get(id)
+            .map(|r| r.info.name.clone())
+            .unwrap_or_else(|| id.short())
+    }
+
+    fn used_by(name: &str) -> String {
+        format!("this invite has already been used by {name} - ask an admin for a new one")
+    }
+
+    /// Tells the nodes whose invite another node used first why their links go, once that
+    /// node's record is here (its name), or after a few seconds without it; then closes them.
+    pub(super) fn flush_invite_rejects(&self, st: &mut State) {
+        let pending = std::mem::take(&mut st.invite_rejects);
+        for (l, winner, since) in pending {
+            if !st.records.contains_key(&winner) && since.elapsed() < Duration::from_secs(8) {
+                st.invite_rejects.push((l, winner, since));
+                continue;
+            }
+            let why = Self::used_by(&self.name_of(st, &winner));
+            let _ = l.tx.try_send(frame(T_REJECT, why.as_bytes()));
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                l.kill.notify_one();
+            });
+        }
+        // This node's own lost invite: the name once the other node's record is here.
+        let named = match &st.rejected {
+            Some((by, why)) if by == "the network" => st
+                .claims
+                .values()
+                .map(|a| a.claim.node)
+                .find(|n| why.contains(&n.short()) && st.records.contains_key(n)),
+            _ => None,
+        };
+        if let Some(id) = named {
+            st.rejected = Some(("the network".into(), Self::used_by(&self.name_of(st, &id))));
+        }
+    }
+
     pub(super) fn managed(st: &State) -> bool {
         st.roster.is_some()
     }
@@ -571,6 +616,22 @@ impl Node {
             .filter(|a| a.ticket.id == ticket.id)
             .map(|a| (a.claim.at, a.claim.node))
             .collect();
+        // Our own admission with the same invite, which isn't among the others' (so this node
+        // notices itself when another node used the invite first).
+        if !st.claims.contains_key(&self.ident.id)
+            && claim.node != self.ident.id
+            && let Some(mine) = st
+                .my_claim
+                .as_ref()
+                .and_then(|m| m.claim.open::<Claim>(|c| c.node).ok())
+            && mine.node == self.ident.id
+            && mine
+                .ticket
+                .open::<Ticket>(|t| t.issuer)
+                .is_ok_and(|t| t.id == ticket.id)
+        {
+            rivals.push((mine.at, mine.node));
+        }
         rivals.push((claim.at, claim.node));
         rivals.sort();
         let winners: Vec<NodeId> = rivals
@@ -578,17 +639,49 @@ impl Node {
             .take(ticket.uses.max(1) as usize)
             .map(|(_, n)| *n)
             .collect();
+        let used = |st: &State, by: &[NodeId]| {
+            let names: Vec<String> = by
+                .iter()
+                .filter(|n| **n != claim.node)
+                .map(|n| self.name_of(st, n))
+                .collect();
+            if names.is_empty() {
+                "this invite has already been used - ask an admin for a new one".to_string()
+            } else {
+                format!(
+                    "this invite has already been used by {} - ask an admin for a new one",
+                    names.join(", ")
+                )
+            }
+        };
         if !winners.contains(&claim.node) {
-            bail!("this invite has already been used - ask an admin for a new one");
+            bail!("{}", used(st, &winners));
         }
         // A late claim (only vouched for) never pushes out a node already admitted with the
         // same invite: its time is the claimer's word.
         if !fresh && rivals.len() > ticket.uses.max(1) as usize {
-            bail!("this invite has already been used - ask an admin for a new one");
+            let others: Vec<NodeId> = rivals.iter().map(|(_, n)| *n).collect();
+            bail!("{}", used(st, &others));
         }
         for (_, loser) in rivals.iter().skip(ticket.uses.max(1) as usize) {
-            warn!("{loser} used an invite that another node used first - dropping it");
-            st.claims.remove(loser);
+            let name = self.name_of(st, loser);
+            warn!(
+                "{name} ({loser}) used an invite that {} used first - dropping it",
+                self.name_of(st, &claim.node)
+            );
+            // Gone for good: sent again, its admission must be checked again (and refused).
+            if let Some(a) = st.claims.remove(loser) {
+                st.claims_seen
+                    .remove(blake3::hash(&serde_json::to_vec(&a.msg.claim).unwrap_or_default()).as_bytes());
+            }
+            if *loser == self.ident.id {
+                st.my_invite_lost = true;
+                // This node lost: say so in status, while links to members that haven't heard
+                // of the other node yet are still up.
+                st.rejected = Some(("the network".into(), Self::used_by(&self.name_of(st, &claim.node))));
+            } else {
+                st.invite_lost.insert(*loser, claim.node);
+            }
         }
         info!("admitted {} with an invite from {}", claim.node, ticket.issuer);
         st.claims.insert(
@@ -631,7 +724,11 @@ impl Node {
             .collect();
         for id in out {
             if let Some(l) = st.links.remove(&id) {
-                l.kill.notify_one();
+                // A node whose invite another one used first is told so, by name, before it goes.
+                match st.invite_lost.remove(&id) {
+                    Some(winner) => st.invite_rejects.push((l, winner, Instant::now())),
+                    None => l.kill.notify_one(),
+                }
             }
             if let Some(r) = st.records.remove(&id) {
                 warn!(

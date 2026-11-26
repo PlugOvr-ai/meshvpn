@@ -2687,8 +2687,74 @@ def test_small_mtu_lost_parts(lab):
 
 
 @test
+def test_autoupdate(lab):
+    """meshvpn autoupdate: off by default, on for every network of the machine, and says why when
+    GitHub can't be reached (a proxy that wants a login)."""
+    net, (hub, a) = mesh(lab, ["hub", "a"])
+    check(a.mvj("autoupdate") == {"auto_update": False}, "off by default")
+    check(not a.status().get("auto_update"), "status: off")
+    # No way out to the internet (a proxy nobody logged in at).
+    a.sh("iptables -A OUTPUT -p tcp --dport 443 -j REJECT; iptables -A OUTPUT -p tcp --dport 80 -j REJECT")
+    out = a.mv("autoupdate on")
+    check("Automatic updates are on" in out and "No update now" in out and "proxy" in out, out)
+    check(a.mvj("autoupdate") == {"auto_update": True}, "on")
+    check("auto_update = true" in a.sh("cat /etc/meshvpn/config.toml"), "in the configuration")
+    check(a.status().get("auto_update"), "status: on, without a restart")
+    # The daemon's own first try (a minute after the start) says why it didn't update.
+    wait(lambda: "GitHub could not be reached" in (a.status().get("update_problem") or ""), "the reason in status", 150)
+    check("proxy" in a.mv("status"), "status tells about the proxy")
+    a.mv("autoupdate off")
+    check(not a.status().get("auto_update") and a.mvj("autoupdate") == {"auto_update": False}, "off again")
+
+
+@test
+def test_invite_used_late(lab):
+    """A node admitted by a member that hadn't heard yet that another node used the invite first
+    is dropped later - and told why, by name, also while it still has links."""
+    net = lab.network("net")
+    hub, a, b, c = (lab.node(n, [net]) for n in ("hub", "a", "b", "c"))
+    hub.mv(f"init --name hub --endpoint {hub.c}:7870")
+    hub.up()
+    a.mv(f"join {invite(hub)} --name a --endpoint {a.c}:7870")
+    a.up()
+    wait(lambda: hub.online("a"), "a admitted")
+    reused = invite(hub)
+    ip = {n.name: n.net_ip(net) for n in (hub, a, b, c)}
+
+    def cut(n, other):
+        n.sh(f"iptables -A INPUT -s {ip[other]} -p tcp -j REJECT --reject-with tcp-reset; "
+             f"iptables -A OUTPUT -d {ip[other]} -p tcp -j REJECT --reject-with tcp-reset; "
+             f"iptables -A INPUT -s {ip[other]} -j DROP; iptables -A OUTPUT -d {ip[other]} -j DROP")
+
+    # a hears nothing of b; c reaches only a.
+    cut(a, "hub"), cut(a, "b"), cut(c, "hub"), cut(c, "b")
+    b.mv(f"join {reused} --name b")
+    b.up()
+    wait(lambda: hub.online("b"), "b admitted by hub")
+    time.sleep(1)
+    c.mv(f"join {reused} --name c")
+    c.sh(f"sed -i 's/{hub.c}:7870/{a.c}:7870/' /etc/meshvpn/config.toml")
+    c.up()
+    wait(lambda: a.online("c"), "c admitted by a, which hasn't heard of b", 60)
+    a.sh("iptables -F")
+    wait(lambda: "already been used by" in (c.status().get("turned_away") or ""), "c is told", 90)
+    # By name, or by id where c never got b's record.
+    told = c.status()["turned_away"]
+    check(" by b " in told or b.status()["id"][:8] in told, f"who used the invite: {told}")
+    wait(lambda: not a.online("c"), "a drops c", 120)
+    log = a.log()
+    check(any(f"used an invite that {w} used first" in log for w in ("b", b.status()["id"][:8])), "a logs why")
+    # Turned away, c tries again only now and then (not many times a second).
+    time.sleep(20)
+    n = a.log().count("rejected connection from")
+    time.sleep(20)
+    check(a.log().count("rejected connection from") - n <= 8, "c keeps trying too often")
+
+
+@test
 def test_relay_over_udp(lab):
-    """Nodes only UDP gets through to (TCP blocked) are relayed for over UDP: a reaches c through hub."""
+    """Nodes only UDP gets through to (TCP blocked) are relayed for over UDP, and get records over UDP:
+    a reaches c through hub, and hears of its changes."""
     net, (hub, a, c) = mesh(lab, ["hub", "a", "c"])
     wait(lambda: "UDP" in (a.peer("c") or {}).get("path", ""), "a direct to c over UDP", 60)
     wait(lambda: "UDP" in (a.peer("hub") or {}).get("path", "") and "UDP" in (c.peer("hub") or {}).get("path", ""),
@@ -2711,6 +2777,13 @@ def test_relay_over_udp(lab):
     # A TCP connection over the mesh through the UDP relay.
     out = a.sh(f"timeout 10 bash -c 'exec 3<>/dev/tcp/{cip}/22; head -c 7 <&3'", ok=False).stdout
     check(out.startswith("SSH-2.0"), f"ssh banner through hub: {out!r}")
+    # Records too: without any link, a and c still hear of each other's changes (over UDP via hub).
+    c.mv("tag add gpu-box")
+    wait(lambda: "gpu-box" in ((a.peer("c") or {}).get("tags") or []), "c's new tag reaches a without links", 60)
+    # And they stay online for each other past the time a record from a link would keep them.
+    time.sleep(100)
+    check(a.online("c") and c.online("a"), f"still online: {a.peer('c')} {c.peer('a')}")
+    check(ping(a, cip, 3), "still reachable")
 
 
 @test

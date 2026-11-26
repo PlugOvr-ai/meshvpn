@@ -100,6 +100,12 @@ const DIGEST_GRACE_MS: u64 = 5_000;
 /// nobody can dial are always named: the others reach those only through us). Enough for relay
 /// routes; a record listing all links of a big mesh would grow with every node.
 const NEIGHBORS_MAX: usize = 32;
+/// How often GitHub is asked for a new release (plus up to a sixth more, at random).
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+/// After an automatic update failed (GitHub out of reach): the next try.
+const AUTO_UPDATE_RETRY: Duration = Duration::from_secs(30 * 60);
+/// Automatic updates are tried at most this often, also when other nodes run newer versions.
+const AUTO_UPDATE_MIN_GAP: Duration = Duration::from_secs(10 * 60);
 /// The path of a node others hear from but this one can't reach: no direct path, and no
 /// node with a path to it that this node reaches.
 pub const NO_ROUTE: &str = "no route from here (others see it)";
@@ -365,6 +371,11 @@ struct State {
     /// Host key of whatever answers SSH here (published in our record).
     my_ssh_host_key: Option<String>,
     update_available: Option<String>,
+    /// Why the last automatic update didn't happen (GitHub out of reach, a proxy that wants a
+    /// login), for status.
+    update_problem: Option<String>,
+    /// The newest version seen on another node that woke the update loop.
+    newer_seen: Option<String>,
     forgotten: HashMap<NodeId, Forget>,
     /// Network keys by version; `key_version` is the current one.
     keys: HashMap<u32, [u8; 32]>,
@@ -470,6 +481,15 @@ struct State {
     my_claim: Option<ClaimMsg>,
     /// Why another node turned us away (name of that node, reason), until we are admitted.
     rejected: Option<(String, String)>,
+    /// Nodes whose invite turned out to be used by another node first, and that node.
+    invite_lost: HashMap<NodeId, NodeId>,
+    /// Another node used this node's invite first.
+    my_invite_lost: bool,
+    /// Their links, kept a few seconds until the other node's record is here, so they are told
+    /// its name (`flush_invite_rejects`).
+    invite_rejects: Vec<(LinkEntry, NodeId, Instant)>,
+    /// Like `LinkEntry::digest_at` and `asked`, for nodes we exchange records with over UDP.
+    udp_gossip: HashMap<NodeId, (Option<Instant>, (Instant, usize))>,
     /// Refused logins to the built-in SSH server, for doctor/status.
     ssh_refused: VecDeque<(u64, String)>,
     leases: Vec<Lease>,
@@ -509,6 +529,8 @@ pub struct Node {
     next_link_id: AtomicU64,
     /// A node we had no path to is being talked to: dial it now, not at the next tick.
     want_now: Notify,
+    /// Wakes the update loop: another node runs a newer version (with `auto_update`).
+    update_wake: Notify,
     started: Instant,
     /// Nonces of the packets we send (session + counter, `replay`).
     nonces: replay::Sender,
@@ -589,6 +611,12 @@ pub struct Status {
     pub version: String,
     #[serde(default)]
     pub update_available: Option<String>,
+    /// New releases are installed by themselves (`meshvpn autoupdate`).
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Why the last automatic update failed.
+    #[serde(default)]
+    pub update_problem: Option<String>,
     #[serde(default)]
     pub banned: Vec<String>,
     #[serde(default)]
@@ -773,6 +801,7 @@ pub async fn run(dir: PathBuf, mut cfg: Config) -> Result<()> {
         state: Mutex::new(State::default()),
         next_link_id: AtomicU64::new(1),
         want_now: Notify::new(),
+        update_wake: Notify::new(),
         started: Instant::now(),
         nonces,
         socks,
@@ -1239,6 +1268,7 @@ impl Node {
             neighbors,
             udp_neighbors: st.my_udp_neighbors.clone(),
             udp_relay: true,
+            udp_gossip: true,
             seq: st.my_seq - 1,
             net: self.net.clone(),
             version: crate::update::current(),
@@ -1393,6 +1423,43 @@ impl Node {
                 Self::send_gossip(l, full.clone());
             }
         }
+        // (UDP gossip peers all split.)
+        for id in self.udp_gossip_peers(st) {
+            self.send_peer(st, &id, core.clone());
+            if let Some(d) = &details {
+                self.send_peer(st, &id, d.clone());
+            }
+        }
+    }
+
+    /// The nodes we exchange records with over UDP: a working UDP path but no link (a node
+    /// TCP doesn't get through to would hear nothing of the others otherwise).
+    fn udp_gossip_peers(&self, st: &State) -> Vec<NodeId> {
+        st.udp_paths
+            .iter()
+            .filter(|(id, p)| {
+                p.usable()
+                    && !st.links.contains_key(*id)
+                    && st.records.get(*id).is_some_and(|r| r.info.udp_gossip)
+                    && Self::admitted(st, id)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Sends gossip (records, details, digests, wants) to `peer`: over the link, or else its
+    /// UDP path.
+    fn send_peer(&self, st: &State, peer: &NodeId, f: Vec<u8>) {
+        if let Some(l) = st.links.get(peer) {
+            Self::send_gossip(l, f);
+        } else if st.records.get(peer).is_some_and(|r| r.info.udp_gossip)
+            && let Some((addr, datagrams)) = self.udp_relay_datagrams(st, peer, &f)
+            && let Some(sock) = self.udp_socket(&addr)
+        {
+            for d in datagrams {
+                let _ = sock.try_send_to(&d, addr);
+            }
+        }
     }
 
     /// Queues gossip for a link unless its queue is long already (see `GOSSIP_QUEUE`).
@@ -1449,6 +1516,15 @@ impl Node {
         for (id, l) in &st.links {
             if Some(*id) != except {
                 let _ = l.tx.try_send(f.to_vec());
+            }
+        }
+        // Admissions, rosters, bans and key rotations also to the nodes only UDP reaches
+        // (pings are for links).
+        if f.first() != Some(&T_PING) {
+            for id in self.udp_gossip_peers(st) {
+                if Some(id) != except {
+                    self.send_peer(st, &id, f.to_vec());
+                }
             }
         }
     }
@@ -1616,17 +1692,12 @@ impl Node {
                 }
             }
             // Its details come apart: from where the record came, which has them (or soon).
-            if !want.is_empty()
-                && Self::splits(&st, &from)
-                && let Some(l) = st.links.get(&from)
-            {
-                Self::send_gossip(l, frame(T_WANT_DETAILS, &want));
+            if !want.is_empty() && Self::splits(&st, &from) {
+                self.send_peer(&st, &from, frame(T_WANT_DETAILS, &want));
             }
             for (to, recs) in out {
-                if let Some(l) = st.links.get(&to) {
-                    for f in gossip_frames(&recs) {
-                        Self::send_gossip(l, f);
-                    }
+                for f in gossip_frames(&recs) {
+                    self.send_peer(&st, &to, f);
                 }
             }
             drop(st);
@@ -1698,34 +1769,43 @@ impl Node {
     fn send_digest(&self) {
         use rand::seq::IteratorRandom;
         let st = self.state.lock().unwrap();
-        let Some(l) = st
+        let udp = self.udp_gossip_peers(&st);
+        let Some(to) = st
             .links
-            .iter()
-            .filter(|(id, _)| Self::digests(&st, id))
+            .keys()
+            .filter(|id| Self::digests(&st, id))
+            .chain(udp.iter())
             .choose(&mut rand::thread_rng())
+            .copied()
         else {
             return;
         };
-        let (to, l) = l;
-        let f = self.digest_frame(&st, Self::splits(&st, to));
+        let f = self.digest_frame(&st, Self::splits(&st, &to));
         // One link message holds the digest of ~1500 nodes; a larger one would end the link.
         if f.len() > crate::link::MAX_PLAINTEXT {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| warn!("{} nodes: too many for one digest, digests are off", st.records.len()));
             return;
         }
-        Self::send_gossip(l, f);
+        self.send_peer(&st, &to, f);
     }
 
     /// A neighbor's digest: send it what is newer here, ask for what is newer there.
     /// Whether a digest from `from` is answered now (`DIGEST_REPLY_GAP`).
     fn digest_due(&self, from: &NodeId) -> bool {
         let mut st = self.state.lock().unwrap();
-        let Some(l) = st.links.get_mut(from) else { return false };
-        if l.digest_at.is_some_and(|t| t.elapsed() < DIGEST_REPLY_GAP) {
+        let st = &mut *st;
+        let at = match st.links.get_mut(from) {
+            Some(l) => &mut l.digest_at,
+            None if st.udp_paths.contains_key(from) => {
+                &mut st.udp_gossip.entry(*from).or_insert((None, (Instant::now(), 0))).0
+            }
+            None => return false,
+        };
+        if at.is_some_and(|t| t.elapsed() < DIGEST_REPLY_GAP) {
             return false;
         }
-        l.digest_at = Some(Instant::now());
+        *at = Some(Instant::now());
         true
     }
 
@@ -1790,7 +1870,6 @@ impl Node {
 
     fn digest_reply(&self, from: NodeId, theirs: HashMap<NodeId, u64>) {
         let st = self.state.lock().unwrap();
-        let Some(l) = st.links.get(&from) else { return };
         let settled = now_ms().saturating_sub(DIGEST_GRACE_MS);
         let mut give: Vec<SignedInfo> = st
             .records
@@ -1813,10 +1892,10 @@ impl Node {
             .flat_map(|(id, _)| id.0)
             .collect();
         for f in gossip_frames(&give) {
-            Self::send_gossip(l, f);
+            self.send_peer(&st, &from, f);
         }
         if !want.is_empty() {
-            Self::send_gossip(l, frame(T_WANT, &want));
+            self.send_peer(&st, &from, frame(T_WANT, &want));
         }
         // Details that went missing on the way: the neighbor may have them.
         if Self::splits(&st, &from) {
@@ -1827,7 +1906,7 @@ impl Node {
                 .flat_map(|r| r.info.id.0)
                 .collect();
             if !want.is_empty() {
-                Self::send_gossip(l, frame(T_WANT_DETAILS, &want));
+                self.send_peer(&st, &from, frame(T_WANT_DETAILS, &want));
             }
         }
     }
@@ -1836,12 +1915,18 @@ impl Node {
     /// How many more records (or details) `from` may ask for now (`ASK_WINDOW`); counts them.
     fn ask_room(st: &mut State, from: &NodeId, asked: usize) -> usize {
         let budget = 2 * st.records.len() + 64;
-        let Some(l) = st.links.get_mut(from) else { return 0 };
-        if l.asked.0.elapsed() >= ASK_WINDOW {
-            l.asked = (Instant::now(), 0);
+        let window = match st.links.get_mut(from) {
+            Some(l) => &mut l.asked,
+            None if st.udp_paths.contains_key(from) => {
+                &mut st.udp_gossip.entry(*from).or_insert((None, (Instant::now(), 0))).1
+            }
+            None => return 0,
+        };
+        if window.0.elapsed() >= ASK_WINDOW {
+            *window = (Instant::now(), 0);
         }
-        let room = budget.saturating_sub(l.asked.1).min(asked);
-        l.asked.1 += room;
+        let room = budget.saturating_sub(window.1).min(asked);
+        window.1 += room;
         room
     }
 
@@ -1857,7 +1942,6 @@ impl Node {
             .collect();
         // The rest comes with the next digest.
         let room = Self::ask_room(&mut st, &from, ids.len());
-        let Some(l) = st.links.get(&from) else { return };
         let give: Vec<SignedInfo> = ids
             .iter()
             .take(room)
@@ -1871,7 +1955,7 @@ impl Node {
             })
             .collect();
         for f in gossip_frames(&give) {
-            Self::send_gossip(l, f);
+            self.send_peer(&st, &from, f);
         }
     }
 
@@ -1944,7 +2028,6 @@ impl Node {
             .copied()
             .collect();
         let room = Self::ask_room(&mut st, &from, ids.len());
-        let Some(l) = st.links.get(&from) else { return };
         let give: Vec<SignedDetails> = ids
             .iter()
             .take(room)
@@ -1961,7 +2044,7 @@ impl Node {
             })
             .collect();
         for f in details_frames(&give) {
-            Self::send_gossip(l, f);
+            self.send_peer(&st, &from, f);
         }
     }
 
@@ -3103,10 +3186,17 @@ impl Node {
     /// (records lag behind, or a part of the way is missing from them) - a node we have a direct
     /// path to that names a path to `dst`, or that `dst` names (it decides on from there).
     fn next_hop(&self, st: &State, dst: &NodeId) -> Option<NodeId> {
+        self.next_hop_avoiding(st, dst, None)
+    }
+
+    /// `next_hop`, never back to `from` (where a relayed frame came from): with views of the
+    /// network that lag behind, two nodes could each take the other for the way on.
+    fn next_hop_avoiding(&self, st: &State, dst: &NodeId, from: Option<&NodeId>) -> Option<NodeId> {
         let usable = |h: &NodeId| {
-            st.links.contains_key(h)
-                || st.udp_paths.get(h).is_some_and(|p| p.usable())
-                    && st.records.get(h).is_some_and(|r| r.info.udp_relay)
+            Some(h) != from
+                && (st.links.contains_key(h)
+                    || st.udp_paths.get(h).is_some_and(|p| p.usable())
+                        && st.records.get(h).is_some_and(|r| r.info.udp_relay))
         };
         // Routes are made every few seconds: the UDP path a route starts with may have gone quiet since.
         if let Some(h) = st.routes.get(dst).filter(|h| usable(h)) {
@@ -3128,20 +3218,14 @@ impl Node {
         hops.first().copied()
     }
 
-    /// What carries the routed frame `f` (data, ext, why) to the next hop: its link or its UDP
-    /// path (sealed for it, `udp_relay_datagrams`). Data prefers UDP, like direct data (a link
-    /// that just broke takes a while to time out); the rest the link, which loses nothing.
+    /// What carries the routed frame `f` (data, ext, why) to the next hop: its link, or else its
+    /// UDP path (sealed for it, `udp_relay_datagrams`).
     fn hop_carrier(&self, st: &State, hop: &NodeId, f: Vec<u8>) -> Option<Outgoing> {
-        let link = st.links.get(hop).map(|l| l.tx.clone());
-        if f.first() != Some(&T_DATA)
-            && let Some(tx) = link
-        {
-            return Some(Outgoing::Link(tx, f));
+        if let Some(l) = st.links.get(hop) {
+            return Some(Outgoing::Link(l.tx.clone(), f));
         }
-        if let Some((addr, datagrams)) = self.udp_relay_datagrams(st, hop, &f) {
-            return Some(Outgoing::Udp(addr, datagrams));
-        }
-        link.map(|tx| Outgoing::Link(tx, f))
+        let (addr, datagrams) = self.udp_relay_datagrams(st, hop, &f)?;
+        Some(Outgoing::Udp(addr, datagrams))
     }
 
     /// Hands the routed frame `f` to the next hop (dropped when congested, like a network).
@@ -3348,37 +3432,59 @@ impl Node {
             .map(|id| (id.0[..8].try_into().unwrap(), *id))
             .collect();
 
-        // Breadth-first search over the neighbor lists of online nodes (links and UDP paths
-        // both ends name), from our links and UDP paths.
+        // Breadth-first search over the neighbor lists of online nodes (links both ends name),
+        // from our links. Then, for the nodes not reached that way, also over UDP paths both
+        // ends name, from ours too: those come and go with traffic in a big network, and the
+        // others hear of it late, so they only fill the gaps (nodes only UDP gets through to).
         let mut routes: HashMap<NodeId, NodeId> = HashMap::new();
-        let mut queue = VecDeque::new();
-        // (UDP paths only to nodes that take relay datagrams.)
-        let relays = |id: &NodeId| st.records.get(id).is_some_and(|r| r.info.udp_relay);
-        let udp: Vec<NodeId> = st
-            .udp_paths
-            .iter()
-            .filter(|(id, p)| p.usable() && relays(id))
-            .map(|(id, _)| *id)
-            .collect();
-        for n in st.links.keys().chain(udp.iter()) {
-            if routes.insert(*n, *n).is_none() {
-                queue.push_back(*n);
-            }
+        let mut order: Vec<NodeId> = vec![];
+        let mut queue: VecDeque<NodeId> = st.links.keys().copied().collect();
+        for n in &queue {
+            routes.insert(*n, *n);
         }
-        let names = |r: &NodeInfo, id: &NodeId| r.neighbors.contains(id) || r.udp_neighbors.contains(id);
-        while let Some(cur) = queue.pop_front() {
-            let first = routes[&cur];
-            let Some(rec) = st.records.get(&cur) else { continue };
-            // Clients relay nothing: nobody is reached through one.
-            if !self.is_online(st, &cur) || Self::client_of(st, &cur).is_some() {
-                continue;
+        let links = |r: &NodeInfo| r.neighbors.clone();
+        let both = |r: &NodeInfo| {
+            r.neighbors
+                .iter()
+                .chain(r.udp_neighbors.iter())
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        for udp in [false, true] {
+            if udp {
+                // (UDP paths only to nodes that take relay datagrams.)
+                let relays = |id: &NodeId| st.records.get(id).is_some_and(|r| r.info.udp_relay);
+                let mine: Vec<NodeId> = st
+                    .udp_paths
+                    .iter()
+                    .filter(|(id, p)| p.usable() && relays(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                queue = order.iter().copied().collect();
+                for n in mine {
+                    if routes.insert(n, n).is_none() {
+                        queue.push_back(n);
+                    }
+                }
             }
-            // Only links both ends name: one node's word alone could pull traffic through it.
-            for nb in rec.info.neighbors.iter().chain(rec.info.udp_neighbors.iter()) {
-                let mutual = st.records.get(nb).is_some_and(|r| names(&r.info, &cur));
-                if mutual && *nb != self.ident.id && !routes.contains_key(nb) {
-                    routes.insert(*nb, first);
-                    queue.push_back(*nb);
+            let edges = |r: &NodeInfo| if udp { both(r) } else { links(r) };
+            while let Some(cur) = queue.pop_front() {
+                if !udp {
+                    order.push(cur);
+                }
+                let first = routes[&cur];
+                let Some(rec) = st.records.get(&cur) else { continue };
+                // Clients relay nothing: nobody is reached through one.
+                if !self.is_online(st, &cur) || Self::client_of(st, &cur).is_some() {
+                    continue;
+                }
+                // Only links both ends name: one node's word alone could pull traffic through it.
+                for nb in edges(&rec.info) {
+                    let mutual = st.records.get(&nb).is_some_and(|r| edges(&r.info).contains(&cur));
+                    if mutual && nb != self.ident.id && !routes.contains_key(&nb) {
+                        routes.insert(nb, first);
+                        queue.push_back(nb);
+                    }
                 }
             }
         }
@@ -3470,7 +3576,10 @@ impl Node {
         let (dst, hop, cipher) = {
             let mut st = self.state.lock().unwrap();
             let dst = self.node_for(&st, dst_ip)?;
-            let hop = self.next_hop(&st, &dst)?;
+            let Some(hop) = self.next_hop(&st, &dst) else {
+                debug!("no way to {dst}");
+                return None;
+            };
             let cipher = self.cipher_for(&mut st, &dst)?;
             (dst, hop, cipher)
         };
@@ -3488,7 +3597,7 @@ impl Node {
     }
 
     /// Handles a data frame: returns the IP packet if it is for us, otherwise relays it.
-    fn handle_data(&self, mut f: Vec<u8>) -> Option<Vec<u8>> {
+    fn handle_data(&self, mut f: Vec<u8>, from: NodeId) -> Option<Vec<u8>> {
         if f.len() < 1 + DATA_HDR {
             return None;
         }
@@ -3506,8 +3615,13 @@ impl Node {
             if Self::client_of(&st, &self.ident.id).is_some() {
                 return None; // clients relay nothing
             }
-            let hop = self.next_hop(&st, &dst)?;
-            self.to_hop(&st, &hop, f);
+            let Some(hop) = self.next_hop_avoiding(&st, &dst, Some(&from)) else {
+                debug!("relay: no way on to {dst}");
+                return None;
+            };
+            if !self.to_hop(&st, &hop, f) {
+                debug!("relay: {hop} (towards {dst}) didn't take it");
+            }
             return None;
         }
         let cipher = {
@@ -3695,7 +3809,9 @@ impl Node {
                             }
                         }
                         match est {
-                            Ok(est) => node.serve(est).await,
+                            Ok(est) => {
+                                node.serve(est).await;
+                            }
                             Err(e)
                                 if ["banned", "outdated network key", "not admitted"]
                                     .iter()
@@ -3830,7 +3946,15 @@ impl Node {
                             self.broadcast(&st, &frame(T_CLAIM, &serde_json::to_vec(&m).unwrap()), None);
                             None
                         }
-                        Ok(None) => None,
+                        // Taken before - unless it has lost to another node's since.
+                        Ok(None) if Self::admitted(&st, &peer) => None,
+                        Ok(None) => Some((
+                            format!(
+                                "{} ({peer}) is not admitted: its admission no longer counts",
+                                info.name
+                            ),
+                            "this admission no longer counts (another node used the invite first, or a client's time is up) - ask an admin for a new invite".into(),
+                        )),
                         Err(e) => Some((
                             format!("{} ({peer}) is not admitted: {e:#}", info.name),
                             format!("{e:#}"),
@@ -3931,7 +4055,8 @@ impl Node {
         })
     }
 
-    async fn serve(self: Arc<Self>, est: Established) {
+    /// Runs a link until it ends. Returns whether the other side turned this node away.
+    async fn serve(self: Arc<Self>, est: Established) -> bool {
         let Established {
             peer,
             link_id,
@@ -3961,7 +4086,7 @@ impl Node {
             };
             match kind {
                 T_DATA => {
-                    if let Some(pkt) = self.handle_data(msg) {
+                    if let Some(pkt) = self.handle_data(msg, peer) {
                         self.deliver(pkt).await;
                     }
                 }
@@ -4074,13 +4199,17 @@ impl Node {
             self.links_changed(&mut st);
             self.rebuild(&mut st);
             drop(st);
-            // Try to get it back right away instead of waiting for the next tick.
-            let node = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                node.dial_now();
-            });
+            // Try to get it back right away instead of waiting for the next tick - unless it
+            // turned us away (then the dialer's backoff decides).
+            if !reason.starts_with("turned away") {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    node.dial_now();
+                });
+            }
         }
+        reason.starts_with("turned away")
     }
 
     // ----------------------------------------------------------------------------- port mapping
@@ -4234,6 +4363,18 @@ impl Node {
         b.delay = (b.delay * 2).min(if not_ours { NOT_A_NODE_BACKOFF } else { MAX_BACKOFF });
     }
 
+    /// The next try of `key` after a growing pause. Returns the pause in seconds.
+    fn backoff(st: &mut State, key: &str) -> u64 {
+        let b = st.backoff.entry(key.to_string()).or_insert(Backoff {
+            next: Instant::now(),
+            delay: Duration::from_secs(5),
+        });
+        b.next = Instant::now() + b.delay;
+        let retry = b.delay.as_secs();
+        b.delay = (b.delay * 2).min(MAX_BACKOFF);
+        retry
+    }
+
     async fn dial(self: Arc<Self>, key: String, addrs: Vec<String>, bootstrap: Option<String>) {
         let mut last_err = None;
         for addr in &addrs {
@@ -4255,7 +4396,11 @@ impl Node {
                             st.bootstrap_ids.insert(b.clone(), est.peer);
                         }
                     }
-                    self.serve(est).await;
+                    // Turned away once up (not admitted): again only after the backoff.
+                    if self.clone().serve(est).await {
+                        let mut st = self.state.lock().unwrap();
+                        Self::backoff(&mut st, &key);
+                    }
                     return;
                 }
                 Err(e) => {
@@ -4278,13 +4423,7 @@ impl Node {
         for a in &addrs {
             st.dialing_addrs.remove(a);
         }
-        let b = st.backoff.entry(key.clone()).or_insert(Backoff {
-            next: Instant::now(),
-            delay: Duration::from_secs(5),
-        });
-        b.next = Instant::now() + b.delay;
-        let retry = b.delay.as_secs();
-        b.delay = (b.delay * 2).min(MAX_BACKOFF);
+        let retry = Self::backoff(&mut st, &key);
         if let Some(e) = last_err {
             let msg = format!("cannot reach {}: {e:#} (retrying in {retry}s)", addrs.join(", "));
             // Once we are part of the mesh, unreachable addresses are normal (NAT, firewalls).
@@ -4345,6 +4484,10 @@ impl Node {
                 } = &mut *st;
                 record_rate.retain(|id, _| records.contains_key(id));
                 details_rate.retain(|id, _| records.contains_key(id));
+                let State {
+                    udp_paths, udp_gossip, ..
+                } = &mut *st;
+                udp_gossip.retain(|id, _| udp_paths.contains_key(id));
                 self.expire_leases(&mut st);
                 self.expire_clients(&mut st);
                 // An admin's word for the roster it didn't sign (also after an update from a
@@ -4354,6 +4497,10 @@ impl Node {
                 }
                 st.other_admins.retain(|_, at| at.elapsed() < Duration::from_secs(3600));
                 self.auto_forget(&mut st);
+                if ticks.is_multiple_of(6) {
+                    self.note_newer_versions(&mut st);
+                }
+                self.flush_invite_rejects(&mut st);
                 self.rebuild(&mut st);
                 st.structural = if self.on_demand(&st) {
                     self.structural(&st)
@@ -4840,12 +4987,16 @@ impl Node {
             extension: None,
             version: crate::update::current(),
             update_available: st.update_available.clone(),
+            auto_update: self.auto_update(),
+            update_problem: st.update_problem.clone().filter(|_| self.auto_update()),
             banned: st.banned.values().cloned().collect(),
             socks: matches!(self.io, PacketIo::Userspace(_)).then(|| self.cfg.socks_listen.clone()),
+            // Also while links are left: a node whose invite another node used first still has
+            // them for a while, at members that haven't heard of the earlier one yet.
             turned_away: st
                 .rejected
                 .as_ref()
-                .filter(|_| st.links.is_empty())
+                .filter(|_| st.links.is_empty() || st.my_invite_lost)
                 .map(|(by, why)| format!("{by}: {why}")),
             ssh_refused: st
                 .ssh_refused
@@ -4911,23 +5062,124 @@ impl Node {
         Ok(format!("updated {} -> {tag}, restarting", update::current()))
     }
 
+    /// `meshvpn autoupdate on`: read from the configuration each time, so switching it takes
+    /// effect without a restart.
+    fn auto_update(&self) -> bool {
+        Config::load(&self.dir).is_ok_and(|c| c.auto_update) && !crate::update::is_dev_build()
+    }
+
     async fn update_loop(self: Arc<Self>) {
         tokio::time::sleep(Duration::from_secs(60)).await;
+        let mut last_try: Option<Instant> = None;
         loop {
-            // Only checks: new releases are installed with `meshvpn update`, never by themselves.
-            match self.update_now(true, false).await {
-                Ok(msg) if msg.contains("available") => {
-                    info!(
-                        "{msg} - install it with: {}",
+            let wait = if self.auto_update() {
+                last_try = Some(Instant::now());
+                self.auto_update_round().await
+            } else {
+                // Only checks: new releases are installed with `meshvpn update`.
+                self.state.lock().unwrap().update_problem = None;
+                match self.update_now(true, false).await {
+                    Ok(msg) if msg.contains("available") => {
+                        info!(
+                            "{msg} - install it with: {} (or let it update by itself: {})",
+                            crate::config::hint("sudo meshvpn update"),
+                            crate::config::hint("sudo meshvpn autoupdate on")
+                        )
+                    }
+                    Ok(msg) => debug!("{msg}"),
+                    Err(e) => debug!("update check failed: {e:#}"),
+                }
+                UPDATE_CHECK_EVERY
+            };
+            // Spread checks out so a whole network does not hit GitHub at once.
+            let jitter = Duration::from_secs(rand::rngs::OsRng.next_u64() % (wait.as_secs() / 6).max(1));
+            tokio::select! {
+                _ = tokio::time::sleep(wait + jitter) => {}
+                // Another node runs a newer version: try now, but not more often than this.
+                _ = self.update_wake.notified() => {
+                    if let Some(t) = last_try {
+                        let since = t.elapsed();
+                        if since < AUTO_UPDATE_MIN_GAP {
+                            tokio::time::sleep(AUTO_UPDATE_MIN_GAP - since).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One try of an automatic update. Returns how long until the next one.
+    async fn auto_update_round(self: &Arc<Self>) -> Duration {
+        use crate::update;
+        // Another network's meshvpn on this machine updated the program already: run that.
+        if let Ok(exe) = update::current_exe()
+            && let Some(v) = update::installed_version(&exe)
+            && update::is_newer(&v, &update::current())
+        {
+            info!("meshvpn {v} is installed already (updated by another network's meshvpn); restarting");
+            self.restart(exe);
+        }
+        match self.update_now(false, false).await {
+            Ok(msg) => {
+                debug!("automatic update: {msg}");
+                self.state.lock().unwrap().update_problem = None;
+                UPDATE_CHECK_EVERY
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                // A download that arrived but doesn't check out, or can't be installed, is no
+                // matter of the way out.
+                let local = [
+                    "does not connect out",
+                    "not installing",
+                    "writing",
+                    "replacing",
+                    "moving",
+                ];
+                let why = if local.iter().any(|k| e.contains(k)) {
+                    format!("the update failed: {e}")
+                } else {
+                    format!(
+                        "GitHub could not be reached ({e}). Behind a proxy that wants a login in the browser? \
+                         Log in there - meshvpn tries again every {} minutes (or right away: {})",
+                        AUTO_UPDATE_RETRY.as_secs() / 60,
                         crate::config::hint("sudo meshvpn update")
                     )
+                };
+                let mut st = self.state.lock().unwrap();
+                if st.update_problem.as_deref() != Some(why.as_str()) {
+                    warn!("automatic update: {why}");
                 }
-                Ok(msg) => debug!("{msg}"),
-                Err(e) => debug!("update check failed: {e:#}"),
+                st.update_problem = Some(why);
+                AUTO_UPDATE_RETRY
             }
-            // Spread checks out so a whole network does not hit GitHub at once.
-            let jitter = rand::rngs::OsRng.next_u64() % 3600;
-            tokio::time::sleep(Duration::from_secs(6 * 3600 + jitter)).await;
+        }
+    }
+
+    /// With `auto_update`: wakes the update loop once per newer version another node runs.
+    fn note_newer_versions(&self, st: &mut State) {
+        let current = crate::update::current();
+        let newest = st
+            .records
+            .values()
+            .filter(|r| self.is_online(st, &r.info.id))
+            .map(|r| r.info.version.clone())
+            .filter(|v| crate::update::is_newer(v, &current))
+            .max_by(|a, b| {
+                if crate::update::is_newer(a, b) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            });
+        if let Some(v) = newest
+            && st.newer_seen.as_ref().is_none_or(|s| crate::update::is_newer(&v, s))
+        {
+            st.newer_seen = Some(v.clone());
+            if self.auto_update() {
+                info!("{v} runs on another node: looking for the update");
+                self.update_wake.notify_one();
+            }
         }
     }
 

@@ -204,6 +204,9 @@ pub struct NodeInfo {
     /// Takes relay datagrams over UDP (`node::udp`), so it can be a UDP hop of a route.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub udp_relay: bool,
+    /// Exchanges records over UDP (digests, records, details) with nodes it has no link to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub udp_gossip: bool,
     /// Monotonic version, newer wins.
     pub seq: u64,
     /// Network this record belongs to (see `keys::network_tag`).
@@ -819,6 +822,7 @@ mod tests {
             neighbors: vec![],
             udp_neighbors: vec![],
             udp_relay: false,
+            udp_gossip: false,
             seq: 1,
             net: "n1".into(),
             ssh_keys: vec![],

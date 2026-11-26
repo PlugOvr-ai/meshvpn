@@ -325,6 +325,10 @@ pub struct Config {
     /// in company networks may take the traffic for BitTorrent.
     #[serde(default)]
     pub dht: bool,
+    /// Install new releases by themselves (`meshvpn autoupdate on`): checked every few hours,
+    /// and when another node runs a newer version. Off by default.
+    #[serde(default)]
+    pub auto_update: bool,
     /// Hole punching over IPv6 towards nodes we have no link to (both sides behind firewalls,
     /// no port forward): connection attempts to their IPv6 addresses, for up to a day.
     #[serde(default = "default_true")]
@@ -409,6 +413,7 @@ impl Config {
             port_mapping: true,
             stun: default_stun(),
             dht: false,
+            auto_update: false,
             punch: true,
             join: None,
             tags: vec![],

@@ -21,8 +21,10 @@
 //!   frag   A4 | src id prefix 8 | message 4 | index 1 | count 1 | part of a data or relay datagram
 //!   relay  A5 | src id prefix 8 | nonce 24 | XChaCha20-Poly1305(link frame)
 //!          a frame the receiver passes on towards another node, or takes as the last hop
-//!          (data, ext, why: what links carry for others). So a node that only UDP reaches
-//!          (TCP blocked or both sides behind NATs) still relays and is reached through relays.
+//!          (data, ext, why: what links carry for others), or takes from a node without a link
+//!          to it (records, digests, admissions, rosters, rotations: `NodeInfo::udp_gossip`). So
+//!          a node that only UDP reaches (TCP blocked or both sides behind NATs) still relays, is
+//!          reached through relays, and keeps up with the network.
 //!          Always split into parts that fit any path.
 //!
 //! Path MTU: a full-size packet makes a datagram of about 1450 bytes, more than some paths
@@ -782,7 +784,27 @@ impl Node {
             return None;
         }
         self.udp_open(d, from, |_, f| {
-            matches!(f.first(), Some(&(T_DATA | T_EXT | T_WHY | T_WHY_REPLY)))
+            matches!(
+                f.first(),
+                Some(
+                    &(T_DATA
+                        | T_EXT
+                        | T_WHY
+                        | T_WHY_REPLY
+                        | T_GOSSIP
+                        | T_DIGEST
+                        | T_DIGEST2
+                        | T_WANT
+                        | T_DETAILS
+                        | T_WANT_DETAILS
+                        | T_FORGET
+                        | T_ROSTER
+                        | T_CLAIM
+                        | T_ENDORSE
+                        | T_DOC
+                        | T_ROTATE)
+                )
+            )
         })
     }
 
@@ -793,13 +815,26 @@ impl Node {
         };
         match kind {
             T_DATA => {
-                if let Some(pkt) = self.handle_data(f) {
+                if let Some(pkt) = self.handle_data(f, hop) {
                     self.deliver(pkt).await;
                 }
             }
             T_EXT => self.handle_ext(payload),
             T_WHY => self.handle_why(hop, payload),
             T_WHY_REPLY => self.handle_why_reply(hop, payload),
+            // Records and the network's state, from a node without a link to us (`udp_gossip`).
+            T_GOSSIP => self.handle_gossip(hop, payload),
+            T_DIGEST => self.handle_digest(hop, payload),
+            T_DIGEST2 => self.handle_digest2(hop, payload),
+            T_WANT => self.handle_want(hop, payload),
+            T_DETAILS => self.handle_details(hop, payload),
+            T_WANT_DETAILS => self.handle_want_details(hop, payload),
+            T_FORGET => self.handle_forget(hop, payload),
+            T_ROSTER | T_CLAIM | T_ENDORSE => {
+                self.dispatch_admin(kind, hop, payload);
+            }
+            T_DOC => self.handle_doc(hop, payload),
+            T_ROTATE => self.handle_rotation(hop, payload),
             _ => {}
         }
     }
@@ -1121,6 +1156,7 @@ mod tests {
             neighbors: vec![],
             udp_neighbors: vec![],
             udp_relay: false,
+            udp_gossip: false,
             seq: 1,
             net: String::new(),
             version: String::new(),

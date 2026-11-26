@@ -345,6 +345,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Install new releases by themselves: `on`, `off` (the default), or without an argument
+    /// what it is now. For every network of this machine (they share the program).
+    Autoupdate {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// Find nodes again whose address changed through BitTorrent's Mainline DHT (encrypted, only
     /// members can read it): `on`, `off`, or without an argument what it is now. Restarts meshvpn.
     Dht {
@@ -2174,6 +2180,10 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Install => {
             for d in chosen_networks(&base, &dir, net_given) {
                 install(&d)?;
+                // Joined with an invite and started for the first time: was it taken?
+                if Config::load(&d).is_ok_and(|c| c.ticket.is_some()) {
+                    report_admission(&d);
+                }
             }
             if let Some(path) = crate::completion::install()
                 && !json
@@ -2182,6 +2192,9 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Dht { state } => dht_cmd(&dir, state.as_deref().map(|s| s == "on"), json)?,
+        Cmd::Autoupdate { state } => {
+            autoupdate_cmd(&base, &dir, state.as_deref().map(|s| s == "on"), json)?;
+        }
         Cmd::Restart => {
             for d in chosen_networks(&base, &dir, net_given) {
                 restart(&d)?;
@@ -2876,6 +2889,74 @@ fn stop_for_replace(dir: &Path) -> Replaced {
 
 /// `meshvpn dht [on|off]`: shows or changes `dht` in the configuration; a running meshvpn restarts
 /// to use it.
+/// `meshvpn autoupdate [on|off]`: one program for all networks of the machine, so the setting
+/// goes into each one's configuration. Their meshvpn read it at every check: no restart.
+fn autoupdate_cmd(base: &Path, dir: &Path, on: Option<bool>, json: bool) -> Result<()> {
+    let dirs = chosen_networks(base, dir, false);
+    let Some(on) = on else {
+        let now = dirs.iter().any(|d| Config::load(d).is_ok_and(|c| c.auto_update));
+        if json {
+            println!("{}", serde_json::json!({ "auto_update": now }));
+        } else if now {
+            println!(
+                "Automatic updates are on: new releases are installed by themselves (checked every 6 hours, and when \
+                 another node runs a newer version). meshvpn status says when GitHub can't be reached."
+            );
+        } else {
+            println!(
+                "Automatic updates are off - switch them on with: {}\nUpdate by hand: {}",
+                config::hint("sudo meshvpn autoupdate on"),
+                config::hint("sudo meshvpn update")
+            );
+        }
+        return Ok(());
+    };
+    require_owner()?;
+    for d in &dirs {
+        let mut cfg = Config::load(d)?;
+        if cfg.auto_update != on {
+            cfg.auto_update = on;
+            cfg.save(d)?;
+        }
+    }
+    if !on {
+        say(json, "Automatic updates are off. Update by hand: sudo meshvpn update");
+        return Ok(());
+    }
+    if update::is_dev_build() {
+        say(
+            json,
+            "Automatic updates are on, but this is a development build: it is never updated by itself.",
+        );
+        return Ok(());
+    }
+    say(
+        json,
+        "Automatic updates are on: new releases are installed by themselves (checked every 6 hours, and when \
+         another node runs a newer version).",
+    );
+    // Right away, if there is one.
+    if control::is_running(dir) {
+        let rt = tokio::runtime::Runtime::new()?;
+        let req = control::Request::Update {
+            check_only: false,
+            force: false,
+        };
+        let failed = |m: &str| {
+            format!(
+                "No update now: {m} - it tries again later (behind a proxy that wants a login in the browser? log in there)"
+            )
+        };
+        match rt.block_on(control::request(dir, &req)) {
+            Ok(control::Response::Message { text }) => say(json, &text),
+            Ok(control::Response::Error { message }) => say(json, &failed(&message)),
+            Err(e) => say(json, &failed(&format!("{e:#}"))),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn dht_cmd(dir: &Path, on: Option<bool>, json: bool) -> Result<()> {
     let mut cfg = Config::load(dir)?;
     let net = networks::flag(dir);
@@ -3074,6 +3155,25 @@ fn restart_replaced(dir: &Path, replaced: Replaced) -> bool {
     }
 }
 
+/// Right after (re)starting with a new admission: waits a few seconds for the network to take this
+/// node or turn it away (an invite another node used already), and says so in the second case.
+fn report_admission(dir: &Path) {
+    let Ok(rt) = tokio::runtime::Runtime::new() else { return };
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let Ok(control::Response::Status(st)) = rt.block_on(control::request(dir, &control::Request::Status)) else {
+            continue;
+        };
+        if let Some(t) = &st.turned_away {
+            println!("\n\x1b[1;31mnot admitted:\x1b[0m {t}");
+            return;
+        }
+        if st.peers.iter().any(|p| p.online) {
+            return;
+        }
+    }
+}
+
 /// Sets up sshd right away if the config asks for password-less logins. If that isn't possible
 /// yet (e.g. meshvpn not installed to /usr/local/bin), the daemon retries at startup.
 fn enable_ssh_logins(cfg: &Config) {
@@ -3121,6 +3221,7 @@ fn print_next_steps(dir: &Path, cfg: &Config, restarted: bool) {
     if restarted {
         println!("meshvpn runs with the new configuration.");
         println!("  {:<22} # see who is connected", format!("meshvpn{net} status"));
+        report_admission(dir);
         return;
     }
     if control::is_running(dir) {
@@ -3692,11 +3793,18 @@ fn print_status(st: &node::Status, all: bool) {
         st.network,
         st.version
     );
-    if let Some(v) = &st.update_available {
-        println!(
-            "  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - run: {}",
-            config::hint("sudo meshvpn update")
-        );
+    if let Some(p) = &st.update_problem {
+        println!("  \x1b[1;33mautoupdate:\x1b[0m {p}");
+    } else if let Some(v) = &st.update_available {
+        if st.auto_update {
+            println!("  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - installing it by itself (autoupdate on)");
+        } else {
+            println!(
+                "  \x1b[1;36mupdate:\x1b[0m meshvpn {v} is available - run: {} (or by itself: {})",
+                config::hint("sudo meshvpn update"),
+                config::hint("sudo meshvpn autoupdate on")
+            );
+        }
     }
     if let Some(ip6) = st.mesh_ip6 {
         println!("  IPv6:         {ip6}");
