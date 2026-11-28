@@ -357,6 +357,13 @@ enum Cmd {
         #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
+    /// Find nodes again whose address changed through public Nostr relays (HTTPS, encrypted, only
+    /// members can read it; on by default): `on`, `off`, or without an argument what it is now.
+    /// Restarts meshvpn.
+    Nostr {
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
     /// Install and start a systemd service so the VPN runs at boot (one per network: all of
     /// this machine's networks, or the one of --net).
     Install,
@@ -2191,7 +2198,8 @@ fn real_main(cli: Cli) -> Result<i32> {
                 println!("Tab completion for bash: {} (in new shells)", path.display());
             }
         }
-        Cmd::Dht { state } => dht_cmd(&dir, state.as_deref().map(|s| s == "on"), json)?,
+        Cmd::Dht { state } => rendezvous_cmd(&dir, false, state.as_deref().map(|s| s == "on"), json)?,
+        Cmd::Nostr { state } => rendezvous_cmd(&dir, true, state.as_deref().map(|s| s == "on"), json)?,
         Cmd::Autoupdate { state } => {
             autoupdate_cmd(&base, &dir, state.as_deref().map(|s| s == "on"), json)?;
         }
@@ -2887,8 +2895,6 @@ fn stop_for_replace(dir: &Path) -> Replaced {
     }
 }
 
-/// `meshvpn dht [on|off]`: shows or changes `dht` in the configuration; a running meshvpn restarts
-/// to use it.
 /// `meshvpn autoupdate [on|off]`: one program for all networks of the machine, so the setting
 /// goes into each one's configuration. Their meshvpn read it at every check: no restart.
 fn autoupdate_cmd(base: &Path, dir: &Path, on: Option<bool>, json: bool) -> Result<()> {
@@ -2957,35 +2963,47 @@ fn autoupdate_cmd(base: &Path, dir: &Path, on: Option<bool>, json: bool) -> Resu
     Ok(())
 }
 
-fn dht_cmd(dir: &Path, on: Option<bool>, json: bool) -> Result<()> {
+/// `meshvpn dht [on|off]` / `meshvpn nostr [on|off]`: shows or changes `dht` / `nostr` in the
+/// configuration; a running meshvpn restarts to use it.
+fn rendezvous_cmd(dir: &Path, nostr: bool, on: Option<bool>, json: bool) -> Result<()> {
     let mut cfg = Config::load(dir)?;
     let net = networks::flag(dir);
+    let (what, cmd) = if nostr {
+        ("Nostr rendezvous", "nostr")
+    } else {
+        ("DHT rendezvous", "dht")
+    };
+    let now = if nostr { cfg.nostr } else { cfg.dht };
     let Some(on) = on else {
         if json {
-            println!("{}", serde_json::json!({ "dht": cfg.dht }));
-        } else if cfg.dht {
-            println!("DHT rendezvous is on (meshvpn{net} status shows what it found).");
+            println!("{}", serde_json::json!({ cmd: now }));
+        } else if now {
+            println!("{what} is on (meshvpn{net} status shows what it found).");
         } else {
             println!(
-                "DHT rendezvous is off - switch it on with: {}",
-                config::hint(&format!("sudo meshvpn{net} dht on"))
+                "{what} is off - switch it on with: {}",
+                config::hint(&format!("sudo meshvpn{net} {cmd} on"))
             );
         }
         return Ok(());
     };
     require_owner()?;
     let word = if on { "on" } else { "off" };
-    if cfg.dht == on {
-        say(json, &format!("DHT rendezvous is {word} already"));
+    if now == on {
+        say(json, &format!("{what} is {word} already"));
         return Ok(());
     }
-    cfg.dht = on;
+    if nostr {
+        cfg.nostr = on;
+    } else {
+        cfg.dht = on;
+    }
     cfg.save(dir)?;
     if !control::is_running(dir) {
-        say(json, &format!("DHT rendezvous {word} - it applies when meshvpn starts"));
+        say(json, &format!("{what} {word} - it applies when meshvpn starts"));
         return Ok(());
     }
-    say(json, &format!("DHT rendezvous {word} - restarting meshvpn to use it"));
+    say(json, &format!("{what} {word} - restarting meshvpn to use it"));
     restart(dir)
         .map_err(|e| anyhow::anyhow!("the setting is saved, but meshvpn didn't restart: {e:#} - restart it yourself"))
 }
@@ -3318,8 +3336,8 @@ fn make_invite(
     let (ticket_key, bind) = keys::one_time_key();
     let (ticket, admins) = invite_ticket(dir, cfg, uses, valid_ms, client, bind)?;
     let ticket_key = ticket.as_ref().map(|_| ticket_key);
-    // Where to meet if neither side can reach the other (only with the DHT on, see node/join.rs).
-    let join = if cfg.dht && control::is_running(dir) {
+    // Where to meet if neither side can reach the other (with the DHT or Nostr on, see node/join.rs).
+    let join = if (cfg.dht || cfg.nostr) && control::is_running(dir) {
         let req = control::Request::RegisterJoin {
             until: now_ms() + valid_ms,
         };

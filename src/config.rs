@@ -325,6 +325,13 @@ pub struct Config {
     /// in company networks may take the traffic for BitTorrent.
     #[serde(default)]
     pub dht: bool,
+    /// The same through public Nostr relays (HTTPS, also through a proxy or an SSH tunnel): on
+    /// by default, as it looks like any other web traffic.
+    #[serde(default = "default_true")]
+    pub nostr: bool,
+    /// Nostr relays to use (`wss://...`). Empty: a built-in list of large public ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nostr_relays: Vec<String>,
     /// Install new releases by themselves (`meshvpn autoupdate on`): checked every few hours,
     /// and when another node runs a newer version. Off by default.
     #[serde(default)]
@@ -413,6 +420,8 @@ impl Config {
             port_mapping: true,
             stun: default_stun(),
             dht: false,
+            nostr: true,
+            nostr_relays: vec![],
             auto_update: false,
             punch: true,
             join: None,
@@ -676,6 +685,12 @@ pub struct JoinHint {
     pub node: crate::keys::NodeId,
     pub v6: Vec<String>,
     pub until: u64,
+    /// Where the inviting node looks for the new one: the DHT (invites from before Nostr say
+    /// nothing: the DHT), Nostr relays.
+    #[serde(default = "default_true")]
+    pub dht: bool,
+    #[serde(default)]
+    pub nostr: bool,
 }
 
 /// An open invite's place, kept by the inviting node.

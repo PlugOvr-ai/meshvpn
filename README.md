@@ -173,8 +173,21 @@ A network needs one node the others can reach. That can be a node at home, and i
   allow permanent forwards are not used. The port is then reachable from the internet: only nodes with the
   network key get past the handshake, but if that isn't wanted (servers in a company or university network,
   notebooks on public Wi-Fi), switch it off with `port_mapping = false`, or join those with `--no-listen`.
-* **Found again after a new address (DHT rendezvous, off by default).** A node others can reach puts its current
-  address into BitTorrent's public DHT. Nodes that lost it (a notebook outside the company network, the other home
+* **Found again after a new address (Nostr relays, on by default).** A node others can reach puts its current
+  address on public [Nostr](https://nostr.com) relays: ordinary web servers, reached over HTTPS (port 443) like any
+  website, also through the proxy `meshvpn install` found and through an SSH tunnel. Nodes that lost it look it up
+  there and connect again, with no DynDNS or server of your own. The entry is the same as in the DHT below:
+  encrypted with the network key (relays see only noise), signed by the node, stored at a place that changes every
+  day. It goes to five large relays run by different people (`nostr_relays = ["wss://...", ...]` in the config for
+  others, e.g. your own), and lookups ask all of them, so a relay that is down or deletes entries doesn't matter.
+  A relay can withhold an entry, but not forge one. Relays that want a login (NIP-42) get one with the entry's key.
+
+  `meshvpn status` shows `rendezvous: Nostr, published … (at 5 of 5 Nostr relays)`, or why no relay was reached
+  (behind a proxy that wants a login in the browser: log in there). Each relay's operator sees that this address
+  stores and asks for small encrypted entries, as with any website. `sudo meshvpn nostr off` switches it off
+  (`meshvpn nostr` shows the setting); it restarts meshvpn.
+* **Found again after a new address (DHT rendezvous, off by default).** The same through BitTorrent's public DHT,
+  with no relays at all. A node others can reach puts its current address into the DHT. Nodes that lost it (a notebook outside the company network, the other home
   after the nightly reconnect) look it up there and connect again. No DynDNS or server needed. The entry is
   encrypted with the network key and signed by the node: only members can read it, and they can't forge each
   other's entries. Where it is stored changes every day, and after a ban the banned node can't find it anymore.
@@ -204,23 +217,23 @@ A network needs one node the others can reach. That can be a node at home, and i
   `stun = [...]` in the config, `stun = []` for none. Each request tells the server's operator that this address
   runs meshvpn.
 
-None of this goes through a configured proxy or SSH tunnel: those nodes keep using only them.
+None of this except the Nostr relays goes through a configured proxy or SSH tunnel: those nodes keep using only them.
 
 * **Hole punching over IPv6.** Two nodes that both can't accept connections (a home router without a port
   forward, a mobile network) connect anyway if both have IPv6: each sends to the other's IPv6 address from its own
   port 7870 at the same time, so each one's firewall lets the other's packets in. That gives the direct UDP path
-  and, by TCP simultaneous open, the link that carries records and control. The addresses come from the DHT
-  rendezvous (with `dht = true`; nodes put their *temporary* IPv6 addresses into their entry, which change every
+  and, by TCP simultaneous open, the link that carries records and control. The addresses come from the
+  rendezvous (Nostr relays, or the DHT with `dht = true`; nodes put their *temporary* IPv6 addresses into their entry, which change every
   day or so and don't identify the machine, also nodes nobody can connect to) or, while they still hold, from the
   node's last record. Tried for nodes heard of in the last day: for a quarter of an hour all the time, then only in
   the first minute of every five by the clock (so both sides try at the same moment). The log says
   `hole punching: TCP link to <node> via [...]`. Off with `punch = false` (e.g. on a company notebook, where
   repeated connection attempts to home addresses may stand out).
 
-* **Joining that way too.** An invite made on a node with `dht = true` carries a join hint: a secret slot, the
-  node's id and its IPv6 addresses. A new node that can't reach the inviting node puts its own IPv6 addresses into
-  the DHT at the slot (sealed and signed like a rendezvous entry; it uses the DHT for this one meeting whatever its
-  own setting) and tries the inviting node's addresses; the inviting node looks there while the invite is open
+* **Joining that way too.** An invite made on a node with Nostr relays or the DHT on carries a join hint: a secret
+  slot, the node's id, its IPv6 addresses and which of the two it uses. A new node that can't reach the inviting
+  node puts its own IPv6 addresses there at the slot (sealed and signed like a rendezvous entry; it uses them for
+  this one meeting whatever its own settings) and tries the inviting node's addresses; the inviting node looks there while the invite is open
   (every 30 seconds for the first half hour, then every two minutes) and tries back. The join then runs over the
   punched link as usual. The new node logs `joining: waiting for the inviting node at ...`, the inviting one
   `joining: a new node (...) waits at ...`.
@@ -691,7 +704,7 @@ created before the ban stop working, so create new ones with `meshvpn invite`. I
 | Discovery | Nodes sign a record (name, endpoints, neighbors, sequence number) and gossip all records they know. A new link gets the full table; changes are flooded. The state is saved to disk, so the mesh survives losing the bootstrap node. |
 | Connectivity | Every node dials every other node's advertised endpoints (with backoff). Endpoints are configured, auto-detected (LAN IP, public IP as seen by peers or STUN servers, the port opened on the home router with UPnP/PCP/NAT-PMP) or the SSH tunnel's public port. |
 | Hole punching (IPv6) | Towards nodes without a link: UDP probes and TCP connects from the fixed port (`listen` port) to their global IPv6 addresses, from the rendezvous or the node's record (heard of within a day); stateful firewalls let the crossing packets in. Both ends get the TCP connection from connect() (simultaneous open), so the lower node id starts the Noise handshake. |
-| Rendezvous | Nodes with endpoints (and every node with global IPv6 addresses, for hole punching) put them into BitTorrent's Mainline DHT (BEP 44 mutable item, every 30 minutes and when they change): under a key and salt derived from the network key, the node id and the day; XChaCha20-Poly1305 with a key from the network key; signed by the node and dated (older than 75 minutes is ignored). After a put, the node looks its entry up itself and puts it again soon if a lookup still finds an older one. Nodes look up those they lost (every 2 minutes while they have no link or the node has been gone less than 15 minutes, 10 minutes otherwise, hourly for nodes gone for a day) and dial the addresses found first; for hole punching they use the newer of entry and record, all addresses at once. The DHT client never answers or stores anything for others. |
+| Rendezvous | The same entries go to Nostr relays (on by default) and the DHT (`dht = true`); lookups ask both and use the newest. On Nostr an entry is an addressable event (kind 30078) signed with a secp256k1 key derived from the DHT key seed (BIP-340), with the DHT salt as its `d` tag, the sealed value as base64 content and an `expiration` tag (NIP-40) 3 hours on; it goes to every relay over WebSocket (TLS, through `https_proxy` or the SSH tunnel's SOCKS proxy), lookups ask every relay in one request and check each event's signature and place. Nodes with endpoints (and every node with global IPv6 addresses, for hole punching) put them into BitTorrent's Mainline DHT (BEP 44 mutable item, every 30 minutes and when they change): under a key and salt derived from the network key, the node id and the day; XChaCha20-Poly1305 with a key from the network key; signed by the node and dated (older than 75 minutes is ignored). After a put, the node looks its entry up itself and puts it again soon if a lookup still finds an older one. Nodes look up those they lost (every 2 minutes while they have no link or the node has been gone less than 15 minutes, 10 minutes otherwise, hourly for nodes gone for a day) and dial the addresses found first; for hole punching they use the newer of entry and record, all addresses at once. The DHT client never answers or stores anything for others. |
 | Relaying | Records list each node's neighbors. Nodes that can't connect directly are reached by a shortest path (BFS) through other nodes. |
 | Encryption | Hop-by-hop Noise encryption, plus end-to-end XChaCha20-Poly1305 per packet (a static-static X25519 key bound to the network id). Relays can't read or forge traffic, and the inner source IP must match the sender. |
 | Names | `<name>.mesh` entries in a marked block of `/etc/hosts` (`manage_hosts = false` to disable); `<name>.<network>.mesh` for a further network of the machine. If several nodes publish the same name, one has it and the others are `<name>-<id>.mesh`: the node that has the name keeps it while it is online; once it is offline, a node of that name that is online gets it (a machine set up again takes over from its old identity, without anybody doing anything). A client (a user's computer, `invite --client`) never gets a name a node has, online or not. `localhost`, `wpad` and a few more names that programs look up on their own are entered with `.mesh` only. |

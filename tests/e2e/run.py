@@ -148,7 +148,9 @@ class Lab:
     def node(self, name, networks, caps=True, sysctls=(), ip=None, install=True, net_admin=False, cmd=None, image=IMAGE,
              extra=()):
         c = f"{self.prefix}-{name}"
-        args = ["docker", "run", "-d", "--name", c, "--hostname", name, "--network", networks[0]]
+        # No Nostr relays unless a test starts its own (never the public ones).
+        args = ["docker", "run", "-d", "--name", c, "--hostname", name, "--network", networks[0],
+                "-e", "MESHVPN_TEST_NOSTR_RELAYS="]
         if ip:
             args += ["--ip", ip]
         if caps:
@@ -1157,6 +1159,92 @@ def test_rendezvous(lab):
     wait(lambda: "198.51.103.20" in (b.peer("hub") or {}).get("path", ""),
          "b connected to the hub at its new address", timeout=300, interval=3)
     check("rendezvous: hub" in b.log(), "found through the rendezvous")
+
+
+def nostr_relay(lab, networks, auth=False):
+    """A Nostr relay (tests/e2e/fixtures/nostr_relay.py) on ws://<container>:7777 and an HTTP
+    proxy on :3128; returns (node, relay URL)."""
+    relay = lab.node("relay", networks, caps=False, install=False)
+    run(["docker", "cp", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "nostr_relay.py"),
+         f"{relay.c}:/nostr_relay.py"])
+    run(["docker", "exec", "-d", relay.c, "sh", "-c",
+         f"python3 /nostr_relay.py --port 7777 {'--auth' if auth else ''} > /relay.log 2>&1"])
+    run(["docker", "exec", "-d", relay.c, "sh", "-c", "python3 /nostr_relay.py --connect-proxy 3128 > /proxy.log 2>&1"])
+    wait(lambda: "relay on" in relay.sh("cat /relay.log") and "proxy on" in relay.sh("cat /proxy.log"), "relay running", 20)
+    return relay, f"ws://{relay.c}:7777"
+
+
+@test
+def test_nostr_rendezvous(lab):
+    """The hub gets a new address; a node that only dials out, and reaches the relay only through
+    an HTTP proxy, finds it again through a Nostr relay that wants a login (NIP-42)."""
+    net = lab.network("pub", subnet="198.51.104.0/24")
+    relay, url = nostr_relay(lab, [net], auth=True)
+    hub = lab.node("hub", [net], ip="198.51.104.10")
+    b = lab.node("b", [net])
+    env = f"MESHVPN_TEST_NOSTR_RELAYS={url}"
+    hub.mv("init --name hub")
+    hub.up(env)
+    b.mv(f"join {invite(hub)} --name b --no-listen")
+    # b gets to the relay only through the proxy.
+    b.sh(f"iptables -A OUTPUT -p tcp -d {relay.net_ip(net)} --dport 7777 -j REJECT")
+    b.up(f"{env} http_proxy=http://{relay.c}:3128")
+    wait(lambda: hub.online("b"), "b online")
+    check("Nostr rendezvous is on" in b.mv("nostr"), "on by default")
+    wait(lambda: "published 198.51.104.10:7870" in (hub.status().get("rendezvous") or ""),
+         "hub's entry at the relay", timeout=120, interval=2)
+    r = hub.status()["rendezvous"]
+    check(r.startswith("Nostr,") and "at 1 of 1 Nostr relays" in r, f"status: {r}")
+    log = relay.sh("cat /relay.log")
+    check('"kind": 30078' in log, "events at the relay")
+    check("198.51.104.10" not in log and '"hub"' not in log, "the relay sees no addresses or names")
+    # A new address from the provider: everything b knows about the hub is out of date.
+    hub.stop()
+    run(["docker", "network", "disconnect", net, hub.c])
+    run(["docker", "network", "connect", "--ip", "198.51.104.20", net, hub.c])
+    hub.up(env)
+    wait(lambda: "published 198.51.104.20:7870" in (hub.status().get("rendezvous") or ""),
+         "hub's new entry", timeout=120, interval=2)
+    wait(lambda: "198.51.104.20" in (b.peer("hub") or {}).get("path", ""),
+         "b connected to the hub at its new address", timeout=300, interval=3)
+    check("rendezvous: hub" in b.log(), "found through the rendezvous")
+    check("7777" in relay.sh("cat /proxy.log"), "b went through the proxy")
+    # Switched off: no rendezvous in status.
+    b.stop()
+    check("applies when meshvpn starts" in b.mv("nostr off"), "switched off")
+    b.up(f"{env} http_proxy=http://{relay.c}:3128")
+    check(b.status().get("rendezvous") is None and "is off" in b.mv("nostr"), "off")
+
+
+@test
+def test_join_nostr(lab):
+    """A new node joins although neither it nor the inviting node can be reached: they meet
+    through a Nostr relay (the invite's join slot) and hole punching over IPv6."""
+    na, nb = lab.network("a4"), lab.network("b4")
+    v6 = lab.network("v6", ipv6_only=True, subnet="2001:db8:7a::/64")
+    relay, url = nostr_relay(lab, [na, nb])
+    a, b = lab.node("a", [na, v6]), lab.node("b", [nb, v6])
+    for n in (a, b):
+        n.sh("""
+            ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
+            ip6tables -A INPUT -i lo -j ACCEPT
+            ip6tables -A INPUT -j DROP
+        """)
+    env = f"MESHVPN_TEST_NOSTR_RELAYS={url}"
+    a.mv("init --name a")
+    a.up(env)
+    inv = invite(a)
+    body = inv.strip().removeprefix("mesh1-")
+    data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    hint = data.get("join") or {}
+    check(hint.get("v6") and hint.get("nostr") and not hint.get("dht"), f"the invite carries a Nostr join hint: {hint}")
+    b.mv(f"join {inv} --name b")
+    b.up(env)
+    wait(lambda: a.online("b") and b.online("a"), "b joined", timeout=180, interval=2)
+    check("Nostr relays" in b.log(), "b waited at the join slot on the relay")
+    check("hole punching: TCP link" in a.log() + b.log(), "the link came from hole punching")
+    check(ping(b, "a.mesh", 3), "traffic between them")
 
 
 @test
@@ -3117,7 +3205,8 @@ def test_desktop_full_container(lab):
     def start(image, *extra):
         c = f"{lab.prefix}-box"
         run(["docker", "rm", "-f", c], ok=False)
-        run(["docker", "run", "-d", "--name", c, "--hostname", "box", "--network", net, *extra, image, "sleep", "infinity"])
+        run(["docker", "run", "-d", "--name", c, "--hostname", "box", "--network", net, "-e", "MESHVPN_TEST_NOSTR_RELAYS=",
+             *extra, image, "sleep", "infinity"])
         if c not in lab.containers:
             lab.containers.append(c)
         return Node(lab, "box", c)

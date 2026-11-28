@@ -16,6 +16,9 @@
 //! time it is needed. Off by default (`dht = true` in the config switches it on: firewalls in
 //! company networks may take the traffic for BitTorrent); never through a proxy or SSH tunnel,
 //! which have no way out for UDP.
+//!
+//! The same entries go to public Nostr relays (see `nostr`), on by default: HTTPS like any web
+//! traffic, also through a proxy or an SSH tunnel. Lookups ask both and take the newest entry.
 
 use super::*;
 use chacha20poly1305::aead::Aead;
@@ -84,7 +87,19 @@ pub(super) fn derive(context: &str, parts: &[&[u8]]) -> [u8; 32] {
 
 /// The DHT key pair of a network for a day: every member can work it out, nobody else.
 fn signing_key(net_key: &[u8; 32], day: u64) -> SigningKey {
-    SigningKey::from_bytes(&derive("meshvpn rendezvous v1 key", &[net_key, &day.to_be_bytes()]))
+    SigningKey::from_bytes(&key_seed(net_key, day))
+}
+
+fn key_seed(net_key: &[u8; 32], day: u64) -> [u8; 32] {
+    derive("meshvpn rendezvous v1 key", &[net_key, &day.to_be_bytes()])
+}
+
+/// One node's entry of a day on Nostr relays: the DHT's key seed and salt.
+fn place(net_key: &[u8; 32], day: u64, id: &NodeId) -> nostr::Place {
+    nostr::Place {
+        seed: key_seed(net_key, day),
+        salt: salt(net_key, day, id),
+    }
 }
 
 /// Where one node's entry is (the salt, under the network's key of the day).
@@ -208,11 +223,39 @@ pub(super) struct RendezvousState {
     put_at: Option<Instant>,
     stored_at: u32,
     visible: Option<bool>,
+    /// The last put to Nostr relays: when, and at how many.
+    nostr_put: Option<(Instant, nostr::Put)>,
+    /// No relay answered the last lookup.
+    nostr_error: Option<String>,
+    /// The newest entry found per node (its time): an older one found later doesn't win.
+    found_at: HashMap<NodeId, u64>,
 }
 
 impl Node {
+    /// The DHT or Nostr relays.
     pub(super) fn rendezvous_enabled(&self) -> bool {
+        self.dht_enabled() || self.nostr_enabled()
+    }
+
+    pub(super) fn dht_enabled(&self) -> bool {
         self.cfg.dht && !self.cfg.no_outbound && self.cfg.effective_socks().is_none()
+    }
+
+    /// Nostr relays: also through the SSH tunnel's SOCKS proxy.
+    pub(super) fn nostr_enabled(&self) -> bool {
+        self.cfg.nostr && !self.cfg.no_outbound && !self.nostr_relays().is_empty()
+    }
+
+    pub(super) fn nostr_relays(&self) -> Vec<String> {
+        // Tests: their own relay, or none (empty).
+        if let Ok(list) = std::env::var("MESHVPN_TEST_NOSTR_RELAYS") {
+            return list.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+        }
+        if self.cfg.nostr_relays.is_empty() {
+            nostr::DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
+        } else {
+            self.cfg.nostr_relays.clone()
+        }
     }
 
     pub(super) fn current_key(st: &State) -> Option<[u8; 32]> {
@@ -319,79 +362,153 @@ impl Node {
         if publish.is_none() && lookups.is_empty() {
             return;
         }
-        let Some(dht) = self.dht().await else {
+        let dht = if self.dht_enabled() { self.dht().await } else { None };
+        let nostr = self.nostr_enabled();
+        if dht.is_none() && !nostr {
             let mut st = self.state.lock().unwrap();
             st.rendezvous.publishing = false;
             st.rendezvous.running = st.rendezvous.running.saturating_sub(lookups.len());
             return;
-        };
+        }
         if let Some((key, endpoints, v6, all)) = publish {
             let node = self.clone();
             let dht = dht.clone();
             tokio::spawn(async move {
-                let ok = node.rendezvous_publish(&dht, &key, &endpoints, &v6, now).await;
-                // Look it up ourselves: does a lookup find this version, or still an older one?
-                let visible = match ok {
-                    Ok(_) => Some(node.rendezvous_readback(&dht, &key, now).await),
-                    Err(_) => None,
+                let in_dht = async {
+                    let dht = dht.as_ref()?;
+                    let ok = node.rendezvous_publish(dht, &key, &endpoints, &v6, now).await;
+                    // Look it up ourselves: does a lookup find this version, or still an older one?
+                    let visible = match ok {
+                        Ok(_) => Some(node.rendezvous_readback(dht, &key, now).await),
+                        Err(_) => None,
+                    };
+                    Some((ok, visible))
                 };
+                let on_nostr = async {
+                    if !nostr {
+                        return None;
+                    }
+                    let value = seal(&key, &node.ident, &node.net, now, &endpoints, &v6)?;
+                    let p = place(&key, day(now), &node.ident.id);
+                    let put =
+                        nostr::put(&node.nostr_relays(), node.cfg.effective_socks(), &p, &value, now / 1000).await;
+                    debug!("rendezvous: published to {} of {} Nostr relays", put.ok, put.tried);
+                    Some(put)
+                };
+                let (in_dht, on_nostr) = tokio::join!(in_dht, on_nostr);
                 let mut st = node.state.lock().unwrap();
                 st.rendezvous.publishing = false;
-                match ok {
-                    Ok(stored) => {
-                        st.rendezvous.put_at = Some(Instant::now());
-                        st.rendezvous.stored_at = stored;
-                        st.rendezvous.visible = visible;
-                        if visible == Some(false) {
-                            info!(
-                                "rendezvous: published, but a lookup still finds an older entry - again in 2 minutes"
-                            );
+                // Again soon, not in half an hour, if it reached few places.
+                let mut soon = false;
+                let mut stored = false;
+                if let Some(put) = on_nostr {
+                    stored |= put.ok > 0;
+                    soon |= put.ok == 0;
+                    st.rendezvous.nostr_put = Some((Instant::now(), put));
+                }
+                if let Some((ok, visible)) = in_dht {
+                    match ok {
+                        Ok(n) => {
+                            stored = true;
+                            st.rendezvous.put_at = Some(Instant::now());
+                            st.rendezvous.stored_at = n;
+                            st.rendezvous.visible = visible;
+                            if visible == Some(false) {
+                                info!(
+                                    "rendezvous: published, but a DHT lookup still finds an older entry - again in 2 minutes"
+                                );
+                            }
+                            soon |= n < MIN_STORED || visible == Some(false);
+                            st.rendezvous.error = None;
                         }
-                        // Stored at few nodes or not found: again soon, not in half an hour.
-                        let at = if stored < MIN_STORED || visible == Some(false) {
-                            Instant::now().checked_sub(PUBLISH_EVERY - Duration::from_secs(120))
-                        } else {
-                            None
-                        };
-                        st.rendezvous.published = Some((all, at.unwrap_or_else(Instant::now), day(now)));
-                        st.rendezvous.error = None;
+                        Err(e) => {
+                            debug!("rendezvous: publishing to the DHT failed: {e:#}");
+                            st.rendezvous.error = Some(format!("{e:#}"));
+                            soon = true;
+                        }
                     }
-                    Err(e) => {
-                        debug!("rendezvous: publishing failed: {e:#}");
-                        st.rendezvous.error = Some(format!("{e:#}"));
-                    }
+                }
+                if stored {
+                    let at = if soon {
+                        Instant::now().checked_sub(PUBLISH_EVERY - Duration::from_secs(120))
+                    } else {
+                        None
+                    };
+                    st.rendezvous.published = Some((all, at.unwrap_or_else(Instant::now), day(now)));
                 }
             });
         }
+        if nostr && !lookups.is_empty() {
+            // All at once: one request per relay, today's and yesterday's place of each node.
+            let node = self.clone();
+            let ids: Vec<(NodeId, [u8; 32])> = lookups.clone();
+            let no_dht = dht.is_none();
+            tokio::spawn(async move {
+                let now = now_ms();
+                let mut places = vec![];
+                for (id, key) in ids.iter().take(nostr::MAX_PLACES / 2) {
+                    for d in [day(now), day(now).saturating_sub(1)] {
+                        places.push((*id, *key, place(key, d, id)));
+                    }
+                }
+                let only: Vec<nostr::Place> = places.iter().map(|(_, _, p)| *p).collect();
+                let (found, error) = nostr::get(&node.nostr_relays(), node.cfg.effective_socks(), &only).await;
+                node.state.lock().unwrap().rendezvous.nostr_error = error;
+                for ((id, key, _), f) in places.iter().zip(found) {
+                    if let Some((value, _)) = f
+                        && let Some(found) = open(key, &value, id, &node.net, now_ms())
+                    {
+                        node.rendezvous_found(*id, found);
+                    }
+                }
+                if no_dht {
+                    let mut st = node.state.lock().unwrap();
+                    st.rendezvous.running = st.rendezvous.running.saturating_sub(ids.len());
+                }
+            });
+        }
+        let Some(dht) = dht else { return };
         for (id, key) in lookups {
             let node = self.clone();
             let dht = dht.clone();
             tokio::spawn(async move {
                 let found = node.rendezvous_lookup(&dht, &key, &id).await;
-                let mut st = node.state.lock().unwrap();
-                st.rendezvous.running = st.rendezvous.running.saturating_sub(1);
+                {
+                    let mut st = node.state.lock().unwrap();
+                    st.rendezvous.running = st.rendezvous.running.saturating_sub(1);
+                }
                 if let Some(found) = found {
-                    let name = st.records.get(&id).map(|r| r.info.name.clone()).unwrap_or_default();
-                    let known = st.dht_hints.get(&id).is_some_and(|(e, _)| *e == found.ep)
-                        && st.punch_hints.get(&id).is_some_and(|(v, _, _)| *v == found.v6);
-                    if !known {
-                        let mut all = found.ep.clone();
-                        all.extend(found.v6.iter().map(|a| a.to_string()));
-                        info!("rendezvous: {name} ({id}) is at {}", all.join(", "));
-                    }
-                    if !found.ep.is_empty() {
-                        st.dht_hints.insert(id, (found.ep, Instant::now()));
-                    }
-                    if !found.v6.is_empty() {
-                        st.punch_hints.insert(id, (found.v6, Instant::now(), found.at));
-                    }
-                    // Try the new address now, not at the next backoff step.
-                    st.backoff.remove(&id.hex());
-                    drop(st);
-                    node.dial_now();
+                    node.rendezvous_found(id, found);
                 }
             });
         }
+    }
+
+    /// A node's entry found (in the DHT or at a relay): try its addresses now.
+    fn rendezvous_found(self: &Arc<Self>, id: NodeId, found: Found) {
+        let mut st = self.state.lock().unwrap();
+        if st.rendezvous.found_at.get(&id).is_some_and(|at| *at > found.at) {
+            return;
+        }
+        st.rendezvous.found_at.insert(id, found.at);
+        let name = st.records.get(&id).map(|r| r.info.name.clone()).unwrap_or_default();
+        let known = st.dht_hints.get(&id).is_some_and(|(e, _)| *e == found.ep)
+            && st.punch_hints.get(&id).is_some_and(|(v, _, _)| *v == found.v6);
+        if !known {
+            let mut all = found.ep.clone();
+            all.extend(found.v6.iter().map(|a| a.to_string()));
+            info!("rendezvous: {name} ({id}) is at {}", all.join(", "));
+        }
+        if !found.ep.is_empty() {
+            st.dht_hints.insert(id, (found.ep, Instant::now()));
+        }
+        if !found.v6.is_empty() {
+            st.punch_hints.insert(id, (found.v6, Instant::now(), found.at));
+        }
+        // Try the new address now, not at the next backoff step.
+        st.backoff.remove(&id.hex());
+        drop(st);
+        self.dial_now();
     }
 
     /// Puts our entry; how many DHT nodes stored it.
@@ -444,13 +561,15 @@ impl Node {
 
     /// For `status`.
     pub(super) fn rendezvous_status(&self, st: &State) -> Option<String> {
-        // A new node meeting the one that invited it uses the DHT whatever its own setting.
+        // A new node meeting the one that invited it uses what the invite says, whatever its own
+        // setting.
         let joining = self.cfg.join.as_ref().filter(|h| {
             st.links.is_empty() && !st.records.keys().any(|id| *id != self.ident.id) && now_ms() <= h.until
         });
         if let Some(h) = joining {
             return Some(format!(
-                "DHT, joining: waiting for the inviting node at {} (for {}; this usually takes a few minutes)",
+                "{}, joining: waiting for the inviting node at {} (for {}; this usually takes a few minutes)",
+                label(h.dht, h.nostr),
                 h.v6.join(", "),
                 ago(self.started.elapsed().as_secs())
             ));
@@ -458,6 +577,7 @@ impl Node {
         if !self.rendezvous_enabled() {
             return None;
         }
+        let (dht, nostr) = (self.dht_enabled(), self.nostr_enabled());
         let r = &st.rendezvous;
         let mut parts = vec![];
         // Nodes gone lately: what is being done to find them again.
@@ -493,20 +613,30 @@ impl Node {
                 ago(seen.as_secs())
             ));
         }
-        match (&r.published, r.put_at) {
-            (Some((ep, _, _)), Some(at)) => {
-                let check = match r.visible {
-                    Some(true) => format!(", stored at {} DHT nodes, found by a lookup", r.stored_at),
-                    Some(false) => format!(
-                        ", stored at {} DHT nodes, but a lookup still finds an older entry (trying again)",
-                        r.stored_at
-                    ),
-                    None => String::new(),
-                };
+        let nostr_put = r.nostr_put.as_ref().filter(|_| nostr);
+        let dht_at = r.put_at.filter(|_| dht);
+        match &r.published {
+            Some((ep, _, _)) if dht_at.is_some() || nostr_put.is_some_and(|(_, p)| p.ok > 0) => {
+                let mut how = vec![];
+                if dht_at.is_some() {
+                    how.push(match r.visible {
+                        Some(true) => format!("stored at {} DHT nodes, found by a lookup", r.stored_at),
+                        Some(false) => format!(
+                            "stored at {} DHT nodes, but a lookup still finds an older entry (trying again)",
+                            r.stored_at
+                        ),
+                        None => format!("stored at {} DHT nodes", r.stored_at),
+                    });
+                }
+                if let Some((_, p)) = nostr_put {
+                    how.push(format!("at {} of {} Nostr relays", p.ok, p.tried));
+                }
+                let at = [dht_at, nostr_put.map(|(t, _)| *t)].into_iter().flatten().max();
                 parts.push(format!(
-                    "published {} ({} ago{check})",
+                    "published {} ({} ago; {})",
                     ep.join(", "),
-                    ago(at.elapsed().as_secs())
+                    ago(at.map_or(0, |t| t.elapsed().as_secs())),
+                    how.join(", ")
                 ))
             }
             _ if st.my_endpoints.is_empty() && self.punch_candidates().is_empty() => {}
@@ -516,13 +646,33 @@ impl Node {
         if found > 0 {
             parts.push(format!("found {found} node(s) there"));
         }
-        if let Some(e) = &r.error {
+        if let Some(e) = r.error.as_ref().filter(|_| dht) {
             parts.push(format!("last error: {e}"));
+        }
+        // No relay took the entry, or none answered a lookup.
+        let relay_error = nostr_put
+            .filter(|(_, p)| p.ok == 0)
+            .and_then(|(_, p)| p.error.clone())
+            .or_else(|| r.nostr_error.clone())
+            .filter(|_| nostr);
+        if let Some(e) = relay_error {
+            parts.push(format!(
+                "last error: no Nostr relay reached ({e}; behind a proxy that wants a login in the browser? log in there)"
+            ));
         }
         if parts.is_empty() {
             parts.push("ready (used once a node is gone)".into());
         }
-        Some(format!("DHT, {}", parts.join("; ")))
+        Some(format!("{}, {}", label(dht, nostr), parts.join("; ")))
+    }
+}
+
+/// What the rendezvous uses, for `status`.
+fn label(dht: bool, nostr: bool) -> &'static str {
+    match (dht, nostr) {
+        (true, true) => "DHT and Nostr",
+        (true, false) => "DHT",
+        _ => "Nostr",
     }
 }
 

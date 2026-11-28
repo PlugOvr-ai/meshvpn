@@ -8,9 +8,10 @@
 //! open, the inviting node looks there and tries back. The join itself then runs over the punched
 //! link as always (ticket, admission).
 //!
-//! Only invites made where the DHT is on carry a hint (`dht = true`); the new node uses the DHT
-//! for this one meeting whatever its own setting. Places are looked at every 30 seconds for the
-//! first half hour of an invite, then every two minutes, until it expires.
+//! Only invites made where the DHT or Nostr is on carry a hint, and it says which (the new node
+//! uses those for this one meeting whatever its own settings). The same place is a Nostr event
+//! (see `nostr`). Places are looked at every 30 seconds for the first half hour of an invite, then
+//! every two minutes, until it expires.
 
 use super::*;
 use crate::config::{JoinHint, JoinSlot};
@@ -27,9 +28,18 @@ const MAX_HINT_MS: u64 = 7 * 86_400_000;
 
 /// The DHT place of a join slot: key pair and salt, from the network key and the slot.
 fn place(net_key: &[u8; 32], slot: &str) -> (SigningKey, [u8; 20]) {
-    let key = rendezvous::derive("meshvpn join v1 key", &[net_key, slot.as_bytes()]);
+    let p = nostr_place(net_key, slot);
+    (SigningKey::from_bytes(&p.seed), p.salt)
+}
+
+/// The same place for Nostr relays.
+fn nostr_place(net_key: &[u8; 32], slot: &str) -> nostr::Place {
+    let seed = rendezvous::derive("meshvpn join v1 key", &[net_key, slot.as_bytes()]);
     let salt = rendezvous::derive("meshvpn join v1 salt", &[net_key, slot.as_bytes()]);
-    (SigningKey::from_bytes(&key), salt[..20].try_into().unwrap())
+    nostr::Place {
+        seed,
+        salt: salt[..20].try_into().unwrap(),
+    }
 }
 
 impl Node {
@@ -51,7 +61,7 @@ impl Node {
     /// `meshvpn invite`: a slot for the new node to meet this one (kept until `until`).
     pub fn register_join(&self, until: u64) -> Result<JoinHint> {
         if !self.rendezvous_enabled() {
-            bail!("the DHT is off here (dht = false)");
+            bail!("the DHT and Nostr are off here (dht = false, nostr = false)");
         }
         let v6 = self.join_addresses();
         if v6.is_empty() {
@@ -77,6 +87,8 @@ impl Node {
             node: self.ident.id,
             v6,
             until,
+            dht: self.dht_enabled(),
+            nostr: self.nostr_enabled(),
         })
     }
 
@@ -131,22 +143,43 @@ impl Node {
         if v6.is_empty() {
             return;
         }
-        let Some(dht) = self.dht().await else { return };
         let Some(value) = rendezvous::seal(&key, &self.ident, &self.net, now, &[], &v6) else {
             return;
         };
-        let (signer, salt) = place(&key, &hint.slot);
-        let item = MutableItem::new(signer, &value, (now / 1000) as i64, Some(&salt));
-        match dht.put_mutable(item, None).await {
-            Ok(out) => {
-                *last_put = Some(Instant::now());
-                info!(
-                    "joining: waiting for the inviting node at {} (our addresses in the DHT at {} nodes)",
-                    hint.v6.join(", "),
-                    out.stored_at
-                );
+        let mut at = vec![];
+        if hint.nostr && !self.cfg.no_outbound {
+            let relays = self.nostr_relays();
+            let put = nostr::put(
+                &relays,
+                self.cfg.effective_socks(),
+                &nostr_place(&key, &hint.slot),
+                &value,
+                now / 1000,
+            )
+            .await;
+            if put.ok > 0 {
+                at.push(format!("at {} of {} Nostr relays", put.ok, put.tried));
+            } else if let Some(e) = put.error {
+                debug!("joining: putting our addresses on Nostr relays: {e}");
             }
-            Err(e) => debug!("joining: putting our addresses: {e}"),
+        }
+        if hint.dht
+            && let Some(dht) = self.dht().await
+        {
+            let (signer, salt) = place(&key, &hint.slot);
+            let item = MutableItem::new(signer, &value, (now / 1000) as i64, Some(&salt));
+            match dht.put_mutable(item, None).await {
+                Ok(out) => at.push(format!("in the DHT at {} nodes", out.stored_at)),
+                Err(e) => debug!("joining: putting our addresses in the DHT: {e}"),
+            }
+        }
+        if !at.is_empty() {
+            *last_put = Some(Instant::now());
+            info!(
+                "joining: waiting for the inviting node at {} (our addresses {})",
+                hint.v6.join(", "),
+                at.join(", ")
+            );
         }
     }
 
@@ -186,15 +219,33 @@ impl Node {
         if due.is_empty() {
             return;
         }
-        let Some(dht) = self.dht().await else { return };
-        for slot in due {
+        for slot in &due {
             looked.insert(slot.clone(), Instant::now());
-            let (signer, salt) = place(&key, &slot);
-            let public = signer.verifying_key().to_bytes();
-            let Some(item) = dht.get_mutable_most_recent(&public, Some(&salt)).await else {
-                continue;
-            };
-            let Some((id, found)) = rendezvous::open_entry(&key, item.value(), &self.net, now_ms()) else {
+        }
+        // What is at the places: Nostr relays (all at once), the DHT (one by one).
+        let mut values: Vec<Vec<u8>> = vec![];
+        if self.nostr_enabled() {
+            let places: Vec<nostr::Place> = due
+                .iter()
+                .take(nostr::MAX_PLACES)
+                .map(|slot| nostr_place(&key, slot))
+                .collect();
+            let (found, _) = nostr::get(&self.nostr_relays(), self.cfg.effective_socks(), &places).await;
+            values.extend(found.into_iter().flatten().map(|(v, _)| v));
+        }
+        if self.dht_enabled()
+            && let Some(dht) = self.dht().await
+        {
+            for slot in &due {
+                let (signer, salt) = place(&key, slot);
+                let public = signer.verifying_key().to_bytes();
+                if let Some(item) = dht.get_mutable_most_recent(&public, Some(&salt)).await {
+                    values.push(item.value().to_vec());
+                }
+            }
+        }
+        for value in values {
+            let Some((id, found)) = rendezvous::open_entry(&key, &value, &self.net, now_ms()) else {
                 continue;
             };
             if id == self.ident.id || self.state.lock().unwrap().links.contains_key(&id) {

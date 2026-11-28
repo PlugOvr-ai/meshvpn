@@ -8,6 +8,17 @@ puts the section at the top of the release notes.
 Sections: **Added**, **Changed**, **Fixed**, **Security**, **Removed**. Security fixes say what an
 attacker needed and what they could do.
 
+## [0.34.15] - 2026-11-28
+
+### Added
+- **Nodes find each other again through Nostr relays** (on by default): the rendezvous entry that so far went only
+  into the BitTorrent DHT (off by default) now also goes to five large public Nostr relays, over HTTPS like any
+  website. That works through a company's proxy and an SSH tunnel and doesn't look like BitTorrent to firewalls.
+  A node whose address changed (nightly reconnect, a notebook on another network) is found again without
+  `dht = true`. Entries are encrypted and signed as in the DHT: relays see only noise and can't forge one.
+  Invites carry a Nostr join hint, so two nodes neither of which can be reached meet that way too.
+  `meshvpn nostr on|off`; `nostr_relays = [...]` in the config for other relays.
+
 ## [0.34.14] - 2026-11-26
 
 0.34.13 was not published (a test failed in the release run: a routing loop, fixed here); its changes are in here.

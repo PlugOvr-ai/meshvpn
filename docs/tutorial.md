@@ -456,6 +456,8 @@ Logs: `journalctl -u meshvpn -f` (service), `/var/log/meshvpn.log` (background d
 | `endpoints = ["host:7870"]` | addresses others use to reach this node |
 | `udp = false` | no direct UDP paths (TCP and relays only) |
 | `port_mapping = false` | don't open the port on the home router (UPnP/PCP/NAT-PMP) |
+| `nostr = false` | don't use Nostr relays to find nodes whose address changed (on by default; see the README, "Without any server") |
+| `nostr_relays = ["wss://..."]` | which Nostr relays (default: five large public ones) |
 | `dht = true` | find nodes whose address changed through the BitTorrent DHT (off by default; see the README, "Without any server") |
 | `punch = false` | no hole punching over IPv6 towards nodes without a link |
 | `stun = []` | don't ask STUN servers for the public address (default: Google's and Cloudflare's) |

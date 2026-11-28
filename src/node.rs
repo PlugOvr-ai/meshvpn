@@ -27,6 +27,7 @@ pub(crate) use exit::clear_exit_routes;
 mod ext;
 mod gpu;
 mod join;
+mod nostr;
 mod punch;
 mod rendezvous;
 mod replay;
